@@ -1,7 +1,2 @@
-/target
-/.idea
-/all-MiniLM-L6-v2
-/fastembed_model
-
+.idea/
 .DS_Store
-Cargo.lock
