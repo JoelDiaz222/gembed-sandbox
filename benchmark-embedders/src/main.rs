@@ -57,7 +57,7 @@ fn main() -> Result<()> {
 fn initialize_fastembed_model() -> Result<TextEmbedding> {
     let fastembed = TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-            .with_cache_dir(PathBuf::from("../fastembed_model")),
+            .with_cache_dir(PathBuf::from("./fastembed_model")),
     )?;
     Ok(fastembed)
 }

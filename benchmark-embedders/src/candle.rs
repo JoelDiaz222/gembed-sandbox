@@ -14,7 +14,7 @@ pub struct CandleEmbedService {
 impl CandleEmbedService {
     pub fn new() -> Result<Self> {
         let device = Device::Cpu;
-        let model_dir = PathBuf::from("../all-MiniLM-L6-v2");
+        let model_dir = PathBuf::from("./all-MiniLM-L6-v2");
         let config = serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
         let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
         let vb = unsafe {
