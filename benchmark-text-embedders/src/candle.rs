@@ -1,3 +1,4 @@
+use crate::{Embedder, ModelType};
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -5,16 +6,16 @@ use candle_transformers::models::bert::BertModel;
 use std::path::PathBuf;
 use tokenizers::{PaddingParams, Tokenizer};
 
-pub struct CandleEmbedService {
+pub struct CandleEmbedder {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
 }
 
-impl CandleEmbedService {
-    pub fn new() -> Result<Self> {
+impl CandleEmbedder {
+    pub fn new(model_type: ModelType) -> Result<Self> {
         let device = Device::Cpu;
-        let model_dir = PathBuf::from("./all-MiniLM-L6-v2");
+        let model_dir = PathBuf::from(model_type.local_dir());
         let config = serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
         let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
         let vb = unsafe {
@@ -39,9 +40,11 @@ impl CandleEmbedService {
             model,
         })
     }
+}
 
+impl Embedder for CandleEmbedder {
     /// Run a forward pass through the Candle model and return normalized embeddings
-    pub fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    fn embed(&mut self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let tokens = self.tokenizer.encode_batch(inputs, true).unwrap();
 
         let token_ids = Tensor::stack(

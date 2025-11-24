@@ -1,5 +1,5 @@
 [package]
-name = "benchmark-embedders"
+name = "benchmark-text-embedders"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,6 +9,7 @@ tonic = "0.14.2"
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 tonic-prost = "0.14.2"
 prost = "0.14.1"
+embed_anything = { version = "0.6.5", features = ["ort"] }
 fastembed = { git = "https://github.com/JoelDiaz222/fastembed-rs" }
 candle-core = "0.9.1"
 candle-nn = "0.9.1"
