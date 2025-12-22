@@ -4,6 +4,7 @@ mod tei_http_embedder;
 use anyhow::Result;
 use postgres::{Client, NoTls};
 use std::time::Instant;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tei_grpc_embedder::TeiGrpcEmbedder;
 use tei_http_embedder::TeiHttpEmbedder;
 
@@ -13,19 +14,59 @@ pub mod tei {
     }
 }
 
-const TEST_SIZES: &[usize] = &[16, 32, 64, 128, 256, 512];
+const TEST_SIZES: &[usize] = &[16, 32, 64, 128, 256, 512, 1024, 2048];
 const BATCH_SIZE: usize = 32;
 const DB_CONNECTION: &str = "host=localhost port=5432 dbname=joeldiaz";
 
-fn make_inputs(n: usize) -> Vec<String> {
-    (0..n)
-        .map(|i| {
-            format!(
-                "This is test sentence number {} for embedding generation.",
-                i
-            )
-        })
-        .collect()
+#[derive(Debug, Clone, Copy, Default)]
+struct MemoryStats {
+    delta_mb: f64,
+}
+
+struct MemoryMonitor {
+    sys: System,
+    pid: Pid,
+    baseline: u64,
+}
+
+impl MemoryMonitor {
+    fn new(pid: i32) -> Self {
+        let mut sys = System::new();
+        let pid = Pid::from_u32(pid as u32);
+
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        let baseline = sys.process(pid).map_or(0, |p| p.memory());
+
+        Self { sys, pid, baseline }
+    }
+
+    fn measure<F, T>(pid: i32, f: F) -> Result<(T, MemoryStats)>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let mut monitor = Self::new(pid);
+        let result = f()?;
+
+        monitor
+            .sys
+            .refresh_processes(ProcessesToUpdate::Some(&[monitor.pid]), true);
+        let peak = monitor
+            .sys
+            .process(monitor.pid)
+            .map_or(monitor.baseline, |p| p.memory());
+
+        let baseline_mb = monitor.baseline as f64 / 1024.0 / 1024.0;
+        let peak_mb = peak as f64 / 1024.0 / 1024.0;
+        let delta_mb = peak_mb - baseline_mb;
+
+        Ok((result, MemoryStats { delta_mb }))
+    }
+}
+
+fn connect_and_get_pid() -> Result<(Client, i32)> {
+    let mut client = Client::connect(DB_CONNECTION, NoTls)?;
+    let pid: i32 = client.query_one("SELECT pg_backend_pid()", &[])?.get(0);
+    Ok((client, pid))
 }
 
 fn setup_database(client: &mut Client) -> Result<()> {
@@ -49,61 +90,57 @@ fn truncate_table(client: &mut Client) -> Result<()> {
     Ok(())
 }
 
-fn benchmark_pg_fastembed(client: &mut Client, texts: &[String]) -> Result<f64> {
-    let start = Instant::now();
-
-    for chunk in texts.chunks(BATCH_SIZE) {
-        let text_literals: Vec<String> = chunk
-            .iter()
-            .map(|s| format!("'{}'", s.replace("'", "''")))
-            .collect();
-        let array_str = text_literals.join(", ");
-
-        let sql = format!(
-            "INSERT INTO embeddings_test (text, embedding)
-             SELECT t, e FROM unnest(ARRAY[{}]) t,
-             unnest(embed_texts('fastembed', 'Qdrant/all-MiniLM-L6-v2-onnx', ARRAY[{}])) e",
-            array_str, array_str
-        );
-
-        client.execute(&sql, &[])?;
-    }
-
-    Ok(start.elapsed().as_secs_f64())
+fn make_inputs(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            format!(
+                "This is test sentence number {} for embedding generation.",
+                i
+            )
+        })
+        .collect()
 }
 
-fn benchmark_pg_grpc(client: &mut Client, texts: &[String]) -> Result<f64> {
-    let start = Instant::now();
-
-    for chunk in texts.chunks(BATCH_SIZE) {
-        let text_literals: Vec<String> = chunk
-            .iter()
-            .map(|s| format!("'{}'", s.replace("'", "''")))
-            .collect();
-        let array_str = text_literals.join(", ");
-
-        let sql = format!(
-            "INSERT INTO embeddings_test (text, embedding)
-             SELECT t, e FROM unnest(ARRAY[{}]) t,
-             unnest(embed_texts('grpc', 'sentence-transformers/all-MiniLM-L6-v2', ARRAY[{}])) e",
-            array_str, array_str
-        );
-
-        client.execute(&sql, &[])?;
-    }
-
-    Ok(start.elapsed().as_secs_f64())
-}
-
-fn benchmark_external_grpc(
-    grpc_service: &mut TeiGrpcEmbedder,
+fn benchmark_internal_db_gen(
     client: &mut Client,
     texts: &[String],
+    provider: &str,
+    model: &str,
 ) -> Result<f64> {
     let start = Instant::now();
 
     for chunk in texts.chunks(BATCH_SIZE) {
-        let embeddings = grpc_service.embed(chunk.to_vec())?;
+        let text_literals: Vec<String> = chunk
+            .iter()
+            .map(|s| format!("'{}'", s.replace("'", "''")))
+            .collect();
+        let array_str = text_literals.join(", ");
+
+        let sql = format!(
+            "INSERT INTO embeddings_test (text, embedding)
+             SELECT t, e FROM unnest(ARRAY[{}]) t,
+             unnest(embed_texts('{}', '{}', ARRAY[{}])) e",
+            array_str, provider, model, array_str
+        );
+
+        client.execute(&sql, &[])?;
+    }
+
+    Ok(start.elapsed().as_secs_f64())
+}
+
+fn benchmark_external_client_gen<F>(
+    client: &mut Client,
+    texts: &[String],
+    mut embed_fn: F,
+) -> Result<f64>
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>>,
+{
+    let start = Instant::now();
+
+    for chunk in texts.chunks(BATCH_SIZE) {
+        let embeddings = embed_fn(chunk.to_vec())?;
 
         for (text, embedding) in chunk.iter().zip(embeddings.iter()) {
             let vector_str = format!(
@@ -128,131 +165,129 @@ fn benchmark_external_grpc(
     Ok(start.elapsed().as_secs_f64())
 }
 
-fn benchmark_external_http(
-    http_service: &TeiHttpEmbedder,
-    client: &mut Client,
-    texts: &[String],
-) -> Result<f64> {
-    let start = Instant::now();
-
-    for chunk in texts.chunks(BATCH_SIZE) {
-        let embeddings = http_service.embed(chunk.to_vec())?;
-
-        for (text, embedding) in chunk.iter().zip(embeddings.iter()) {
-            let vector_str = format!(
-                "[{}]",
-                embedding
-                    .iter()
-                    .map(|f| f.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            let text_escaped = text.replace("'", "''");
-
-            let sql = format!(
-                "INSERT INTO embeddings_test (text, embedding) VALUES ('{}', '{}'::vector)",
-                text_escaped, vector_str
-            );
-
-            client.execute(&sql, &[])?;
-        }
-    }
-
-    Ok(start.elapsed().as_secs_f64())
-}
-
-fn warm_up_services(
-    grpc_service: &mut TeiGrpcEmbedder,
-    http_service: &TeiHttpEmbedder,
-    client: &mut Client,
-) -> Result<()> {
-    let warmup_texts = make_inputs(8);
-
-    truncate_table(client)?;
-    let _ = benchmark_pg_fastembed(client, &warmup_texts)?;
-    truncate_table(client)?;
-    let _ = benchmark_pg_grpc(client, &warmup_texts)?;
-    truncate_table(client)?;
-    let _ = benchmark_external_grpc(grpc_service, client, &warmup_texts)?;
-    truncate_table(client)?;
-    let _ = benchmark_external_http(http_service, client, &warmup_texts)?;
-
-    println!("Warm-up completed.\n");
-    Ok(())
+fn run_benchmark_iteration<F>(benchmark_fn: F) -> Result<(f64, MemoryStats)>
+where
+    F: FnOnce(&mut Client) -> Result<f64>,
+{
+    let (mut client, pid) = connect_and_get_pid()?;
+    truncate_table(&mut client)?;
+    let result = MemoryMonitor::measure(pid, || benchmark_fn(&mut client))?;
+    Ok(result)
 }
 
 fn main() -> Result<()> {
-    let mut client = Client::connect(DB_CONNECTION, NoTls)?;
-    setup_database(&mut client)?;
+    // Initial setup
+    {
+        let mut client = Client::connect(DB_CONNECTION, NoTls)?;
+        setup_database(&mut client)?;
+    }
 
     let mut grpc_service = TeiGrpcEmbedder::new()?;
     let http_service = TeiHttpEmbedder::new()?;
 
-    warm_up_services(&mut grpc_service, &http_service, &mut client)?;
+    // Warm-up
+    {
+        let warmup_texts = make_inputs(8);
+        let mut client = Client::connect(DB_CONNECTION, NoTls)?;
+
+        truncate_table(&mut client)?;
+        benchmark_internal_db_gen(
+            &mut client,
+            &warmup_texts,
+            "fastembed",
+            "Qdrant/all-MiniLM-L6-v2-onnx",
+        )?;
+
+        truncate_table(&mut client)?;
+        benchmark_internal_db_gen(
+            &mut client,
+            &warmup_texts,
+            "grpc",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        )?;
+
+        truncate_table(&mut client)?;
+        benchmark_external_client_gen(&mut client, &warmup_texts, |t| grpc_service.embed(t))?;
+
+        truncate_table(&mut client)?;
+        benchmark_external_client_gen(&mut client, &warmup_texts, |t| http_service.embed(t))?;
+
+        println!("Warm-up completed.\n");
+    }
 
     println!(
-        "\n{:<8} {:>15} {:>15} {:>15} {:>15} {:>15} {:>15} {:>15} {:>15}",
+        "{:<8} {:>18} {:>18} {:>18} {:>18} | {:>18} {:>18} {:>18} {:>18}",
         "Size",
-        "PG Fast (s)",
+        "PG FastEmbed (s)",
         "PG gRPC (s)",
         "Ext gRPC (s)",
         "Ext HTTP (s)",
-        "PG Fast/s",
-        "PG gRPC/s",
-        "Ext gRPC/s",
-        "Ext HTTP/s"
+        "PG Fast Δ Mem",
+        "PG gRPC Δ Mem",
+        "Ext gRPC Δ Mem",
+        "Ext HTTP Δ Mem"
     );
-    println!("{}", "-".repeat(140));
+    println!("{}", "=".repeat(165));
 
     let mut results = Vec::new();
 
     for &size in TEST_SIZES {
         let texts = make_inputs(size);
 
-        truncate_table(&mut client)?;
-        let pg_fast_time = benchmark_pg_fastembed(&mut client, &texts)?;
+        // Benchmark PG FastEmbed
+        let (pg_fast_time, pg_fast_mem) = run_benchmark_iteration(|c| {
+            benchmark_internal_db_gen(c, &texts, "fastembed", "Qdrant/all-MiniLM-L6-v2-onnx")
+        })?;
 
-        truncate_table(&mut client)?;
-        let pg_grpc_time = benchmark_pg_grpc(&mut client, &texts)?;
+        // Benchmark PG gRPC
+        let (pg_grpc_time, pg_grpc_mem) = run_benchmark_iteration(|c| {
+            benchmark_internal_db_gen(c, &texts, "grpc", "sentence-transformers/all-MiniLM-L6-v2")
+        })?;
 
-        truncate_table(&mut client)?;
-        let ext_grpc_time = benchmark_external_grpc(&mut grpc_service, &mut client, &texts)?;
+        // Benchmark External gRPC
+        let (ext_grpc_time, ext_grpc_mem) = run_benchmark_iteration(|c| {
+            benchmark_external_client_gen(c, &texts, |t| grpc_service.embed(t))
+        })?;
 
-        truncate_table(&mut client)?;
-        let ext_http_time = benchmark_external_http(&http_service, &mut client, &texts)?;
+        // Benchmark External HTTP
+        let (ext_http_time, ext_http_mem) = run_benchmark_iteration(|c| {
+            benchmark_external_client_gen(c, &texts, |t| http_service.embed(t))
+        })?;
 
-        let pg_fast_tps = size as f64 / pg_fast_time;
-        let pg_grpc_tps = size as f64 / pg_grpc_time;
-        let ext_grpc_tps = size as f64 / ext_grpc_time;
-        let ext_http_tps = size as f64 / ext_http_time;
-
+        // Print results
         println!(
-            "{:<8} {:>15.3} {:>15.3} {:>15.3} {:>15.3} {:>15.1} {:>15.1} {:>15.1} {:>15.1}",
+            "{:<8} {:>18.3} {:>18.3} {:>18.3} {:>18.3} | {:>17.1}M {:>17.1}M {:>17.1}M {:>17.1}M",
             size,
             pg_fast_time,
             pg_grpc_time,
             ext_grpc_time,
             ext_http_time,
-            pg_fast_tps,
-            pg_grpc_tps,
-            ext_grpc_tps,
-            ext_http_tps
+            pg_fast_mem.delta_mb,
+            pg_grpc_mem.delta_mb,
+            ext_grpc_mem.delta_mb,
+            ext_http_mem.delta_mb
         );
 
-        results.push((pg_fast_tps, pg_grpc_tps, ext_grpc_tps, ext_http_tps));
+        let tps = |time| size as f64 / time;
+        results.push((
+            tps(pg_fast_time),
+            tps(pg_grpc_time),
+            tps(ext_grpc_time),
+            tps(ext_http_time),
+        ));
     }
 
-    println!("\n{}", "=".repeat(140));
-    let avg_pg_fast = results.iter().map(|r| r.0).sum::<f64>() / results.len() as f64;
-    let avg_pg_grpc = results.iter().map(|r| r.1).sum::<f64>() / results.len() as f64;
-    let avg_ext_grpc = results.iter().map(|r| r.2).sum::<f64>() / results.len() as f64;
-    let avg_ext_http = results.iter().map(|r| r.3).sum::<f64>() / results.len() as f64;
+    println!("{}", "=".repeat(165));
+    let n = results.len() as f64;
+    let sums = results.iter().fold((0.0, 0.0, 0.0, 0.0), |acc, r| {
+        (acc.0 + r.0, acc.1 + r.1, acc.2 + r.2, acc.3 + r.3)
+    });
 
-    println!("Average Throughput:");
-    println!("  PG FastEmbed: {:.1} texts/sec", avg_pg_fast);
-    println!("  PG gRPC:      {:.1} texts/sec", avg_pg_grpc);
-    println!("  Ext gRPC:     {:.1} texts/sec", avg_ext_grpc);
-    println!("  Ext HTTP:     {:.1} texts/sec", avg_ext_http);
+    println!("\nAverage Throughput (texts/sec):");
+    println!("  PG FastEmbed:      {:.2}", sums.0 / n);
+    println!("  PG gRPC:           {:.2}", sums.1 / n);
+    println!("  External gRPC:     {:.2}", sums.2 / n);
+    println!("  External HTTP:     {:.2}", sums.3 / n);
 
     Ok(())
 }

@@ -1,5 +1,5 @@
 [package]
-name = "benchmark-tei"
+name = "benchmark-tei-vs-gembed"
 version = "0.1.0"
 edition = "2024"
 
@@ -12,6 +12,7 @@ prost = "0.14.1"
 reqwest = { version = "0.12.24", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 postgres = "0.19.12"
+sysinfo = "0.37.2"
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
