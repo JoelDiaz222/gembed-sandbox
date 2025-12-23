@@ -23,6 +23,8 @@ struct ResourceStats {
     delta_mb: f64,
     peak_mb: f64,
     cpu_usage: f32,
+    sys_peak_mb: f64,
+    sys_cpu_usage: f32,
 }
 
 struct ResourceMonitor {
@@ -36,7 +38,11 @@ impl ResourceMonitor {
         let mut sys = System::new();
         let pid = Pid::from_u32(pid as u32);
 
+        // Refresh specific process and global system stats
         sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        sys.refresh_memory();
+        sys.refresh_cpu_all(); // First refresh for CPU diff
+
         let baseline = sys.process(pid).map_or(0, |p| p.memory());
 
         Self { sys, pid, baseline }
@@ -52,7 +58,9 @@ impl ResourceMonitor {
         monitor
             .sys
             .refresh_processes(ProcessesToUpdate::Some(&[monitor.pid]), true);
-        
+        monitor.sys.refresh_memory();
+        monitor.sys.refresh_cpu_all();
+
         let process = monitor.sys.process(monitor.pid);
         let peak = process.map_or(monitor.baseline, |p| p.memory());
         let cpu_usage = process.map_or(0.0, |p| p.cpu_usage());
@@ -61,12 +69,17 @@ impl ResourceMonitor {
         let peak_mb = peak as f64 / 1024.0 / 1024.0;
         let delta_mb = peak_mb - baseline_mb;
 
+        let sys_peak_mb = monitor.sys.used_memory() as f64 / 1024.0 / 1024.0;
+        let sys_cpu_usage = monitor.sys.global_cpu_usage();
+
         Ok((
             result,
             ResourceStats {
                 delta_mb,
                 peak_mb,
                 cpu_usage,
+                sys_peak_mb,
+                sys_cpu_usage,
             },
         ))
     }
@@ -226,10 +239,10 @@ fn main() -> Result<()> {
 
     println!("Benchmark Results:");
     println!(
-        "{:<18} | {:>10} | {:>11} | {:>13} | {:>9}",
-        "", "Time (s)", "Δ Mem (MB)", "Peak Mem (MB)", "CPU (%)"
+        "{:<14} | {:>9} | {:>10} | {:>10} | {:>9} | {:>12} | {:>9}",
+        "", "Time (s)", "Δ Mem (MB)", "Peak (MB)", "CPU (%)", "Sys Mem (MB)", "Sys CPU (%)"
     );
-    println!("{}", "=".repeat(73));
+    println!("{}", "=".repeat(95));
 
     let mut results = Vec::new();
 
@@ -258,20 +271,44 @@ fn main() -> Result<()> {
 
         println!("Size: {}", size);
         println!(
-            "  {:<16} | {:>10.3} | {:>11.1} | {:>13.1} | {:>9.1}",
-            "PG FastEmbed", pg_fast_time, pg_fast_mem.delta_mb, pg_fast_mem.peak_mb, pg_fast_mem.cpu_usage
+            "  {:<12} | {:>9.3} | {:>10.1} | {:>10.1} | {:>9.1} | {:>12.0} | {:>11.1}",
+            "PG FastEmbed",
+            pg_fast_time,
+            pg_fast_mem.delta_mb,
+            pg_fast_mem.peak_mb,
+            pg_fast_mem.cpu_usage,
+            pg_fast_mem.sys_peak_mb,
+            pg_fast_mem.sys_cpu_usage
         );
         println!(
-            "  {:<16} | {:>10.3} | {:>11.1} | {:>13.1} | {:>9.1}",
-            "PG gRPC", pg_grpc_time, pg_grpc_mem.delta_mb, pg_grpc_mem.peak_mb, pg_grpc_mem.cpu_usage
+            "  {:<12} | {:>9.3} | {:>10.1} | {:>10.1} | {:>9.1} | {:>12.0} | {:>11.1}",
+            "PG gRPC",
+            pg_grpc_time,
+            pg_grpc_mem.delta_mb,
+            pg_grpc_mem.peak_mb,
+            pg_grpc_mem.cpu_usage,
+            pg_grpc_mem.sys_peak_mb,
+            pg_grpc_mem.sys_cpu_usage
         );
         println!(
-            "  {:<16} | {:>10.3} | {:>11.1} | {:>13.1} | {:>9.1}",
-            "Ext gRPC", ext_grpc_time, ext_grpc_mem.delta_mb, ext_grpc_mem.peak_mb, ext_grpc_mem.cpu_usage
+            "  {:<12} | {:>9.3} | {:>10.1} | {:>10.1} | {:>9.1} | {:>12.0} | {:>11.1}",
+            "Ext gRPC",
+            ext_grpc_time,
+            ext_grpc_mem.delta_mb,
+            ext_grpc_mem.peak_mb,
+            ext_grpc_mem.cpu_usage,
+            ext_grpc_mem.sys_peak_mb,
+            ext_grpc_mem.sys_cpu_usage
         );
         println!(
-            "  {:<16} | {:>10.3} | {:>11.1} | {:>13.1} | {:>9.1}",
-            "Ext HTTP", ext_http_time, ext_http_mem.delta_mb, ext_http_mem.peak_mb, ext_http_mem.cpu_usage
+            "  {:<12} | {:>9.3} | {:>10.1} | {:>10.1} | {:>9.1} | {:>12.0} | {:>11.1}",
+            "Ext HTTP",
+            ext_http_time,
+            ext_http_mem.delta_mb,
+            ext_http_mem.peak_mb,
+            ext_http_mem.cpu_usage,
+            ext_http_mem.sys_peak_mb,
+            ext_http_mem.sys_cpu_usage
         );
         println!();
 
@@ -284,7 +321,7 @@ fn main() -> Result<()> {
         ));
     }
 
-    println!("{}", "=".repeat(73));
+    println!("{}", "=".repeat(95));
     let n = results.len() as f64;
     let sums = results.iter().fold((0.0, 0.0, 0.0, 0.0), |acc, r| {
         (acc.0 + r.0, acc.1 + r.1, acc.2 + r.2, acc.3 + r.3)
