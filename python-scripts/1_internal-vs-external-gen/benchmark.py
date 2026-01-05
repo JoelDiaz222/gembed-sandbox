@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from statistics import mean
+from statistics import mean, stdev
 from typing import Callable, List
 
 import embed_anything
@@ -215,11 +215,9 @@ def truncate_table(conn):
 
 
 def make_inputs(n: int) -> List[str]:
-    """Generate test sentences."""
-    return [
-        f"This is test sentence number {i} for embedding generation."
-        for i in range(n)
-    ]
+    """Load review texts from TPCx-AI dataset."""
+    from data.loader import get_review_texts
+    return get_review_texts(n, shuffle=True)
 
 
 def benchmark_internal_db_gen(conn, texts: List[str], provider: str, model: str) -> float:
@@ -314,16 +312,21 @@ def run_method_with_fresh_connection(texts: List[str], benchmark_fn: Callable,
         conn.close()
 
 
+def safe_stdev(values: List[float]) -> float:
+    """Calculate standard deviation, returning 0 for single values."""
+    return stdev(values) if len(values) > 1 else 0.0
+
+
 def print_header():
     """Print benchmark results header."""
     print("Benchmark Results:")
-    print(f"{'':14} | {'Time (s)':>9} | {'Δ Mem (MB)':>10} | {'Peak (MB)':>10} | "
-          f"{'CPU (%)':>9} | {'Sys Mem (MB)':>12} | {'Sys CPU (%)':>11}")
-    print("=" * 95)
+    print(f"{'':14} | {'Time (s)':>12} | {'Δ Mem (MB)':>12} | {'Peak (MB)':>12} | "
+          f"{'CPU (%)':>12} | {'Sys Mem (MB)':>12} | {'Sys CPU (%)':>12}")
+    print("=" * 105)
 
 
 def print_result(label: str, results: List[BenchmarkResult]):
-    """Print aggregated results from multiple runs."""
+    """Print aggregated results from multiple runs with ± std dev."""
     times = [r.time_s for r in results]
     delta_mems = [r.stats.delta_mb for r in results]
     peak_mems = [r.stats.peak_mb for r in results]
@@ -331,15 +334,39 @@ def print_result(label: str, results: List[BenchmarkResult]):
     sys_peak_mems = [r.stats.sys_peak_mb for r in results]
     sys_cpus = [r.stats.sys_cpu_usage for r in results]
 
-    avg_time = mean(times)
-    avg_delta_mem = mean(delta_mems)
-    avg_peak_mem = mean(peak_mems)
-    avg_cpu = mean(cpus)
-    avg_sys_peak_mem = mean(sys_peak_mems)
-    avg_sys_cpu = mean(sys_cpus)
+    def fmt(values: List[float], precision: int = 1) -> str:
+        avg = mean(values)
+        std = safe_stdev(values)
+        if precision == 3:
+            return f"{avg:.3f}±{std:.3f}"
+        elif precision == 0:
+            return f"{avg:.0f}±{std:.0f}"
+        else:
+            return f"{avg:.1f}±{std:.1f}"
 
-    print(f"  {label:12} | {avg_time:>9.3f} | {avg_delta_mem:>10.1f} | {avg_peak_mem:>10.1f} | "
-          f"{avg_cpu:>9.1f} | {avg_sys_peak_mem:>12.0f} | {avg_sys_cpu:>11.1f}")
+    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(delta_mems):>12} | {fmt(peak_mems):>12} | "
+          f"{fmt(cpus):>12} | {fmt(sys_peak_mems, 0):>12} | {fmt(sys_cpus):>12}")
+
+
+def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
+    """Compute mean and std for all metrics from benchmark results."""
+    times = [r.time_s for r in results]
+    return {
+        'throughput': size / mean(times),
+        'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
+        'time_s': mean(times),
+        'time_s_std': safe_stdev(times),
+        'cpu': mean([r.stats.cpu_usage for r in results]),
+        'cpu_std': safe_stdev([r.stats.cpu_usage for r in results]),
+        'mem_delta': mean([r.stats.delta_mb for r in results]),
+        'mem_delta_std': safe_stdev([r.stats.delta_mb for r in results]),
+        'mem_peak': mean([r.stats.peak_mb for r in results]),
+        'mem_peak_std': safe_stdev([r.stats.peak_mb for r in results]),
+        'sys_cpu': mean([r.stats.sys_cpu_usage for r in results]),
+        'sys_cpu_std': safe_stdev([r.stats.sys_cpu_usage for r in results]),
+        'sys_mem': mean([r.stats.sys_peak_mb for r in results]),
+        'sys_mem_std': safe_stdev([r.stats.sys_peak_mb for r in results]),
+    }
 
 
 def main():
@@ -418,55 +445,15 @@ def main():
             # Store metrics for summary and plots
             all_results.append({
                 'size': size,
-                'pg_local': {
-                    'throughput': size / mean([r.time_s for r in pg_local_results]),
-                    'time_s': mean([r.time_s for r in pg_local_results]),
-                    'cpu': mean([r.stats.cpu_usage for r in pg_local_results]),
-                    'mem_delta': mean([r.stats.delta_mb for r in pg_local_results]),
-                    'mem_peak': mean([r.stats.peak_mb for r in pg_local_results]),
-                    'sys_cpu': mean([r.stats.sys_cpu_usage for r in pg_local_results]),
-                    'sys_mem': mean([r.stats.sys_peak_mb for r in pg_local_results]),
-                },
-                'pg_grpc': {
-                    'throughput': size / mean([r.time_s for r in pg_grpc_results]),
-                    'time_s': mean([r.time_s for r in pg_grpc_results]),
-                    'cpu': mean([r.stats.cpu_usage for r in pg_grpc_results]),
-                    'mem_delta': mean([r.stats.delta_mb for r in pg_grpc_results]),
-                    'mem_peak': mean([r.stats.peak_mb for r in pg_grpc_results]),
-                    'sys_cpu': mean([r.stats.sys_cpu_usage for r in pg_grpc_results]),
-                    'sys_mem': mean([r.stats.sys_peak_mb for r in pg_grpc_results]),
-                },
-                'ext_direct': {
-                    'throughput': size / mean([r.time_s for r in ext_direct_results]),
-                    'time_s': mean([r.time_s for r in ext_direct_results]),
-                    'cpu': mean([r.stats.cpu_usage for r in ext_direct_results]),
-                    'mem_delta': mean([r.stats.delta_mb for r in ext_direct_results]),
-                    'mem_peak': mean([r.stats.peak_mb for r in ext_direct_results]),
-                    'sys_cpu': mean([r.stats.sys_cpu_usage for r in ext_direct_results]),
-                    'sys_mem': mean([r.stats.sys_peak_mb for r in ext_direct_results]),
-                },
-                'ext_grpc': {
-                    'throughput': size / mean([r.time_s for r in ext_grpc_results]),
-                    'time_s': mean([r.time_s for r in ext_grpc_results]),
-                    'cpu': mean([r.stats.cpu_usage for r in ext_grpc_results]),
-                    'mem_delta': mean([r.stats.delta_mb for r in ext_grpc_results]),
-                    'mem_peak': mean([r.stats.peak_mb for r in ext_grpc_results]),
-                    'sys_cpu': mean([r.stats.sys_cpu_usage for r in ext_grpc_results]),
-                    'sys_mem': mean([r.stats.sys_peak_mb for r in ext_grpc_results]),
-                },
-                'ext_http': {
-                    'throughput': size / mean([r.time_s for r in ext_http_results]),
-                    'time_s': mean([r.time_s for r in ext_http_results]),
-                    'cpu': mean([r.stats.cpu_usage for r in ext_http_results]),
-                    'mem_delta': mean([r.stats.delta_mb for r in ext_http_results]),
-                    'mem_peak': mean([r.stats.peak_mb for r in ext_http_results]),
-                    'sys_cpu': mean([r.stats.sys_cpu_usage for r in ext_http_results]),
-                    'sys_mem': mean([r.stats.sys_peak_mb for r in ext_http_results]),
-                },
+                'pg_local': compute_metrics(size, pg_local_results),
+                'pg_grpc': compute_metrics(size, pg_grpc_results),
+                'ext_direct': compute_metrics(size, ext_direct_results),
+                'ext_grpc': compute_metrics(size, ext_grpc_results),
+                'ext_http': compute_metrics(size, ext_http_results),
             })
 
         # Print summary
-        print("=" * 95)
+        print("=" * 105)
 
         avg_pg_local = mean([r['pg_local']['throughput'] for r in all_results])
         avg_pg_grpc = mean([r['pg_grpc']['throughput'] for r in all_results])
@@ -490,7 +477,7 @@ def main():
 
 
 def save_results_csv(all_results: List[dict]):
-    """Save benchmark results to CSV file."""
+    """Save benchmark results to CSV file with mean and std values."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = OUTPUT_DIR / f"benchmark_{timestamp}.csv"
@@ -500,11 +487,12 @@ def save_results_csv(all_results: List[dict]):
 
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        # Header: size, then method_metric for each combination
+        # Header: size, then method_metric and method_metric_std for each combination
         header = ['size']
         for method in methods:
             for metric in metrics:
                 header.append(f"{method}_{metric}")
+                header.append(f"{method}_{metric}_std")
         writer.writerow(header)
 
         for r in all_results:
@@ -512,6 +500,7 @@ def save_results_csv(all_results: List[dict]):
             for method in methods:
                 for metric in metrics:
                     row.append(r[method][metric])
+                    row.append(r[method].get(f"{metric}_std", 0))
             writer.writerow(row)
 
     print(f"\nResults saved to: {csv_path}")
@@ -531,8 +520,10 @@ def generate_plots(all_results: List[dict]):
     # Plot 1: Throughput comparison
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        plt.plot(sizes, [r[method]['throughput'] for r in all_results],
-                 f'{marker}-', label=label, linewidth=2, color=color)
+        y_vals = [r[method]['throughput'] for r in all_results]
+        y_errs = [r[method]['throughput_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Throughput (texts/sec)')
     plt.title(f'Embedding Generation: Throughput (batch size={BATCH_SIZE})')
@@ -545,8 +536,10 @@ def generate_plots(all_results: List[dict]):
     # Plot 2: Process CPU Usage
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        plt.plot(sizes, [r[method]['cpu'] for r in all_results],
-                 f'{marker}-', label=label, linewidth=2, color=color)
+        y_vals = [r[method]['cpu'] for r in all_results]
+        y_errs = [r[method]['cpu_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Process CPU Usage (%)')
     plt.title(
@@ -560,8 +553,10 @@ def generate_plots(all_results: List[dict]):
     # Plot 3: System CPU Usage
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        plt.plot(sizes, [r[method]['sys_cpu'] for r in all_results],
-                 f'{marker}-', label=label, linewidth=2, color=color)
+        y_vals = [r[method]['sys_cpu'] for r in all_results]
+        y_errs = [r[method]['sys_cpu_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('System CPU Usage (%)')
     plt.title(f'Embedding Generation: System CPU (batch size={BATCH_SIZE})')
@@ -574,8 +569,10 @@ def generate_plots(all_results: List[dict]):
     # Plot 4: Process Memory Delta
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        plt.plot(sizes, [r[method]['mem_delta'] for r in all_results],
-                 f'{marker}-', label=label, linewidth=2, color=color)
+        y_vals = [r[method]['mem_delta'] for r in all_results]
+        y_errs = [r[method]['mem_delta_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Process Memory Delta (MB)')
     plt.title(
@@ -589,8 +586,10 @@ def generate_plots(all_results: List[dict]):
     # Plot 5: Process Peak Memory
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        plt.plot(sizes, [r[method]['mem_peak'] for r in all_results],
-                 f'{marker}-', label=label, linewidth=2, color=color)
+        y_vals = [r[method]['mem_peak'] for r in all_results]
+        y_errs = [r[method]['mem_peak_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Process Peak Memory (MB)')
     plt.title(
@@ -604,8 +603,10 @@ def generate_plots(all_results: List[dict]):
     # Plot 6: System Memory
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        plt.plot(sizes, [r[method]['sys_mem'] for r in all_results],
-                 f'{marker}-', label=label, linewidth=2, color=color)
+        y_vals = [r[method]['sys_mem'] for r in all_results]
+        y_errs = [r[method]['sys_mem_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('System Memory (MB)')
     plt.title(f'Embedding Generation: System Memory (batch size={BATCH_SIZE})')
@@ -615,13 +616,17 @@ def generate_plots(all_results: List[dict]):
     plt.savefig(OUTPUT_DIR / f"memory_system_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # Plot 7: Summary bar chart (2x3 grid)
+    # Plot 7: Summary bar chart (2x3 grid) with error bars
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     fig.suptitle(f'Average Metrics (batch size={BATCH_SIZE})', fontsize=14)
+    x_pos = range(len(methods))
 
     # Throughput
     avgs = [mean([r[m]['throughput'] for r in all_results]) for m in methods]
-    bars = axes[0, 0].bar(labels, avgs, color=colors)
+    stds = [safe_stdev([r[m]['throughput'] for r in all_results]) for m in methods]
+    bars = axes[0, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[0, 0].set_xticks(x_pos)
+    axes[0, 0].set_xticklabels(labels)
     axes[0, 0].set_ylabel('Throughput (texts/sec)')
     axes[0, 0].set_title('Throughput')
     axes[0, 0].bar_label(bars, fmt='%.1f')
@@ -629,7 +634,10 @@ def generate_plots(all_results: List[dict]):
 
     # Process CPU (PG=PostgreSQL, Ext=Python)
     avgs = [mean([r[m]['cpu'] for r in all_results]) for m in methods]
-    bars = axes[0, 1].bar(labels, avgs, color=colors)
+    stds = [safe_stdev([r[m]['cpu'] for r in all_results]) for m in methods]
+    bars = axes[0, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[0, 1].set_xticks(x_pos)
+    axes[0, 1].set_xticklabels(labels)
     axes[0, 1].set_ylabel('CPU Usage (%)')
     axes[0, 1].set_title('Process CPU*')
     axes[0, 1].bar_label(bars, fmt='%.1f')
@@ -637,7 +645,10 @@ def generate_plots(all_results: List[dict]):
 
     # System CPU
     avgs = [mean([r[m]['sys_cpu'] for r in all_results]) for m in methods]
-    bars = axes[0, 2].bar(labels, avgs, color=colors)
+    stds = [safe_stdev([r[m]['sys_cpu'] for r in all_results]) for m in methods]
+    bars = axes[0, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[0, 2].set_xticks(x_pos)
+    axes[0, 2].set_xticklabels(labels)
     axes[0, 2].set_ylabel('CPU Usage (%)')
     axes[0, 2].set_title('System CPU')
     axes[0, 2].bar_label(bars, fmt='%.1f')
@@ -645,7 +656,10 @@ def generate_plots(all_results: List[dict]):
 
     # Memory Delta (PG=PostgreSQL, Ext=Python)
     avgs = [mean([r[m]['mem_delta'] for r in all_results]) for m in methods]
-    bars = axes[1, 0].bar(labels, avgs, color=colors)
+    stds = [safe_stdev([r[m]['mem_delta'] for r in all_results]) for m in methods]
+    bars = axes[1, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[1, 0].set_xticks(x_pos)
+    axes[1, 0].set_xticklabels(labels)
     axes[1, 0].set_ylabel('Memory (MB)')
     axes[1, 0].set_title('Process Mem Δ*')
     axes[1, 0].bar_label(bars, fmt='%.1f')
@@ -653,7 +667,10 @@ def generate_plots(all_results: List[dict]):
 
     # Peak Memory (PG=PostgreSQL, Ext=Python)
     avgs = [mean([r[m]['mem_peak'] for r in all_results]) for m in methods]
-    bars = axes[1, 1].bar(labels, avgs, color=colors)
+    stds = [safe_stdev([r[m]['mem_peak'] for r in all_results]) for m in methods]
+    bars = axes[1, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[1, 1].set_xticks(x_pos)
+    axes[1, 1].set_xticklabels(labels)
     axes[1, 1].set_ylabel('Memory (MB)')
     axes[1, 1].set_title('Process Peak Mem*')
     axes[1, 1].bar_label(bars, fmt='%.1f')
@@ -661,7 +678,10 @@ def generate_plots(all_results: List[dict]):
 
     # System Memory
     avgs = [mean([r[m]['sys_mem'] for r in all_results]) for m in methods]
-    bars = axes[1, 2].bar(labels, avgs, color=colors)
+    stds = [safe_stdev([r[m]['sys_mem'] for r in all_results]) for m in methods]
+    bars = axes[1, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[1, 2].set_xticks(x_pos)
+    axes[1, 2].set_xticklabels(labels)
     axes[1, 2].set_ylabel('Memory (MB)')
     axes[1, 2].set_title('System Memory')
     axes[1, 2].bar_label(bars, fmt='%.0f')

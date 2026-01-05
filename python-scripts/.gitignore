@@ -9,3 +9,6 @@ __pycache__/
 
 # Benchmark outputs
 output/
+
+# TPCx-AI
+data/Review.psv

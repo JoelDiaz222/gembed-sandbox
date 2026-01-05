@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from statistics import mean
+from statistics import mean, stdev
 from typing import Callable, List
 
 import chromadb
@@ -23,7 +23,7 @@ DB_CONFIG = {
     'user': 'joeldiaz',
 }
 
-TEST_SIZES = [16, 32, 64, 128, 256, 512]
+TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
 RUNS_PER_SIZE = 3
 
@@ -121,20 +121,21 @@ class EmbedAnythingDirectClient:
 # --- Data Generation ---
 
 def generate_products(n: int) -> List[dict]:
-    """Generate realistic product data with reviews and categories."""
+    """Generate realistic product data with reviews from TPCx-AI dataset."""
+    from data.loader import get_review_texts
+
     categories_pool = [
         "Electronics", "Home & Garden", "Sports", "Books", "Clothing",
         "Toys", "Health", "Automotive", "Food", "Office"
     ]
 
     adjectives = ["Premium", "Professional", "Essential", "Advanced", "Classic"]
-    review_templates = [
-        "Great product, exactly what I needed for {}.",
-        "Works well for {}. Good value for money.",
-        "Perfect for {} applications. Highly recommend.",
-        "Decent quality for {}. Met my expectations.",
-        "Excellent {} solution. Fast shipping too.",
-    ]
+
+    # Load real reviews from TPCx-AI dataset
+    # Estimate ~3.5 reviews per product on average
+    total_reviews_needed = int(n * 3.5) + 100
+    reviews_pool = get_review_texts(total_reviews_needed, shuffle=True)
+    review_idx = 0
 
     products = []
     for i in range(n):
@@ -152,15 +153,14 @@ def generate_products(n: int) -> List[dict]:
             'categories': []
         }
 
-        # Generate 2-5 reviews per product
+        # Assign 2-5 real reviews per product from TPCx-AI dataset
         num_reviews = 2 + (i % 4)
         for j in range(num_reviews):
-            use_case = ["daily tasks", "work projects", "home improvement",
-                        "outdoor activities", "creative projects"][j % 5]
             product['reviews'].append({
                 'rating': 3 + (j % 3),
-                'text': review_templates[j % len(review_templates)].format(use_case)
+                'text': reviews_pool[review_idx % len(reviews_pool)]
             })
+            review_idx += 1
 
         # Assign 1-3 categories
         num_cats = 1 + (i % 3)
@@ -693,15 +693,20 @@ def run_scenario2_distributed(products: List[dict],
 # Output Functions
 # =============================================================================
 
+def safe_stdev(values: List[float]) -> float:
+    """Calculate standard deviation, returning 0 for single values."""
+    return stdev(values) if len(values) > 1 else 0.0
+
+
 def print_header():
     """Print benchmark results header."""
-    print(f"{'':14} | {'Time (s)':>9} | {'Δ Mem (MB)':>10} | {'Peak (MB)':>10} | "
-          f"{'CPU (%)':>9} | {'Sys Mem (MB)':>12} | {'Sys CPU (%)':>11}")
-    print("=" * 95)
+    print(f"{'':14} | {'Time (s)':>12} | {'Δ Mem (MB)':>12} | {'Peak (MB)':>12} | "
+          f"{'CPU (%)':>12} | {'Sys Mem (MB)':>12} | {'Sys CPU (%)':>12}")
+    print("=" * 105)
 
 
 def print_result(label: str, results: List[BenchmarkResult]):
-    """Print aggregated results from multiple runs."""
+    """Print aggregated results from multiple runs with ± std dev."""
     times = [r.time_s for r in results]
     delta_mems = [r.stats.delta_mb for r in results]
     peak_mems = [r.stats.peak_mb for r in results]
@@ -709,9 +714,39 @@ def print_result(label: str, results: List[BenchmarkResult]):
     sys_peak_mems = [r.stats.sys_peak_mb for r in results]
     sys_cpus = [r.stats.sys_cpu_usage for r in results]
 
-    print(f"  {label:12} | {mean(times):>9.3f} | {mean(delta_mems):>10.1f} | "
-          f"{mean(peak_mems):>10.1f} | {mean(cpus):>9.1f} | "
-          f"{mean(sys_peak_mems):>12.0f} | {mean(sys_cpus):>11.1f}")
+    def fmt(values: List[float], precision: int = 1) -> str:
+        avg = mean(values)
+        std = safe_stdev(values)
+        if precision == 3:
+            return f"{avg:.3f}±{std:.3f}"
+        elif precision == 0:
+            return f"{avg:.0f}±{std:.0f}"
+        else:
+            return f"{avg:.1f}±{std:.1f}"
+
+    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(delta_mems):>12} | {fmt(peak_mems):>12} | "
+          f"{fmt(cpus):>12} | {fmt(sys_peak_mems, 0):>12} | {fmt(sys_cpus):>12}")
+
+
+def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
+    """Compute mean and std for all metrics from benchmark results."""
+    times = [r.time_s for r in results]
+    return {
+        'throughput': size / mean(times),
+        'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
+        'time_s': mean(times),
+        'time_s_std': safe_stdev(times),
+        'cpu': mean([r.stats.cpu_usage for r in results]),
+        'cpu_std': safe_stdev([r.stats.cpu_usage for r in results]),
+        'mem_delta': mean([r.stats.delta_mb for r in results]),
+        'mem_delta_std': safe_stdev([r.stats.delta_mb for r in results]),
+        'mem_peak': mean([r.stats.peak_mb for r in results]),
+        'mem_peak_std': safe_stdev([r.stats.peak_mb for r in results]),
+        'sys_cpu': mean([r.stats.sys_cpu_usage for r in results]),
+        'sys_cpu_std': safe_stdev([r.stats.sys_cpu_usage for r in results]),
+        'sys_mem': mean([r.stats.sys_peak_mb for r in results]),
+        'sys_mem_std': safe_stdev([r.stats.sys_peak_mb for r in results]),
+    }
 
 
 def main():
@@ -747,32 +782,16 @@ def main():
 
         all_results_s1.append({
             'size': size,
-            'unified': {
-                'throughput': size / mean([r.time_s for r in unified_results]),
-                'time_s': mean([r.time_s for r in unified_results]),
-                'cpu': mean([r.stats.cpu_usage for r in unified_results]),
-                'mem_delta': mean([r.stats.delta_mb for r in unified_results]),
-                'mem_peak': mean([r.stats.peak_mb for r in unified_results]),
-                'sys_cpu': mean([r.stats.sys_cpu_usage for r in unified_results]),
-                'sys_mem': mean([r.stats.sys_peak_mb for r in unified_results]),
-            },
-            'distributed': {
-                'throughput': size / mean([r.time_s for r in distributed_results]),
-                'time_s': mean([r.time_s for r in distributed_results]),
-                'cpu': mean([r.stats.cpu_usage for r in distributed_results]),
-                'mem_delta': mean([r.stats.delta_mb for r in distributed_results]),
-                'mem_peak': mean([r.stats.peak_mb for r in distributed_results]),
-                'sys_cpu': mean([r.stats.sys_cpu_usage for r in distributed_results]),
-                'sys_mem': mean([r.stats.sys_peak_mb for r in distributed_results]),
-            },
+            'unified': compute_metrics(size, unified_results),
+            'distributed': compute_metrics(size, distributed_results),
         })
 
     # ==========================================================================
     # Scenario 2: Pre-existing Data (embedding generation only)
     # ==========================================================================
-    print("=" * 95)
+    print("=" * 105)
     print("SCENARIO 2: Pre-existing Data (embedding generation only)")
-    print("=" * 95)
+    print("=" * 105)
     print_header()
 
     for size in TEST_SIZES:
@@ -788,30 +807,14 @@ def main():
 
         all_results_s2.append({
             'size': size,
-            'unified': {
-                'throughput': size / mean([r.time_s for r in unified_results]),
-                'time_s': mean([r.time_s for r in unified_results]),
-                'cpu': mean([r.stats.cpu_usage for r in unified_results]),
-                'mem_delta': mean([r.stats.delta_mb for r in unified_results]),
-                'mem_peak': mean([r.stats.peak_mb for r in unified_results]),
-                'sys_cpu': mean([r.stats.sys_cpu_usage for r in unified_results]),
-                'sys_mem': mean([r.stats.sys_peak_mb for r in unified_results]),
-            },
-            'distributed': {
-                'throughput': size / mean([r.time_s for r in distributed_results]),
-                'time_s': mean([r.time_s for r in distributed_results]),
-                'cpu': mean([r.stats.cpu_usage for r in distributed_results]),
-                'mem_delta': mean([r.stats.delta_mb for r in distributed_results]),
-                'mem_peak': mean([r.stats.peak_mb for r in distributed_results]),
-                'sys_cpu': mean([r.stats.sys_cpu_usage for r in distributed_results]),
-                'sys_mem': mean([r.stats.sys_peak_mb for r in distributed_results]),
-            },
+            'unified': compute_metrics(size, unified_results),
+            'distributed': compute_metrics(size, distributed_results),
         })
 
     # ==========================================================================
     # Summary
     # ==========================================================================
-    print("=" * 95)
+    print("=" * 105)
     print("\nAverage Throughput (products/sec):")
 
     print("\n  Scenario 1 - Cold Start:")
@@ -828,39 +831,44 @@ def main():
 
 
 def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
-    """Save benchmark results to CSV files."""
+    """Save benchmark results to CSV files with mean and std values."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     methods = ['unified', 'distributed']
     metrics = ['throughput', 'time_s', 'cpu', 'mem_delta', 'mem_peak', 'sys_cpu', 'sys_mem']
 
+    # Build header with _std columns
+    header = ['size']
+    for method in methods:
+        for metric in metrics:
+            header.append(f"{method}_{metric}")
+            header.append(f"{method}_{metric}_std")
+
     # Scenario 1 CSV
     csv_path_s1 = OUTPUT_DIR / f"scenario1_cold_start_{timestamp}.csv"
     with open(csv_path_s1, 'w', newline='') as f:
         writer = csv.writer(f)
-        header = ['size']
-        for method in methods:
-            for metric in metrics:
-                header.append(f"{method}_{metric}")
         writer.writerow(header)
         for r in all_results_s1:
             row = [r['size']]
             for method in methods:
                 for metric in metrics:
                     row.append(r[method][metric])
+                    row.append(r[method].get(f"{metric}_std", 0))
             writer.writerow(row)
 
     # Scenario 2 CSV
     csv_path_s2 = OUTPUT_DIR / f"scenario2_preexisting_{timestamp}.csv"
     with open(csv_path_s2, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(header)  # Same header
+        writer.writerow(header)
         for r in all_results_s2:
             row = [r['size']]
             for method in methods:
                 for metric in metrics:
                     row.append(r[method][metric])
+                    row.append(r[method].get(f"{metric}_std", 0))
             writer.writerow(row)
 
     print(f"\nResults saved to:")
@@ -869,7 +877,7 @@ def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
 
 
 def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
-    """Generate comparison plots for throughput, CPU, and memory."""
+    """Generate comparison plots for throughput, CPU, and memory with error bars."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -883,8 +891,10 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
     def plot_metric(results, sizes, metric, ylabel, title_suffix, filename):
         plt.figure(figsize=(10, 6))
         for method, label, color, marker in zip(methods, labels, colors, markers):
-            plt.plot(sizes, [r[method][metric] for r in results],
-                     f'{marker}-', label=label, linewidth=2, color=color)
+            y_vals = [r[method][metric] for r in results]
+            y_errs = [r[method].get(f'{metric}_std', 0) for r in results]
+            plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                         linewidth=2, color=color, capsize=3, capthick=1)
         plt.xlabel('Number of Products')
         plt.ylabel(ylabel)
         plt.title(f'{title_suffix}')
@@ -928,24 +938,31 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
     plot_metric(all_results_s2, sizes_s2, 'sys_mem', 'System Memory Used (MB)',
                 'Scenario 2 Pre-existing: System Memory', f"s2_memory_system_{timestamp}.png")
 
-    # Summary bar charts (2x6 grid: 2 scenarios x 6 metrics)
+    # Summary bar charts (2x6 grid: 2 scenarios x 6 metrics) with error bars
     # Note: Process metrics track PostgreSQL for Unified, Python for Distributed
     fig, axes = plt.subplots(2, 6, figsize=(20, 8))
     metric_labels = ['Throughput\n(prod/sec)', 'Proc CPU* (%)', 'Proc Mem* Δ (MB)', 'Proc Peak* (MB)', 'Sys CPU (%)',
                      'Sys Mem (MB)']
     metric_keys = ['throughput', 'cpu', 'mem_delta', 'mem_peak', 'sys_cpu', 'sys_mem']
+    x_pos = range(len(methods))
 
     for col, (metric, mlabel) in enumerate(zip(metric_keys, metric_labels)):
         # Scenario 1
         avgs = [mean([r[m][metric] for r in all_results_s1]) for m in methods]
-        bars = axes[0, col].bar(labels, avgs, color=colors)
+        stds = [safe_stdev([r[m][metric] for r in all_results_s1]) for m in methods]
+        bars = axes[0, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+        axes[0, col].set_xticks(x_pos)
+        axes[0, col].set_xticklabels(labels)
         axes[0, col].set_title(f'S1: {mlabel}')
         axes[0, col].bar_label(bars, fmt='%.1f')
         axes[0, col].tick_params(axis='x', rotation=15)
 
         # Scenario 2
         avgs = [mean([r[m][metric] for r in all_results_s2]) for m in methods]
-        bars = axes[1, col].bar(labels, avgs, color=colors)
+        stds = [safe_stdev([r[m][metric] for r in all_results_s2]) for m in methods]
+        bars = axes[1, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+        axes[1, col].set_xticks(x_pos)
+        axes[1, col].set_xticklabels(labels)
         axes[1, col].set_title(f'S2: {mlabel}')
         axes[1, col].bar_label(bars, fmt='%.1f')
         axes[1, col].tick_params(axis='x', rotation=15)
