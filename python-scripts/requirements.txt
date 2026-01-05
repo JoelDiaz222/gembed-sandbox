@@ -1,4 +1,20 @@
+# server_http.py
+fastapi
+pydantic
+uvicorn
+
+# server_grpc.py
+grpcio
+grpcio-tools
+
 psycopg2-binary
 chromadb
 fastembed
 numpy
+
+matplotlib
+pandas
+psutil
+
+embed_anything
+

@@ -76,7 +76,7 @@ fn make_inputs(n: usize) -> Vec<String> {
 
 fn main() -> Result<()> {
     // Choose your model here
-    let model = ModelType::BGELargeENV15;
+    let model = ModelType::AllMiniLML6V2;
 
     println!("Using model: {}\n", model.model_id());
 

@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package tei.v1;
+
+service Embed {
+    rpc Embed (EmbedRequest) returns (EmbedResponse);
+    rpc EmbedBatch (EmbedBatchRequest) returns (EmbedBatchResponse);
+}
+
+message Metadata {
+    uint32 compute_chars = 1;
+    uint32 compute_tokens = 2;
+    uint64 total_time_ns = 3;
+    uint64 tokenization_time_ns = 4;
+    uint64 queue_time_ns = 5;
+    uint64 inference_time_ns = 6;
+}
+
+enum TruncationDirection {
+    TRUNCATION_DIRECTION_RIGHT = 0;
+    TRUNCATION_DIRECTION_LEFT = 1;
+}
+
+message EmbedRequest {
+    string inputs = 1;
+    bool truncate = 2;
+    bool normalize = 3;
+    TruncationDirection truncation_direction = 4;
+    optional string prompt_name = 5;
+    optional uint32 dimensions = 6;
+    string model = 7;
+}
+
+message EmbedResponse {
+    repeated float embeddings = 1;
+    Metadata metadata = 2;
+}
+
+message EmbedBatchRequest {
+    repeated string inputs = 1;
+    bool truncate = 2;
+    bool normalize = 3;
+    TruncationDirection truncation_direction = 4;
+    optional string prompt_name = 5;
+    optional uint32 dimensions = 6;
+    string model = 7;
+}
+
+message EmbedBatchResponse {
+    repeated Embedding embeddings = 1;
+    Metadata metadata = 2;
+}
+
+message Embedding {
+    repeated float values = 1;
+}
