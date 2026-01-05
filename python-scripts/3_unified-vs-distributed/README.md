@@ -23,7 +23,7 @@ Simulates initial data loading or migration:
 ### Scenario 2: Pre-existing Data (Update Only)
 
 Simulates updating embeddings for existing records:
-- Reuses data inserted in Scenario 1
+- Data is pre-inserted (setup phase, not timed)
 - Only embedding generation is measured
 - Common use case: Updating embeddings after model change or adding new embedding column
 
@@ -72,7 +72,7 @@ Results are grouped by scenario:
 
 ## Notes
 
-- Scenario 2 reuses data inserted in Scenario 1
+- Each scenario sets up its own data independently
 - Warmup batches are not counted in final metrics
 - ChromaDB directories are cleaned up between runs
 - pgvector HNSW index uses `m = 16, ef_construction = 100` to match ChromaDB's defaults

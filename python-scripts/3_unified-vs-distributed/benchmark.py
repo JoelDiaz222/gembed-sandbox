@@ -36,11 +36,15 @@ model_cache = {}
 
 @dataclass
 class ResourceStats:
-    delta_mb: float
-    peak_mb: float
-    cpu_usage: float
-    sys_peak_mb: float
-    sys_cpu_usage: float
+    """Resource statistics for Python and PostgreSQL processes."""
+    py_delta_mb: float
+    py_peak_mb: float
+    py_cpu: float
+    pg_delta_mb: float
+    pg_peak_mb: float
+    pg_cpu: float
+    sys_mem_mb: float
+    sys_cpu: float
 
 
 @dataclass
@@ -50,49 +54,93 @@ class BenchmarkResult:
 
 
 class ResourceMonitor:
-    def __init__(self, pid: int):
-        self.pid = pid
-        self.process = psutil.Process(pid)
+    """Monitor resource usage for Python and PostgreSQL processes."""
 
+    def __init__(self, py_pid: int, pg_pid: int = None):
+        self.py_pid = py_pid
+        self.pg_pid = pg_pid
+        
+        # Python process
+        self.py_process = psutil.Process(py_pid)
         try:
-            mem_info = self.process.memory_full_info()
-            self.baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+            mem_info = self.py_process.memory_full_info()
+            self.py_baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
         except (psutil.AccessDenied, AttributeError):
-            mem_info = self.process.memory_info()
-            self.baseline = mem_info.rss
-
-        self.process.cpu_percent()
+            mem_info = self.py_process.memory_info()
+            self.py_baseline = mem_info.rss
+        self.py_process.cpu_percent()
+        
+        # PostgreSQL process
+        self.pg_process = None
+        self.pg_baseline = 0
+        if pg_pid:
+            try:
+                self.pg_process = psutil.Process(pg_pid)
+                try:
+                    mem_info = self.pg_process.memory_full_info()
+                    self.pg_baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+                except (psutil.AccessDenied, AttributeError):
+                    mem_info = self.pg_process.memory_info()
+                    self.pg_baseline = mem_info.rss
+                self.pg_process.cpu_percent()
+            except psutil.NoSuchProcess:
+                self.pg_process = None
+        
         time.sleep(0.1)
 
     @staticmethod
-    def measure(pid: int, func: Callable):
-        """Measure resource usage during function execution."""
-        monitor = ResourceMonitor(pid)
+    def measure(py_pid: int, pg_pid: int, func: Callable):
+        """Measure resource usage for both Python and PostgreSQL processes."""
+        monitor = ResourceMonitor(py_pid, pg_pid)
         result = func()
 
+        # Python process final stats
         try:
-            mem_info = monitor.process.memory_full_info()
-            peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+            mem_info = monitor.py_process.memory_full_info()
+            py_peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
         except (psutil.AccessDenied, AttributeError):
-            mem_info = monitor.process.memory_info()
-            peak = mem_info.rss
+            mem_info = monitor.py_process.memory_info()
+            py_peak = mem_info.rss
+        py_cpu = monitor.py_process.cpu_percent()
+        
+        py_baseline_mb = monitor.py_baseline / (1024 * 1024)
+        py_peak_mb = py_peak / (1024 * 1024)
+        py_delta_mb = py_peak_mb - py_baseline_mb
 
-        cpu_usage = monitor.process.cpu_percent()
+        # PostgreSQL process final stats
+        pg_delta_mb = 0.0
+        pg_peak_mb = 0.0
+        pg_cpu = 0.0
+        if monitor.pg_process:
+            try:
+                try:
+                    mem_info = monitor.pg_process.memory_full_info()
+                    pg_peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+                except (psutil.AccessDenied, AttributeError):
+                    mem_info = monitor.pg_process.memory_info()
+                    pg_peak = mem_info.rss
+                pg_cpu = monitor.pg_process.cpu_percent()
+                
+                pg_baseline_mb = monitor.pg_baseline / (1024 * 1024)
+                pg_peak_mb = pg_peak / (1024 * 1024)
+                pg_delta_mb = pg_peak_mb - pg_baseline_mb
+            except psutil.NoSuchProcess:
+                pass
 
-        baseline_mb = monitor.baseline / (1024 * 1024)
-        peak_mb = peak / (1024 * 1024)
-        delta_mb = peak_mb - baseline_mb
-
+        # System-wide stats
         sys_mem = psutil.virtual_memory()
-        sys_peak_mb = sys_mem.used / (1024 * 1024)
-        sys_cpu_usage = psutil.cpu_percent()
+        sys_mem_mb = sys_mem.used / (1024 * 1024)
+        sys_cpu = psutil.cpu_percent()
 
         stats = ResourceStats(
-            delta_mb=delta_mb,
-            peak_mb=peak_mb,
-            cpu_usage=cpu_usage,
-            sys_peak_mb=sys_peak_mb,
-            sys_cpu_usage=sys_cpu_usage
+            py_delta_mb=py_delta_mb,
+            py_peak_mb=py_peak_mb,
+            py_cpu=py_cpu,
+            pg_delta_mb=pg_delta_mb,
+            pg_peak_mb=pg_peak_mb,
+            pg_cpu=pg_cpu,
+            sys_mem_mb=sys_mem_mb,
+            sys_cpu=sys_cpu
         )
 
         return result, stats
@@ -563,7 +611,8 @@ def scenario1_distributed(conn, products: List[dict],
 
 def run_scenario1_unified(products: List[dict], runs: int) -> List[BenchmarkResult]:
     """Run scenario 1 unified: cold start, insert + embed in PostgreSQL."""
-    conn, pid = connect_and_get_pid()
+    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
+    py_pid = os.getpid()
 
     try:
         # Warm up
@@ -576,7 +625,7 @@ def run_scenario1_unified(products: List[dict], runs: int) -> List[BenchmarkResu
         for _ in range(runs):
             truncate_pg_tables(conn)
             elapsed, stats = ResourceMonitor.measure(
-                pid,
+                py_pid, pg_pid,
                 lambda: scenario1_unified(conn, products)
             )
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
@@ -590,11 +639,11 @@ def run_scenario1_distributed(products: List[dict],
                               embed_client: EmbedAnythingDirectClient,
                               runs: int) -> List[BenchmarkResult]:
     """Run scenario 1 distributed: cold start, insert + embed from app data."""
-    pid = os.getpid()
+    py_pid = os.getpid()
 
     # Warm up
     warmup_products = generate_products(8)
-    conn, _ = connect_and_get_pid()
+    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
     client, collection, db_path = create_chroma_client()
     try:
         truncate_pg_tables(conn)
@@ -611,7 +660,7 @@ def run_scenario1_distributed(products: List[dict],
         try:
             truncate_pg_tables(conn)
             elapsed, stats = ResourceMonitor.measure(
-                pid,
+                py_pid, pg_pid,
                 lambda: scenario1_distributed(conn, products, embed_client, collection)
             )
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
@@ -624,7 +673,8 @@ def run_scenario1_distributed(products: List[dict],
 
 def run_scenario2_unified(products: List[dict], runs: int) -> List[BenchmarkResult]:
     """Run scenario 2 unified: pre-existing data, generate embeddings only."""
-    conn, pid = connect_and_get_pid()
+    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
+    py_pid = os.getpid()
 
     try:
         # Setup: insert data first (not timed)
@@ -640,7 +690,7 @@ def run_scenario2_unified(products: List[dict], runs: int) -> List[BenchmarkResu
         for _ in range(runs):
             clear_embeddings(conn)
             elapsed, stats = ResourceMonitor.measure(
-                pid,
+                py_pid, pg_pid,
                 lambda: scenario2_unified(conn)
             )
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
@@ -654,10 +704,10 @@ def run_scenario2_distributed(products: List[dict],
                               embed_client: EmbedAnythingDirectClient,
                               runs: int) -> List[BenchmarkResult]:
     """Run scenario 2 distributed: pre-existing data, fetch + embed + store."""
-    pid = os.getpid()
+    py_pid = os.getpid()
 
     # Setup: insert data into PostgreSQL first (not timed)
-    conn, _ = connect_and_get_pid()
+    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
     truncate_pg_tables(conn)
     insert_product_data(conn, products)
     conn.close()
@@ -678,7 +728,7 @@ def run_scenario2_distributed(products: List[dict],
         client, collection, db_path = create_chroma_client()
         try:
             elapsed, stats = ResourceMonitor.measure(
-                pid,
+                py_pid, pg_pid,
                 lambda: scenario2_distributed(conn, embed_client, collection)
             )
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
@@ -700,19 +750,22 @@ def safe_stdev(values: List[float]) -> float:
 
 def print_header():
     """Print benchmark results header."""
-    print(f"{'':14} | {'Time (s)':>12} | {'Δ Mem (MB)':>12} | {'Peak (MB)':>12} | "
-          f"{'CPU (%)':>12} | {'Sys Mem (MB)':>12} | {'Sys CPU (%)':>12}")
-    print("=" * 105)
+    print(f"{'':14} | {'Time (s)':>12} | {'Py Δ MB':>10} | {'Py Peak':>10} | {'Py CPU%':>8} | "
+          f"{'PG Δ MB':>10} | {'PG Peak':>10} | {'PG CPU%':>8} | {'Sys MB':>10} | {'Sys CPU%':>8}")
+    print("=" * 135)
 
 
 def print_result(label: str, results: List[BenchmarkResult]):
     """Print aggregated results from multiple runs with ± std dev."""
     times = [r.time_s for r in results]
-    delta_mems = [r.stats.delta_mb for r in results]
-    peak_mems = [r.stats.peak_mb for r in results]
-    cpus = [r.stats.cpu_usage for r in results]
-    sys_peak_mems = [r.stats.sys_peak_mb for r in results]
-    sys_cpus = [r.stats.sys_cpu_usage for r in results]
+    py_delta = [r.stats.py_delta_mb for r in results]
+    py_peak = [r.stats.py_peak_mb for r in results]
+    py_cpu = [r.stats.py_cpu for r in results]
+    pg_delta = [r.stats.pg_delta_mb for r in results]
+    pg_peak = [r.stats.pg_peak_mb for r in results]
+    pg_cpu = [r.stats.pg_cpu for r in results]
+    sys_mem = [r.stats.sys_mem_mb for r in results]
+    sys_cpu = [r.stats.sys_cpu for r in results]
 
     def fmt(values: List[float], precision: int = 1) -> str:
         avg = mean(values)
@@ -724,8 +777,8 @@ def print_result(label: str, results: List[BenchmarkResult]):
         else:
             return f"{avg:.1f}±{std:.1f}"
 
-    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(delta_mems):>12} | {fmt(peak_mems):>12} | "
-          f"{fmt(cpus):>12} | {fmt(sys_peak_mems, 0):>12} | {fmt(sys_cpus):>12}")
+    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(py_delta):>10} | {fmt(py_peak):>10} | {fmt(py_cpu):>8} | "
+          f"{fmt(pg_delta):>10} | {fmt(pg_peak):>10} | {fmt(pg_cpu):>8} | {fmt(sys_mem, 0):>10} | {fmt(sys_cpu):>8}")
 
 
 def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
@@ -736,16 +789,25 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
         'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
         'time_s': mean(times),
         'time_s_std': safe_stdev(times),
-        'cpu': mean([r.stats.cpu_usage for r in results]),
-        'cpu_std': safe_stdev([r.stats.cpu_usage for r in results]),
-        'mem_delta': mean([r.stats.delta_mb for r in results]),
-        'mem_delta_std': safe_stdev([r.stats.delta_mb for r in results]),
-        'mem_peak': mean([r.stats.peak_mb for r in results]),
-        'mem_peak_std': safe_stdev([r.stats.peak_mb for r in results]),
-        'sys_cpu': mean([r.stats.sys_cpu_usage for r in results]),
-        'sys_cpu_std': safe_stdev([r.stats.sys_cpu_usage for r in results]),
-        'sys_mem': mean([r.stats.sys_peak_mb for r in results]),
-        'sys_mem_std': safe_stdev([r.stats.sys_peak_mb for r in results]),
+        # Python process
+        'py_cpu': mean([r.stats.py_cpu for r in results]),
+        'py_cpu_std': safe_stdev([r.stats.py_cpu for r in results]),
+        'py_mem_delta': mean([r.stats.py_delta_mb for r in results]),
+        'py_mem_delta_std': safe_stdev([r.stats.py_delta_mb for r in results]),
+        'py_mem_peak': mean([r.stats.py_peak_mb for r in results]),
+        'py_mem_peak_std': safe_stdev([r.stats.py_peak_mb for r in results]),
+        # PostgreSQL process
+        'pg_cpu': mean([r.stats.pg_cpu for r in results]),
+        'pg_cpu_std': safe_stdev([r.stats.pg_cpu for r in results]),
+        'pg_mem_delta': mean([r.stats.pg_delta_mb for r in results]),
+        'pg_mem_delta_std': safe_stdev([r.stats.pg_delta_mb for r in results]),
+        'pg_mem_peak': mean([r.stats.pg_peak_mb for r in results]),
+        'pg_mem_peak_std': safe_stdev([r.stats.pg_peak_mb for r in results]),
+        # System-wide
+        'sys_cpu': mean([r.stats.sys_cpu for r in results]),
+        'sys_cpu_std': safe_stdev([r.stats.sys_cpu for r in results]),
+        'sys_mem': mean([r.stats.sys_mem_mb for r in results]),
+        'sys_mem_std': safe_stdev([r.stats.sys_mem_mb for r in results]),
     }
 
 
@@ -836,7 +898,10 @@ def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     methods = ['unified', 'distributed']
-    metrics = ['throughput', 'time_s', 'cpu', 'mem_delta', 'mem_peak', 'sys_cpu', 'sys_mem']
+    metrics = ['throughput', 'time_s', 
+               'py_cpu', 'py_mem_delta', 'py_mem_peak',
+               'pg_cpu', 'pg_mem_delta', 'pg_mem_peak',
+               'sys_cpu', 'sys_mem']
 
     # Build header with _std columns
     header = ['size']
@@ -907,15 +972,14 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
     # Scenario 1 plots
     plot_metric(all_results_s1, sizes_s1, 'throughput', 'Throughput (products/sec)',
                 'Scenario 1 Cold Start: Throughput', f"s1_throughput_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'cpu', 'Process CPU Usage (%)',
-                'Scenario 1 Cold Start: Process CPU\n(Unified: PostgreSQL, Distributed: Python)',
-                f"s1_cpu_process_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'mem_delta', 'Process Memory Delta (MB)',
-                'Scenario 1 Cold Start: Process Memory Change\n(Unified: PostgreSQL, Distributed: Python)',
-                f"s1_memory_delta_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'mem_peak', 'Process Peak Memory (MB)',
-                'Scenario 1 Cold Start: Process Peak Memory\n(Unified: PostgreSQL, Distributed: Python)',
-                f"s1_memory_peak_{timestamp}.png")
+    plot_metric(all_results_s1, sizes_s1, 'py_cpu', 'Python Process CPU (%)',
+                'Scenario 1 Cold Start: Python Process CPU', f"s1_py_cpu_{timestamp}.png")
+    plot_metric(all_results_s1, sizes_s1, 'py_mem_peak', 'Python Peak Memory (MB)',
+                'Scenario 1 Cold Start: Python Peak Memory', f"s1_py_memory_{timestamp}.png")
+    plot_metric(all_results_s1, sizes_s1, 'pg_cpu', 'PostgreSQL Process CPU (%)',
+                'Scenario 1 Cold Start: PostgreSQL CPU', f"s1_pg_cpu_{timestamp}.png")
+    plot_metric(all_results_s1, sizes_s1, 'pg_mem_peak', 'PostgreSQL Peak Memory (MB)',
+                'Scenario 1 Cold Start: PostgreSQL Peak Memory', f"s1_pg_memory_{timestamp}.png")
     plot_metric(all_results_s1, sizes_s1, 'sys_cpu', 'System CPU Usage (%)',
                 'Scenario 1 Cold Start: System CPU', f"s1_cpu_system_{timestamp}.png")
     plot_metric(all_results_s1, sizes_s1, 'sys_mem', 'System Memory Used (MB)',
@@ -924,26 +988,25 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
     # Scenario 2 plots
     plot_metric(all_results_s2, sizes_s2, 'throughput', 'Throughput (products/sec)',
                 'Scenario 2 Pre-existing: Throughput', f"s2_throughput_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'cpu', 'Process CPU Usage (%)',
-                'Scenario 2 Pre-existing: Process CPU\n(Unified: PostgreSQL, Distributed: Python)',
-                f"s2_cpu_process_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'mem_delta', 'Process Memory Delta (MB)',
-                'Scenario 2 Pre-existing: Process Memory Change\n(Unified: PostgreSQL, Distributed: Python)',
-                f"s2_memory_delta_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'mem_peak', 'Process Peak Memory (MB)',
-                'Scenario 2 Pre-existing: Process Peak Memory\n(Unified: PostgreSQL, Distributed: Python)',
-                f"s2_memory_peak_{timestamp}.png")
+    plot_metric(all_results_s2, sizes_s2, 'py_cpu', 'Python Process CPU (%)',
+                'Scenario 2 Pre-existing: Python Process CPU', f"s2_py_cpu_{timestamp}.png")
+    plot_metric(all_results_s2, sizes_s2, 'py_mem_peak', 'Python Peak Memory (MB)',
+                'Scenario 2 Pre-existing: Python Peak Memory', f"s2_py_memory_{timestamp}.png")
+    plot_metric(all_results_s2, sizes_s2, 'pg_cpu', 'PostgreSQL Process CPU (%)',
+                'Scenario 2 Pre-existing: PostgreSQL CPU', f"s2_pg_cpu_{timestamp}.png")
+    plot_metric(all_results_s2, sizes_s2, 'pg_mem_peak', 'PostgreSQL Peak Memory (MB)',
+                'Scenario 2 Pre-existing: PostgreSQL Peak Memory', f"s2_pg_memory_{timestamp}.png")
     plot_metric(all_results_s2, sizes_s2, 'sys_cpu', 'System CPU Usage (%)',
                 'Scenario 2 Pre-existing: System CPU', f"s2_cpu_system_{timestamp}.png")
     plot_metric(all_results_s2, sizes_s2, 'sys_mem', 'System Memory Used (MB)',
                 'Scenario 2 Pre-existing: System Memory', f"s2_memory_system_{timestamp}.png")
 
-    # Summary bar charts (2x6 grid: 2 scenarios x 6 metrics) with error bars
-    # Note: Process metrics track PostgreSQL for Unified, Python for Distributed
-    fig, axes = plt.subplots(2, 6, figsize=(20, 8))
-    metric_labels = ['Throughput\n(prod/sec)', 'Proc CPU* (%)', 'Proc Mem* Δ (MB)', 'Proc Peak* (MB)', 'Sys CPU (%)',
-                     'Sys Mem (MB)']
-    metric_keys = ['throughput', 'cpu', 'mem_delta', 'mem_peak', 'sys_cpu', 'sys_mem']
+    # Summary bar charts (2x8 grid: 2 scenarios x 8 metrics) with error bars
+    fig, axes = plt.subplots(2, 8, figsize=(28, 8))
+    metric_labels = ['Throughput\n(prod/sec)', 'Py CPU (%)', 'Py Mem (MB)', 'PG CPU (%)', 
+                     'PG Mem (MB)', 'Sys CPU (%)', 'Sys Mem (MB)', 'Time (s)']
+    metric_keys = ['throughput', 'py_cpu', 'py_mem_peak', 'pg_cpu', 
+                   'pg_mem_peak', 'sys_cpu', 'sys_mem', 'time_s']
     x_pos = range(len(methods))
 
     for col, (metric, mlabel) in enumerate(zip(metric_keys, metric_labels)):

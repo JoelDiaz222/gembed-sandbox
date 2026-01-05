@@ -37,11 +37,15 @@ model_cache = {}
 
 @dataclass
 class ResourceStats:
-    delta_mb: float
-    peak_mb: float
-    cpu_usage: float
-    sys_peak_mb: float
-    sys_cpu_usage: float
+    """Resource statistics for both Python and PostgreSQL processes."""
+    py_delta_mb: float
+    py_peak_mb: float
+    py_cpu: float
+    pg_delta_mb: float
+    pg_peak_mb: float
+    pg_cpu: float
+    sys_mem_mb: float
+    sys_cpu: float
 
 
 @dataclass
@@ -51,49 +55,98 @@ class BenchmarkResult:
 
 
 class ResourceMonitor:
-    def __init__(self, pid: int):
-        self.pid = pid
-        self.process = psutil.Process(pid)
+    """Monitor resource usage for Python and PostgreSQL processes."""
 
+    def __init__(self, py_pid: int, pg_pid: int = None):
+        self.py_pid = py_pid
+        self.pg_pid = pg_pid
+        self.py_process = psutil.Process(py_pid)
+        self.pg_process = psutil.Process(pg_pid) if pg_pid else None
+
+        # Get Python baseline
         try:
-            mem_info = self.process.memory_full_info()
-            self.baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+            mem_info = self.py_process.memory_full_info()
+            self.py_baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
         except (psutil.AccessDenied, AttributeError):
-            mem_info = self.process.memory_info()
-            self.baseline = mem_info.rss
+            mem_info = self.py_process.memory_info()
+            self.py_baseline = mem_info.rss
 
-        self.process.cpu_percent()
+        # Get PostgreSQL baseline if available
+        self.pg_baseline = 0
+        if self.pg_process:
+            try:
+                mem_info = self.pg_process.memory_full_info()
+                self.pg_baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+            except (psutil.AccessDenied, AttributeError):
+                try:
+                    mem_info = self.pg_process.memory_info()
+                    self.pg_baseline = mem_info.rss
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    pass
+
+        # Prime CPU measurements
+        self.py_process.cpu_percent()
+        if self.pg_process:
+            try:
+                self.pg_process.cpu_percent()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
         time.sleep(0.1)
 
     @staticmethod
-    def measure(pid: int, func: Callable):
+    def measure(py_pid: int, pg_pid: int, func: Callable):
         """Measure resource usage during function execution."""
-        monitor = ResourceMonitor(pid)
+        monitor = ResourceMonitor(py_pid, pg_pid)
         result = func()
 
+        # Measure Python process
         try:
-            mem_info = monitor.process.memory_full_info()
-            peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+            mem_info = monitor.py_process.memory_full_info()
+            py_peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
         except (psutil.AccessDenied, AttributeError):
-            mem_info = monitor.process.memory_info()
-            peak = mem_info.rss
+            mem_info = monitor.py_process.memory_info()
+            py_peak = mem_info.rss
+        py_cpu = monitor.py_process.cpu_percent()
+        py_baseline_mb = monitor.py_baseline / (1024 * 1024)
+        py_peak_mb = py_peak / (1024 * 1024)
+        py_delta_mb = py_peak_mb - py_baseline_mb
 
-        cpu_usage = monitor.process.cpu_percent()
+        # Measure PostgreSQL process if available
+        pg_delta_mb = 0.0
+        pg_peak_mb = 0.0
+        pg_cpu = 0.0
+        if monitor.pg_process:
+            try:
+                mem_info = monitor.pg_process.memory_full_info()
+                pg_peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
+            except (psutil.AccessDenied, AttributeError):
+                try:
+                    mem_info = monitor.pg_process.memory_info()
+                    pg_peak = mem_info.rss
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    pg_peak = monitor.pg_baseline
+            try:
+                pg_cpu = monitor.pg_process.cpu_percent()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+            pg_baseline_mb = monitor.pg_baseline / (1024 * 1024)
+            pg_peak_mb = pg_peak / (1024 * 1024)
+            pg_delta_mb = pg_peak_mb - pg_baseline_mb
 
-        baseline_mb = monitor.baseline / (1024 * 1024)
-        peak_mb = peak / (1024 * 1024)
-        delta_mb = peak_mb - baseline_mb
-
+        # System-wide metrics
         sys_mem = psutil.virtual_memory()
-        sys_peak_mb = sys_mem.used / (1024 * 1024)
-        sys_cpu_usage = psutil.cpu_percent()
+        sys_mem_mb = sys_mem.used / (1024 * 1024)
+        sys_cpu = psutil.cpu_percent()
 
         stats = ResourceStats(
-            delta_mb=delta_mb,
-            peak_mb=peak_mb,
-            cpu_usage=cpu_usage,
-            sys_peak_mb=sys_peak_mb,
-            sys_cpu_usage=sys_cpu_usage
+            py_delta_mb=py_delta_mb,
+            py_peak_mb=py_peak_mb,
+            py_cpu=py_cpu,
+            pg_delta_mb=pg_delta_mb,
+            pg_peak_mb=pg_peak_mb,
+            pg_cpu=pg_cpu,
+            sys_mem_mb=sys_mem_mb,
+            sys_cpu=sys_cpu
         )
 
         return result, stats
@@ -233,28 +286,29 @@ def benchmark_chroma(collection, texts: List[str], embed_fn: Callable) -> float:
 
 # --- Benchmark Runner Functions ---
 
-def run_benchmark_iteration(pid: int, truncate_fn: Callable,
+def run_benchmark_iteration(py_pid: int, pg_pid: int, truncate_fn: Callable,
                             benchmark_fn: Callable) -> BenchmarkResult:
     """Run a single benchmark iteration with resource monitoring."""
     truncate_fn()
 
-    elapsed, stats = ResourceMonitor.measure(pid, benchmark_fn)
+    elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid, benchmark_fn)
     return BenchmarkResult(time_s=elapsed, stats=stats)
 
 
-def run_multiple_iterations(pid: int, truncate_fn: Callable, benchmark_fn: Callable,
-                            runs: int) -> List[BenchmarkResult]:
+def run_multiple_iterations(py_pid: int, pg_pid: int, truncate_fn: Callable,
+                            benchmark_fn: Callable, runs: int) -> List[BenchmarkResult]:
     """Run multiple benchmark iterations."""
     results = []
     for _ in range(runs):
-        result = run_benchmark_iteration(pid, truncate_fn, benchmark_fn)
+        result = run_benchmark_iteration(py_pid, pg_pid, truncate_fn, benchmark_fn)
         results.append(result)
     return results
 
 
 def run_pg_method(texts: List[str], provider: str, runs: int) -> List[BenchmarkResult]:
     """Run PG benchmark with fresh connection, warmup, then timed runs."""
-    conn, pid = connect_and_get_pid()
+    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
+    py_pid = os.getpid()
 
     try:
         # Warm up
@@ -264,7 +318,8 @@ def run_pg_method(texts: List[str], provider: str, runs: int) -> List[BenchmarkR
 
         # Run benchmark
         results = run_multiple_iterations(
-            pid,
+            py_pid,
+            pg_pid,
             lambda: truncate_pg_table(conn),
             lambda: benchmark_pg_internal(conn, texts, provider, EMBED_ANYTHING_MODEL),
             runs
@@ -277,7 +332,7 @@ def run_pg_method(texts: List[str], provider: str, runs: int) -> List[BenchmarkR
 def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
                       runs: int) -> List[BenchmarkResult]:
     """Run ChromaDB benchmark with fresh client, warmup, then timed runs."""
-    pid = os.getpid()
+    py_pid = os.getpid()
 
     # Create fresh client for warmup
     client, collection, db_path = create_chroma_client()
@@ -289,13 +344,14 @@ def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
     finally:
         cleanup_chroma(client, db_path)
 
-    # Run actual benchmark iterations
+    # Run actual benchmark iterations (no PG process for ChromaDB)
     results = []
     for _ in range(runs):
         client, collection, db_path = create_chroma_client()
         try:
             elapsed, stats = ResourceMonitor.measure(
-                pid,
+                py_pid,
+                None,  # No PostgreSQL process for ChromaDB
                 lambda: benchmark_chroma(collection, texts, embed_client.embed)
             )
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
@@ -315,19 +371,22 @@ def safe_stdev(values: List[float]) -> float:
 def print_header():
     """Print benchmark results header."""
     print("Benchmark Results:")
-    print(f"{'':14} | {'Time (s)':>12} | {'Δ Mem (MB)':>12} | {'Peak (MB)':>12} | "
-          f"{'CPU (%)':>12} | {'Sys Mem (MB)':>12} | {'Sys CPU (%)':>12}")
-    print("=" * 105)
+    print(f"{'':14} | {'Time (s)':>12} | {'Py Δ MB':>12} | {'Py Peak':>12} | {'Py CPU':>10} | "
+          f"{'PG Δ MB':>12} | {'PG Peak':>12} | {'PG CPU':>10} | {'Sys MB':>10} | {'Sys CPU':>10}")
+    print("=" * 145)
 
 
 def print_result(label: str, results: List[BenchmarkResult]):
     """Print aggregated results from multiple runs with ± std dev."""
     times = [r.time_s for r in results]
-    delta_mems = [r.stats.delta_mb for r in results]
-    peak_mems = [r.stats.peak_mb for r in results]
-    cpus = [r.stats.cpu_usage for r in results]
-    sys_peak_mems = [r.stats.sys_peak_mb for r in results]
-    sys_cpus = [r.stats.sys_cpu_usage for r in results]
+    py_delta_mems = [r.stats.py_delta_mb for r in results]
+    py_peak_mems = [r.stats.py_peak_mb for r in results]
+    py_cpus = [r.stats.py_cpu for r in results]
+    pg_delta_mems = [r.stats.pg_delta_mb for r in results]
+    pg_peak_mems = [r.stats.pg_peak_mb for r in results]
+    pg_cpus = [r.stats.pg_cpu for r in results]
+    sys_mems = [r.stats.sys_mem_mb for r in results]
+    sys_cpus = [r.stats.sys_cpu for r in results]
 
     def fmt(values: List[float], precision: int = 1) -> str:
         avg = mean(values)
@@ -339,8 +398,9 @@ def print_result(label: str, results: List[BenchmarkResult]):
         else:
             return f"{avg:.1f}±{std:.1f}"
 
-    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(delta_mems):>12} | {fmt(peak_mems):>12} | "
-          f"{fmt(cpus):>12} | {fmt(sys_peak_mems, 0):>12} | {fmt(sys_cpus):>12}")
+    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(py_delta_mems):>12} | {fmt(py_peak_mems):>12} | "
+          f"{fmt(py_cpus):>10} | {fmt(pg_delta_mems):>12} | {fmt(pg_peak_mems):>12} | {fmt(pg_cpus):>10} | "
+          f"{fmt(sys_mems, 0):>10} | {fmt(sys_cpus):>10}")
 
 
 def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
@@ -351,16 +411,22 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
         'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
         'time_s': mean(times),
         'time_s_std': safe_stdev(times),
-        'cpu': mean([r.stats.cpu_usage for r in results]),
-        'cpu_std': safe_stdev([r.stats.cpu_usage for r in results]),
-        'mem_delta': mean([r.stats.delta_mb for r in results]),
-        'mem_delta_std': safe_stdev([r.stats.delta_mb for r in results]),
-        'mem_peak': mean([r.stats.peak_mb for r in results]),
-        'mem_peak_std': safe_stdev([r.stats.peak_mb for r in results]),
-        'sys_cpu': mean([r.stats.sys_cpu_usage for r in results]),
-        'sys_cpu_std': safe_stdev([r.stats.sys_cpu_usage for r in results]),
-        'sys_mem': mean([r.stats.sys_peak_mb for r in results]),
-        'sys_mem_std': safe_stdev([r.stats.sys_peak_mb for r in results]),
+        'py_cpu': mean([r.stats.py_cpu for r in results]),
+        'py_cpu_std': safe_stdev([r.stats.py_cpu for r in results]),
+        'py_mem_delta': mean([r.stats.py_delta_mb for r in results]),
+        'py_mem_delta_std': safe_stdev([r.stats.py_delta_mb for r in results]),
+        'py_mem_peak': mean([r.stats.py_peak_mb for r in results]),
+        'py_mem_peak_std': safe_stdev([r.stats.py_peak_mb for r in results]),
+        'pg_cpu': mean([r.stats.pg_cpu for r in results]),
+        'pg_cpu_std': safe_stdev([r.stats.pg_cpu for r in results]),
+        'pg_mem_delta': mean([r.stats.pg_delta_mb for r in results]),
+        'pg_mem_delta_std': safe_stdev([r.stats.pg_delta_mb for r in results]),
+        'pg_mem_peak': mean([r.stats.pg_peak_mb for r in results]),
+        'pg_mem_peak_std': safe_stdev([r.stats.pg_peak_mb for r in results]),
+        'sys_cpu': mean([r.stats.sys_cpu for r in results]),
+        'sys_cpu_std': safe_stdev([r.stats.sys_cpu for r in results]),
+        'sys_mem': mean([r.stats.sys_mem_mb for r in results]),
+        'sys_mem_std': safe_stdev([r.stats.sys_mem_mb for r in results]),
     }
 
 
@@ -426,7 +492,8 @@ def save_results_csv(all_results: List[dict]):
     csv_path = OUTPUT_DIR / f"benchmark_{timestamp}.csv"
 
     methods = ['pg_local', 'pg_grpc', 'chroma']
-    metrics = ['throughput', 'time_s', 'cpu', 'mem_delta', 'mem_peak', 'sys_cpu', 'sys_mem']
+    metrics = ['throughput', 'time_s', 'py_cpu', 'py_mem_delta', 'py_mem_peak',
+               'pg_cpu', 'pg_mem_delta', 'pg_mem_peak', 'sys_cpu', 'sys_mem']
 
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -476,23 +543,39 @@ def generate_plots(all_results: List[dict]):
     plt.savefig(OUTPUT_DIR / f"throughput_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # Plot 2: Process CPU Usage
+    # Plot 2: Python Process CPU Usage
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['cpu'] for r in all_results]
-        y_errs = [r[method]['cpu_std'] for r in all_results]
+        y_vals = [r[method]['py_cpu'] for r in all_results]
+        y_errs = [r[method]['py_cpu_std'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
-    plt.ylabel('Process CPU Usage (%)')
-    plt.title(f'Process CPU Usage (batch size={BATCH_SIZE})\n(PG: PostgreSQL process, ChromaDB: Python process)')
+    plt.ylabel('Python CPU Usage (%)')
+    plt.title(f'Python Process CPU Usage (batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"cpu_process_{timestamp}.png", dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / f"cpu_python_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # Plot 3: System CPU Usage
+    # Plot 3: PostgreSQL Process CPU Usage
+    plt.figure(figsize=(10, 6))
+    for method, label, color, marker in zip(methods, labels, colors, markers):
+        y_vals = [r[method]['pg_cpu'] for r in all_results]
+        y_errs = [r[method]['pg_cpu_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
+    plt.xlabel('Number of Texts')
+    plt.ylabel('PostgreSQL CPU Usage (%)')
+    plt.title(f'PostgreSQL Process CPU Usage (batch size={BATCH_SIZE})\n(ChromaDB shows 0 - no PG process)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xscale('log', base=2)
+    plt.savefig(OUTPUT_DIR / f"cpu_postgres_{timestamp}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Plot 4: System CPU Usage
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
         y_vals = [r[method]['sys_cpu'] for r in all_results]
@@ -508,39 +591,71 @@ def generate_plots(all_results: List[dict]):
     plt.savefig(OUTPUT_DIR / f"cpu_system_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # Plot 4: Process Memory Delta
+    # Plot 5: Python Process Memory Delta
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['mem_delta'] for r in all_results]
-        y_errs = [r[method]['mem_delta_std'] for r in all_results]
+        y_vals = [r[method]['py_mem_delta'] for r in all_results]
+        y_errs = [r[method]['py_mem_delta_std'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
-    plt.ylabel('Process Memory Delta (MB)')
-    plt.title(f'Process Memory Change (batch size={BATCH_SIZE})\n(PG: PostgreSQL process, ChromaDB: Python process)')
+    plt.ylabel('Python Memory Delta (MB)')
+    plt.title(f'Python Process Memory Change (batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"memory_delta_{timestamp}.png", dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / f"memory_python_delta_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # Plot 5: Process Peak Memory
+    # Plot 6: PostgreSQL Process Memory Delta
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['mem_peak'] for r in all_results]
-        y_errs = [r[method]['mem_peak_std'] for r in all_results]
+        y_vals = [r[method]['pg_mem_delta'] for r in all_results]
+        y_errs = [r[method]['pg_mem_delta_std'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
-    plt.ylabel('Process Peak Memory (MB)')
-    plt.title(f'Process Peak Memory (batch size={BATCH_SIZE})\n(PG: PostgreSQL process, ChromaDB: Python process)')
+    plt.ylabel('PostgreSQL Memory Delta (MB)')
+    plt.title(f'PostgreSQL Process Memory Change (batch size={BATCH_SIZE})\n(ChromaDB shows 0 - no PG process)')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"memory_peak_{timestamp}.png", dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / f"memory_postgres_delta_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # Plot 6: System Memory
+    # Plot 7: Python Process Peak Memory
+    plt.figure(figsize=(10, 6))
+    for method, label, color, marker in zip(methods, labels, colors, markers):
+        y_vals = [r[method]['py_mem_peak'] for r in all_results]
+        y_errs = [r[method]['py_mem_peak_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
+    plt.xlabel('Number of Texts')
+    plt.ylabel('Python Peak Memory (MB)')
+    plt.title(f'Python Process Peak Memory (batch size={BATCH_SIZE})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xscale('log', base=2)
+    plt.savefig(OUTPUT_DIR / f"memory_python_peak_{timestamp}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Plot 8: PostgreSQL Process Peak Memory
+    plt.figure(figsize=(10, 6))
+    for method, label, color, marker in zip(methods, labels, colors, markers):
+        y_vals = [r[method]['pg_mem_peak'] for r in all_results]
+        y_errs = [r[method]['pg_mem_peak_std'] for r in all_results]
+        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
+                     linewidth=2, color=color, capsize=3, capthick=1)
+    plt.xlabel('Number of Texts')
+    plt.ylabel('PostgreSQL Peak Memory (MB)')
+    plt.title(f'PostgreSQL Process Peak Memory (batch size={BATCH_SIZE})\n(ChromaDB shows 0 - no PG process)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xscale('log', base=2)
+    plt.savefig(OUTPUT_DIR / f"memory_postgres_peak_{timestamp}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Plot 9: System Memory
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
         y_vals = [r[method]['sys_mem'] for r in all_results]
@@ -556,8 +671,8 @@ def generate_plots(all_results: List[dict]):
     plt.savefig(OUTPUT_DIR / f"memory_system_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # Plot 7: Summary bar chart (2x3 grid) with error bars
-    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    # Plot 10: Summary bar chart (2x4 grid) with error bars
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
     fig.suptitle(f'Average Metrics (batch size={BATCH_SIZE})', fontsize=14)
     x_pos = range(len(methods))
 
@@ -566,60 +681,80 @@ def generate_plots(all_results: List[dict]):
     stds = [safe_stdev([r[m]['throughput'] for r in all_results]) for m in methods]
     bars = axes[0, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[0, 0].set_xticks(x_pos)
-    axes[0, 0].set_xticklabels(labels)
-    axes[0, 0].set_ylabel('Throughput (texts/sec)')
+    axes[0, 0].set_xticklabels(labels, fontsize=8)
+    axes[0, 0].set_ylabel('texts/sec')
     axes[0, 0].set_title('Throughput')
-    axes[0, 0].bar_label(bars, fmt='%.1f')
+    axes[0, 0].bar_label(bars, fmt='%.1f', fontsize=7)
 
-    # Process CPU (PG=PostgreSQL, Chroma=Python)
-    avgs = [mean([r[m]['cpu'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['cpu'] for r in all_results]) for m in methods]
+    # Python CPU
+    avgs = [mean([r[m]['py_cpu'] for r in all_results]) for m in methods]
+    stds = [safe_stdev([r[m]['py_cpu'] for r in all_results]) for m in methods]
     bars = axes[0, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[0, 1].set_xticks(x_pos)
-    axes[0, 1].set_xticklabels(labels)
-    axes[0, 1].set_ylabel('CPU Usage (%)')
-    axes[0, 1].set_title('Process CPU*')
-    axes[0, 1].bar_label(bars, fmt='%.1f')
+    axes[0, 1].set_xticklabels(labels, fontsize=8)
+    axes[0, 1].set_ylabel('CPU %')
+    axes[0, 1].set_title('Python CPU')
+    axes[0, 1].bar_label(bars, fmt='%.1f', fontsize=7)
+
+    # PostgreSQL CPU
+    avgs = [mean([r[m]['pg_cpu'] for r in all_results]) for m in methods]
+    stds = [safe_stdev([r[m]['pg_cpu'] for r in all_results]) for m in methods]
+    bars = axes[0, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[0, 2].set_xticks(x_pos)
+    axes[0, 2].set_xticklabels(labels, fontsize=8)
+    axes[0, 2].set_ylabel('CPU %')
+    axes[0, 2].set_title('PostgreSQL CPU')
+    axes[0, 2].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # System CPU
     avgs = [mean([r[m]['sys_cpu'] for r in all_results]) for m in methods]
     stds = [safe_stdev([r[m]['sys_cpu'] for r in all_results]) for m in methods]
-    bars = axes[0, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[0, 2].set_xticks(x_pos)
-    axes[0, 2].set_xticklabels(labels)
-    axes[0, 2].set_ylabel('CPU Usage (%)')
-    axes[0, 2].set_title('System CPU')
-    axes[0, 2].bar_label(bars, fmt='%.1f')
+    bars = axes[0, 3].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[0, 3].set_xticks(x_pos)
+    axes[0, 3].set_xticklabels(labels, fontsize=8)
+    axes[0, 3].set_ylabel('CPU %')
+    axes[0, 3].set_title('System CPU')
+    axes[0, 3].bar_label(bars, fmt='%.1f', fontsize=7)
 
-    # Memory Delta (PG=PostgreSQL, Chroma=Python)
-    avgs = [mean([r[m]['mem_delta'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['mem_delta'] for r in all_results]) for m in methods]
+    # Python Memory Delta
+    avgs = [mean([r[m]['py_mem_delta'] for r in all_results]) for m in methods]
+    stds = [safe_stdev([r[m]['py_mem_delta'] for r in all_results]) for m in methods]
     bars = axes[1, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[1, 0].set_xticks(x_pos)
-    axes[1, 0].set_xticklabels(labels)
-    axes[1, 0].set_ylabel('Memory (MB)')
-    axes[1, 0].set_title('Process Mem Δ*')
-    axes[1, 0].bar_label(bars, fmt='%.1f')
+    axes[1, 0].set_xticklabels(labels, fontsize=8)
+    axes[1, 0].set_ylabel('MB')
+    axes[1, 0].set_title('Python Mem Δ')
+    axes[1, 0].bar_label(bars, fmt='%.1f', fontsize=7)
 
-    # Peak Memory (PG=PostgreSQL, Chroma=Python)
-    avgs = [mean([r[m]['mem_peak'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['mem_peak'] for r in all_results]) for m in methods]
+    # PostgreSQL Memory Delta
+    avgs = [mean([r[m]['pg_mem_delta'] for r in all_results]) for m in methods]
+    stds = [safe_stdev([r[m]['pg_mem_delta'] for r in all_results]) for m in methods]
     bars = axes[1, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[1, 1].set_xticks(x_pos)
-    axes[1, 1].set_xticklabels(labels)
-    axes[1, 1].set_ylabel('Memory (MB)')
-    axes[1, 1].set_title('Process Peak Mem*')
-    axes[1, 1].bar_label(bars, fmt='%.1f')
+    axes[1, 1].set_xticklabels(labels, fontsize=8)
+    axes[1, 1].set_ylabel('MB')
+    axes[1, 1].set_title('PostgreSQL Mem Δ')
+    axes[1, 1].bar_label(bars, fmt='%.1f', fontsize=7)
+
+    # Python Peak Memory
+    avgs = [mean([r[m]['py_mem_peak'] for r in all_results]) for m in methods]
+    stds = [safe_stdev([r[m]['py_mem_peak'] for r in all_results]) for m in methods]
+    bars = axes[1, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[1, 2].set_xticks(x_pos)
+    axes[1, 2].set_xticklabels(labels, fontsize=8)
+    axes[1, 2].set_ylabel('MB')
+    axes[1, 2].set_title('Python Peak Mem')
+    axes[1, 2].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # System Memory
     avgs = [mean([r[m]['sys_mem'] for r in all_results]) for m in methods]
     stds = [safe_stdev([r[m]['sys_mem'] for r in all_results]) for m in methods]
-    bars = axes[1, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[1, 2].set_xticks(x_pos)
-    axes[1, 2].set_xticklabels(labels)
-    axes[1, 2].set_ylabel('Memory (MB)')
-    axes[1, 2].set_title('System Memory')
-    axes[1, 2].bar_label(bars, fmt='%.0f')
+    bars = axes[1, 3].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+    axes[1, 3].set_xticks(x_pos)
+    axes[1, 3].set_xticklabels(labels, fontsize=8)
+    axes[1, 3].set_ylabel('MB')
+    axes[1, 3].set_title('System Memory')
+    axes[1, 3].bar_label(bars, fmt='%.0f', fontsize=7)
 
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / f"summary_{timestamp}.png", dpi=150, bbox_inches='tight')
