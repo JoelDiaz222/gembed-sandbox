@@ -27,31 +27,40 @@ This tests both where embeddings are generated (internal vs external) and where 
 
 1. Start the gRPC server (required for pg_gembed embedding):
 ```bash
-PYTHONPATH=.:proto python servers/grpc_server.py
+PYTHONPATH=.:proto python3.13 servers/grpc_server.py
 ```
 
-2. Run the benchmark:
+2. Run the benchmark (both modes):
 ```bash
-PYTHONPATH=.:proto python 2_pg_gembed-vs-chromadb/benchmark.py
+PYTHONPATH=.:proto python3.13 2_pg_gembed-vs-chromadb/benchmark.py
 ```
 
-## ChromaDB Configuration
+3. Or run specific mode:
+```bash
+# With indexing (HNSW enabled)
+PYTHONPATH=.:proto python3.13 2_pg_gembed-vs-chromadb/benchmark.py --with-index
 
-- **Collection**: `bench_collection`
-- **Index**: HNSW (Hierarchical Navigable Small World)
-- **Distance**: Cosine similarity (default)
-- **Persistence**: Local directory `chroma_bench_{timestamp}`
+# Without indexing (minimal HNSW for ChromaDB, no index for pgvector)
+PYTHONPATH=.:proto python3.13 2_pg_gembed-vs-chromadb/benchmark.py --without-index
+```
 
-## pgvector Configuration
+## Index Modes
 
-The HNSW index is configured to match ChromaDB's defaults for fair comparison:
-- **Index**: `USING hnsw (embedding vector_cosine_ops)`
-- **Parameters**: `m = 16, ef_construction = 100`
+The benchmark runs in two modes to compare indexing overhead.
 
+### With Index (`output/with_index/`)
+- **pgvector**: HNSW index with `m = 16, ef_construction = 100`
+- **ChromaDB**: HNSW index configured with `max_neighbors = 16, ef_construction = 100` (persisted on the collection)
+
+### Without Index (`output/without_index/`)
+- **pgvector**: No index (sequential scan)
+- **ChromaDB**: Minimal HNSW index configured with `max_neighbors = 2, ef_construction = 0` to reduce indexing overhead while avoiding unsafe parameter combinations
+  - Note: ChromaDB persists an HNSW index configuration on collections; extremely small HNSW parameter combinations (e.g. `max_neighbors = 0`) can cause runtime failures, so we use a safe minimal setting above.
 ## Output
 
-- Console summary with performance comparison table
-- ChromaDB data directory (can be deleted after benchmark)
+Results are saved to separate directories:
+- `output/with_index/` - Results with full indexing enabled
+- `output/without_index/` - Results with minimal/no indexing
 
 ## Notes
 

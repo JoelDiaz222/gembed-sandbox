@@ -107,6 +107,8 @@ Compares architectural patterns with two scenarios:
 Each scenario compares:
 - **Unified**: All data + embeddings in PostgreSQL with pg_gembed
 - **Distributed**: Metadata in PostgreSQL + embeddings in ChromaDB
+Both PostgreSQL and ChromaDB use an HNSW index with matching parameters for fair
+comparison: `m = 16`, `ef_construction = 100`.
 
 ```bash
 PYTHONPATH=.:proto python3.13 3_unified-vs-distributed/benchmark.py

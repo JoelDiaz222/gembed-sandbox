@@ -28,17 +28,18 @@ This benchmark compares different methods for generating embeddings before stori
 
 1. Start the gRPC server (if testing gRPC methods):
 ```bash
-PYTHONPATH=.:proto python servers/grpc_server.py
+PYTHONPATH=.:proto python3.13 servers/grpc_server.py
 ```
 
 2. Start the HTTP server (if testing HTTP methods):
 ```bash
-PYTHONPATH=.:proto python servers/http_server.py
+PYTHONPATH=.:proto python3.13 servers/http_server.py
 ```
 
 3. Run the benchmark:
+
 ```bash
-PYTHONPATH=.:proto python 1_internal-vs-external-gen/benchmark.py
+PYTHONPATH=.:proto python3.13 1_internal-vs-external-gen/benchmark.py
 ```
 
 ## Output

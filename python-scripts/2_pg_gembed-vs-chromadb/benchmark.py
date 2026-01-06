@@ -1,11 +1,12 @@
 import csv
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from statistics import mean, stdev
+from statistics import mean, stdev, median, quantiles
 from typing import Callable, List
 
 import chromadb
@@ -23,16 +24,25 @@ DB_CONFIG = {
     'user': 'joeldiaz',
 }
 
-TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
+TEST_SIZES = [16, 32, 64, 128, 256, 512]
 BATCH_SIZE = 32
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
-RUNS_PER_SIZE = 3
+RUNS_PER_SIZE = 5  # Number of runs per test size
 
-# Output directory
+# Output directory (set dynamically based on index mode)
 OUTPUT_DIR = Path(__file__).parent / "output"
 
 # Global model cache for direct Python calls
 model_cache = {}
+
+
+# Simple wrapper matching Chroma's EmbeddingFunction interface
+class EmbeddingWrapper:
+    def __init__(self, fn: Callable):
+        self._fn = fn
+
+    def __call__(self, input):
+        return self._fn(list(input))
 
 
 @dataclass
@@ -53,6 +63,23 @@ class BenchmarkResult:
     time_s: float
     stats: ResourceStats
 
+
+def safe_stdev(values: List[float]) -> float:
+    """Calculate standard deviation, returning 0 for lists with <2 elements."""
+    return stdev(values) if len(values) > 1 else 0.0
+
+
+def calc_iqr(values: List[float]) -> float:
+    """Calculate interquartile range (Q3 - Q1)."""
+    if len(values) < 4:
+        return 0.0
+    q = quantiles(values, n=4)
+    return q[2] - q[0]  # Q3 - Q1
+
+
+# =============================================================================
+# Resource Monitoring
+# =============================================================================
 
 class ResourceMonitor:
     """Monitor resource usage for Python and PostgreSQL processes."""
@@ -152,6 +179,10 @@ class ResourceMonitor:
         return result, stats
 
 
+# =============================================================================
+# Embedding Client
+# =============================================================================
+
 class EmbedAnythingDirectClient:
     """Direct Python client for EmbedAnything."""
 
@@ -185,8 +216,8 @@ def connect_and_get_pid():
     return conn, pid
 
 
-def setup_pg_database(conn):
-    """Initialize PostgreSQL schema with HNSW index."""
+def setup_pg_database(conn, use_index: bool = True):
+    """Initialize PostgreSQL schema, optionally with HNSW index."""
     cur = conn.cursor()
     cur.execute("""
                 CREATE EXTENSION IF NOT EXISTS vector;
@@ -198,9 +229,12 @@ def setup_pg_database(conn):
                     text      TEXT,
                     embedding vector(384)
                 );
-                CREATE INDEX ON embeddings_test
-                    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);
                 """)
+    if use_index:
+        cur.execute("""
+                    CREATE INDEX ON embeddings_test
+                        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);
+                    """)
     conn.commit()
     cur.close()
 
@@ -244,17 +278,40 @@ def benchmark_pg_internal(conn, texts: List[str], provider: str, model: str) -> 
 
 # --- ChromaDB Functions ---
 
-def create_chroma_client(base_path: str = "./chroma_bench"):
-    """Create a fresh ChromaDB persistent client."""
+def create_chroma_client(base_path: str = "./chroma_bench", use_index: bool = True, embed_fn: Callable = None):
+    """Create a fresh ChromaDB persistent client.
+    
+    When use_index=False, minimizes HNSW parameters to reduce indexing overhead.
+    Note: ChromaDB always uses HNSW internally, but we can minimize its impact.
+    """
     db_path = f"{base_path}_{time.time_ns()}"
     if os.path.exists(db_path):
         shutil.rmtree(db_path)
 
     client = chromadb.PersistentClient(path=db_path)
-    collection = client.create_collection(
-        "bench",
-        metadata={"hnsw:space": "cosine"}
-    )
+    
+    if use_index:
+        # Standard HNSW configuration for optimal search
+        configuration = {
+            "hnsw": {
+                "space": "cosine",
+                "max_neighbors": 16,
+                "ef_construction": 100
+            }
+        }
+    else:
+        # Minimal HNSW configuration to reduce indexing overhead (safe minimum)
+        configuration = {
+            "hnsw": {
+                "space": "cosine",
+                "max_neighbors": 2,
+                "ef_construction": 0
+            }
+        }
+    
+    # Always register the external embedding function for Chroma collections.
+    emb_obj = EmbeddingWrapper(embed_fn)
+    collection = client.create_collection("bench", embedding_function=emb_obj, configuration=configuration)
     return client, collection, db_path
 
 
@@ -330,12 +387,12 @@ def run_pg_method(texts: List[str], provider: str, runs: int) -> List[BenchmarkR
 
 
 def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
-                      runs: int) -> List[BenchmarkResult]:
+                      runs: int, use_index: bool = True) -> List[BenchmarkResult]:
     """Run ChromaDB benchmark with fresh client, warmup, then timed runs."""
     py_pid = os.getpid()
 
-    # Create fresh client for warmup
-    client, collection, db_path = create_chroma_client()
+    # Create fresh client for warmup (always register embed function)
+    client, collection, db_path = create_chroma_client(use_index=use_index, embed_fn=embed_client.embed)
 
     try:
         # Warm up
@@ -347,7 +404,7 @@ def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
     # Run actual benchmark iterations (no PG process for ChromaDB)
     results = []
     for _ in range(runs):
-        client, collection, db_path = create_chroma_client()
+        client, collection, db_path = create_chroma_client(use_index=use_index, embed_fn=embed_client.embed)
         try:
             elapsed, stats = ResourceMonitor.measure(
                 py_pid,
@@ -363,17 +420,22 @@ def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
 
 # --- Output Functions ---
 
-def safe_stdev(values: List[float]) -> float:
-    """Calculate standard deviation, returning 0 for single values."""
-    return stdev(values) if len(values) > 1 else 0.0
-
-
 def print_header():
     """Print benchmark results header."""
-    print("Benchmark Results:")
-    print(f"{'':14} | {'Time (s)':>12} | {'Py Δ MB':>12} | {'Py Peak':>12} | {'Py CPU':>10} | "
-          f"{'PG Δ MB':>12} | {'PG Peak':>12} | {'PG CPU':>10} | {'Sys MB':>10} | {'Sys CPU':>10}")
-    print("=" * 145)
+    # Column widths
+    lbl_w = 12
+    time_w = 12
+    col_w = 11
+
+    print("Benchmark Results:", flush=True)
+    med_w = 7
+    header = (
+        "  " +
+        f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU μ±σ':>{col_w}} | "
+        f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU μ±σ':>{col_w}} | {'Sys MB μ±σ':>{col_w}} | {'Sys CPU% μ±σ':>{col_w}}"
+    )
+    print(header, flush=True)
+    print("=" * len(header), flush=True)
 
 
 def print_result(label: str, results: List[BenchmarkResult]):
@@ -388,7 +450,7 @@ def print_result(label: str, results: List[BenchmarkResult]):
     sys_mems = [r.stats.sys_mem_mb for r in results]
     sys_cpus = [r.stats.sys_cpu for r in results]
 
-    def fmt(values: List[float], precision: int = 1) -> str:
+    def fmt_mean(values: List[float], precision: int = 1) -> str:
         avg = mean(values)
         std = safe_stdev(values)
         if precision == 3:
@@ -398,42 +460,134 @@ def print_result(label: str, results: List[BenchmarkResult]):
         else:
             return f"{avg:.1f}±{std:.1f}"
 
-    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(py_delta_mems):>12} | {fmt(py_peak_mems):>12} | "
-          f"{fmt(py_cpus):>10} | {fmt(pg_delta_mems):>12} | {fmt(pg_peak_mems):>12} | {fmt(pg_cpus):>10} | "
-          f"{fmt(sys_mems, 0):>10} | {fmt(sys_cpus):>10}")
+    def fmt_median_iqr(values: List[float], precision: int = 1) -> str:
+        med = median(values)
+        iqr = calc_iqr(values)
+        if precision == 3:
+            return f"{med:.3f}±{iqr:.3f}"
+        elif precision == 0:
+            return f"{med:.0f}±{iqr:.0f}"
+        else:
+            return f"{med:.1f}±{iqr:.1f}"
+
+    # Row format: two-space prefix, label (left), med column, then numeric columns
+    row_fmt = (
+        "  {label:<12}{med:>7} | {time:>12} | {pyd:>11} | {pyp:>11} | {pyc:>11} | {pgd:>11} | {pgp:>11} | {pgc:>11} | {sysm:>11} | {sysc:>11}"
+    )
+    print(row_fmt.format(
+        label=label,
+        med='',
+        time=fmt_mean(times, 3),
+        pyd=fmt_mean(py_delta_mems),
+        pyp=fmt_mean(py_peak_mems),
+        pyc=fmt_mean(py_cpus),
+        pgd=fmt_mean(pg_delta_mems),
+        pgp=fmt_mean(pg_peak_mems),
+        pgc=fmt_mean(pg_cpus),
+        sysm=fmt_mean(sys_mems, 0),
+        sysc=fmt_mean(sys_cpus),
+    ), flush=True)
+    # median ± IQR
+    print(row_fmt.format(
+        label=label,
+        med=' (med)',
+        time=fmt_median_iqr(times, 3),
+        pyd=fmt_median_iqr(py_delta_mems),
+        pyp=fmt_median_iqr(py_peak_mems),
+        pyc=fmt_median_iqr(py_cpus),
+        pgd=fmt_median_iqr(pg_delta_mems),
+        pgp=fmt_median_iqr(pg_peak_mems),
+        pgc=fmt_median_iqr(pg_cpus),
+        sysm=fmt_median_iqr(sys_mems, 0),
+        sysc=fmt_median_iqr(sys_cpus),
+    ), flush=True)
 
 
 def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
-    """Compute mean and std for all metrics from benchmark results."""
+    """Compute mean/std and median/IQR for all metrics from benchmark results."""
     times = [r.time_s for r in results]
+    py_cpu = [r.stats.py_cpu for r in results]
+    py_delta = [r.stats.py_delta_mb for r in results]
+    py_peak = [r.stats.py_peak_mb for r in results]
+    pg_cpu = [r.stats.pg_cpu for r in results]
+    pg_delta = [r.stats.pg_delta_mb for r in results]
+    pg_peak = [r.stats.pg_peak_mb for r in results]
+    sys_cpu = [r.stats.sys_cpu for r in results]
+    sys_mem = [r.stats.sys_mem_mb for r in results]
+    
     return {
+        # Throughput (mean-based)
         'throughput': size / mean(times),
         'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
+        'throughput_median': size / median(times),
+        'throughput_iqr': size / median(times) * calc_iqr(times) / median(times) if len(times) >= 4 else 0,
+        # Time
         'time_s': mean(times),
         'time_s_std': safe_stdev(times),
-        'py_cpu': mean([r.stats.py_cpu for r in results]),
-        'py_cpu_std': safe_stdev([r.stats.py_cpu for r in results]),
-        'py_mem_delta': mean([r.stats.py_delta_mb for r in results]),
-        'py_mem_delta_std': safe_stdev([r.stats.py_delta_mb for r in results]),
-        'py_mem_peak': mean([r.stats.py_peak_mb for r in results]),
-        'py_mem_peak_std': safe_stdev([r.stats.py_peak_mb for r in results]),
-        'pg_cpu': mean([r.stats.pg_cpu for r in results]),
-        'pg_cpu_std': safe_stdev([r.stats.pg_cpu for r in results]),
-        'pg_mem_delta': mean([r.stats.pg_delta_mb for r in results]),
-        'pg_mem_delta_std': safe_stdev([r.stats.pg_delta_mb for r in results]),
-        'pg_mem_peak': mean([r.stats.pg_peak_mb for r in results]),
-        'pg_mem_peak_std': safe_stdev([r.stats.pg_peak_mb for r in results]),
-        'sys_cpu': mean([r.stats.sys_cpu for r in results]),
-        'sys_cpu_std': safe_stdev([r.stats.sys_cpu for r in results]),
-        'sys_mem': mean([r.stats.sys_mem_mb for r in results]),
-        'sys_mem_std': safe_stdev([r.stats.sys_mem_mb for r in results]),
+        'time_s_median': median(times),
+        'time_s_iqr': calc_iqr(times),
+        # Python process
+        'py_cpu': mean(py_cpu),
+        'py_cpu_std': safe_stdev(py_cpu),
+        'py_cpu_median': median(py_cpu),
+        'py_cpu_iqr': calc_iqr(py_cpu),
+        'py_mem_delta': mean(py_delta),
+        'py_mem_delta_std': safe_stdev(py_delta),
+        'py_mem_delta_median': median(py_delta),
+        'py_mem_delta_iqr': calc_iqr(py_delta),
+        'py_mem_peak': mean(py_peak),
+        'py_mem_peak_std': safe_stdev(py_peak),
+        'py_mem_peak_median': median(py_peak),
+        'py_mem_peak_iqr': calc_iqr(py_peak),
+        # PostgreSQL process
+        'pg_cpu': mean(pg_cpu),
+        'pg_cpu_std': safe_stdev(pg_cpu),
+        'pg_cpu_median': median(pg_cpu),
+        'pg_cpu_iqr': calc_iqr(pg_cpu),
+        'pg_mem_delta': mean(pg_delta),
+        'pg_mem_delta_std': safe_stdev(pg_delta),
+        'pg_mem_delta_median': median(pg_delta),
+        'pg_mem_delta_iqr': calc_iqr(pg_delta),
+        'pg_mem_peak': mean(pg_peak),
+        'pg_mem_peak_std': safe_stdev(pg_peak),
+        'pg_mem_peak_median': median(pg_peak),
+        'pg_mem_peak_iqr': calc_iqr(pg_peak),
+        # System-wide
+        'sys_cpu': mean(sys_cpu),
+        'sys_cpu_std': safe_stdev(sys_cpu),
+        'sys_cpu_median': median(sys_cpu),
+        'sys_cpu_iqr': calc_iqr(sys_cpu),
+        'sys_mem': mean(sys_mem),
+        'sys_mem_std': safe_stdev(sys_mem),
+        'sys_mem_median': median(sys_mem),
+        'sys_mem_iqr': calc_iqr(sys_mem),
     }
 
 
-def main():
+def run_benchmark(use_index: bool):
+    """Run the full benchmark with the specified index configuration."""
+    global OUTPUT_DIR
+    
+    # Set output directory based on index mode
+    mode_name = "with_index" if use_index else "without_index"
+    OUTPUT_DIR = Path(__file__).parent / "output" / mode_name
+    
+    print(f"\n{'='*105}")
+    print(f"BENCHMARK MODE: {'WITH INDEX' if use_index else 'WITHOUT INDEX'}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"{'='*105}\n")
+    
+    if use_index:
+        print("pgvector: HNSW index (m=16, ef_construction=100)")
+        print("ChromaDB: HNSW index (max_neighbors=16, ef_construction=100)")
+    else:
+        print("pgvector: No index")
+        print("ChromaDB: Minimal HNSW index (max_neighbors=2, ef_construction=0)")
+    print()
+
     # Initialize PostgreSQL schema
     conn, _ = connect_and_get_pid()
-    setup_pg_database(conn)
+    setup_pg_database(conn, use_index=use_index)
     conn.close()
 
     # Initialize embedding client (reused across all runs)
@@ -445,7 +599,7 @@ def main():
 
     for size in TEST_SIZES:
         texts = make_inputs(size)
-        print(f"Size: {size}")
+        print(f"Size: {size}", flush=True)
 
         # Benchmark PG with EmbedAnything local
         pg_local_results = run_pg_method(texts, "embed_anything", RUNS_PER_SIZE)
@@ -454,7 +608,7 @@ def main():
         pg_grpc_results = run_pg_method(texts, "grpc", RUNS_PER_SIZE)
 
         # Benchmark ChromaDB with EmbedAnything
-        chroma_results = run_chroma_method(texts, embed_client, RUNS_PER_SIZE)
+        chroma_results = run_chroma_method(texts, embed_client, RUNS_PER_SIZE, use_index=use_index)
 
         print_result("PG local", pg_local_results)
         print_result("PG gRPC", pg_grpc_results)
@@ -485,6 +639,29 @@ def main():
     generate_plots(all_results)
 
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+def main():
+    """Run benchmarks in both index modes."""
+    # Check for command-line argument
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--with-index":
+            run_benchmark(use_index=True)
+        elif sys.argv[1] == "--without-index":
+            run_benchmark(use_index=False)
+        else:
+            print(f"Unknown argument: {sys.argv[1]}")
+            print("Usage: python benchmark.py [--with-index | --without-index]")
+            print("       Without arguments, runs both modes.")
+            sys.exit(1)
+    else:
+        # Run both modes
+        run_benchmark(use_index=True)
+        run_benchmark(use_index=False)
+
+
 def save_results_csv(all_results: List[dict]):
     """Save benchmark results to CSV file with mean and std values."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -497,20 +674,24 @@ def save_results_csv(all_results: List[dict]):
 
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        # Header: size, then method_metric and method_metric_std for each combination
+        # Header: size, then method_metric, _std, _median, _iqr for each combination
         header = ['size']
         for method in methods:
             for metric in metrics:
                 header.append(f"{method}_{metric}")
                 header.append(f"{method}_{metric}_std")
+                header.append(f"{method}_{metric}_median")
+                header.append(f"{method}_{metric}_iqr")
         writer.writerow(header)
 
         for r in all_results:
             row = [r['size']]
             for method in methods:
                 for metric in metrics:
-                    row.append(r[method][metric])
+                    row.append(r[method].get(metric))
                     row.append(r[method].get(f"{metric}_std", 0))
+                    row.append(r[method].get(f"{metric}_median", 0))
+                    row.append(r[method].get(f"{metric}_iqr", 0))
             writer.writerow(row)
 
     print(f"\nResults saved to: {csv_path}")
@@ -530,13 +711,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 1: Throughput
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['throughput'] for r in all_results]
-        y_errs = [r[method]['throughput_std'] for r in all_results]
+        y_vals = [r[method]['throughput_median'] for r in all_results]
+        y_errs = [r[method]['throughput_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Throughput (texts/sec)')
-    plt.title(f'PG+pgvector vs ChromaDB: Throughput (batch size={BATCH_SIZE})')
+    plt.title(f'PG+pgvector vs ChromaDB: Throughput (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -546,13 +727,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 2: Python Process CPU Usage
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['py_cpu'] for r in all_results]
-        y_errs = [r[method]['py_cpu_std'] for r in all_results]
+        y_vals = [r[method]['py_cpu_median'] for r in all_results]
+        y_errs = [r[method]['py_cpu_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Python CPU Usage (%)')
-    plt.title(f'Python Process CPU Usage (batch size={BATCH_SIZE})')
+    plt.title(f'Python Process CPU Usage (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -562,13 +743,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 3: PostgreSQL Process CPU Usage
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['pg_cpu'] for r in all_results]
-        y_errs = [r[method]['pg_cpu_std'] for r in all_results]
+        y_vals = [r[method]['pg_cpu_median'] for r in all_results]
+        y_errs = [r[method]['pg_cpu_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('PostgreSQL CPU Usage (%)')
-    plt.title(f'PostgreSQL Process CPU Usage (batch size={BATCH_SIZE})\n(ChromaDB shows 0 - no PG process)')
+    plt.title(f'PostgreSQL Process CPU Usage (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -578,13 +759,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 4: System CPU Usage
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['sys_cpu'] for r in all_results]
-        y_errs = [r[method]['sys_cpu_std'] for r in all_results]
+        y_vals = [r[method]['sys_cpu_median'] for r in all_results]
+        y_errs = [r[method]['sys_cpu_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('System CPU Usage (%)')
-    plt.title(f'PG+pgvector vs ChromaDB: System CPU (batch size={BATCH_SIZE})')
+    plt.title(f'PG+pgvector vs ChromaDB: System CPU (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -594,13 +775,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 5: Python Process Memory Delta
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['py_mem_delta'] for r in all_results]
-        y_errs = [r[method]['py_mem_delta_std'] for r in all_results]
+        y_vals = [r[method]['py_mem_delta_median'] for r in all_results]
+        y_errs = [r[method]['py_mem_delta_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Python Memory Delta (MB)')
-    plt.title(f'Python Process Memory Change (batch size={BATCH_SIZE})')
+    plt.title(f'Python Process Memory Change (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -610,13 +791,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 6: PostgreSQL Process Memory Delta
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['pg_mem_delta'] for r in all_results]
-        y_errs = [r[method]['pg_mem_delta_std'] for r in all_results]
+        y_vals = [r[method]['pg_mem_delta_median'] for r in all_results]
+        y_errs = [r[method]['pg_mem_delta_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('PostgreSQL Memory Delta (MB)')
-    plt.title(f'PostgreSQL Process Memory Change (batch size={BATCH_SIZE})\n(ChromaDB shows 0 - no PG process)')
+    plt.title(f'PostgreSQL Process Memory Change (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -626,13 +807,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 7: Python Process Peak Memory
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['py_mem_peak'] for r in all_results]
-        y_errs = [r[method]['py_mem_peak_std'] for r in all_results]
+        y_vals = [r[method]['py_mem_peak_median'] for r in all_results]
+        y_errs = [r[method]['py_mem_peak_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('Python Peak Memory (MB)')
-    plt.title(f'Python Process Peak Memory (batch size={BATCH_SIZE})')
+    plt.title(f'Python Process Peak Memory (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -642,13 +823,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 8: PostgreSQL Process Peak Memory
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['pg_mem_peak'] for r in all_results]
-        y_errs = [r[method]['pg_mem_peak_std'] for r in all_results]
+        y_vals = [r[method]['pg_mem_peak_median'] for r in all_results]
+        y_errs = [r[method]['pg_mem_peak_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('PostgreSQL Peak Memory (MB)')
-    plt.title(f'PostgreSQL Process Peak Memory (batch size={BATCH_SIZE})\n(ChromaDB shows 0 - no PG process)')
+    plt.title(f'PostgreSQL Process Peak Memory (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -658,13 +839,13 @@ def generate_plots(all_results: List[dict]):
     # Plot 9: System Memory
     plt.figure(figsize=(10, 6))
     for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['sys_mem'] for r in all_results]
-        y_errs = [r[method]['sys_mem_std'] for r in all_results]
+        y_vals = [r[method]['sys_mem_median'] for r in all_results]
+        y_errs = [r[method]['sys_mem_iqr'] for r in all_results]
         plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                      linewidth=2, color=color, capsize=3, capthick=1)
     plt.xlabel('Number of Texts')
     plt.ylabel('System Memory (MB)')
-    plt.title(f'PG+pgvector vs ChromaDB: System Memory (batch size={BATCH_SIZE})')
+    plt.title(f'PG+pgvector vs ChromaDB: System Memory (Median ± IQR, batch size={BATCH_SIZE})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.xscale('log', base=2)
@@ -677,8 +858,8 @@ def generate_plots(all_results: List[dict]):
     x_pos = range(len(methods))
 
     # Throughput
-    avgs = [mean([r[m]['throughput'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['throughput'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['throughput_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['throughput_iqr'] for r in all_results]) for m in methods]
     bars = axes[0, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[0, 0].set_xticks(x_pos)
     axes[0, 0].set_xticklabels(labels, fontsize=8)
@@ -687,8 +868,8 @@ def generate_plots(all_results: List[dict]):
     axes[0, 0].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # Python CPU
-    avgs = [mean([r[m]['py_cpu'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['py_cpu'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['py_cpu_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['py_cpu_iqr'] for r in all_results]) for m in methods]
     bars = axes[0, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[0, 1].set_xticks(x_pos)
     axes[0, 1].set_xticklabels(labels, fontsize=8)
@@ -697,8 +878,8 @@ def generate_plots(all_results: List[dict]):
     axes[0, 1].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # PostgreSQL CPU
-    avgs = [mean([r[m]['pg_cpu'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['pg_cpu'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['pg_cpu_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['pg_cpu_iqr'] for r in all_results]) for m in methods]
     bars = axes[0, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[0, 2].set_xticks(x_pos)
     axes[0, 2].set_xticklabels(labels, fontsize=8)
@@ -707,8 +888,8 @@ def generate_plots(all_results: List[dict]):
     axes[0, 2].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # System CPU
-    avgs = [mean([r[m]['sys_cpu'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['sys_cpu'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['sys_cpu_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['sys_cpu_iqr'] for r in all_results]) for m in methods]
     bars = axes[0, 3].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[0, 3].set_xticks(x_pos)
     axes[0, 3].set_xticklabels(labels, fontsize=8)
@@ -717,8 +898,8 @@ def generate_plots(all_results: List[dict]):
     axes[0, 3].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # Python Memory Delta
-    avgs = [mean([r[m]['py_mem_delta'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['py_mem_delta'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['py_mem_delta_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['py_mem_delta_iqr'] for r in all_results]) for m in methods]
     bars = axes[1, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[1, 0].set_xticks(x_pos)
     axes[1, 0].set_xticklabels(labels, fontsize=8)
@@ -727,8 +908,8 @@ def generate_plots(all_results: List[dict]):
     axes[1, 0].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # PostgreSQL Memory Delta
-    avgs = [mean([r[m]['pg_mem_delta'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['pg_mem_delta'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['pg_mem_delta_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['pg_mem_delta_iqr'] for r in all_results]) for m in methods]
     bars = axes[1, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[1, 1].set_xticks(x_pos)
     axes[1, 1].set_xticklabels(labels, fontsize=8)
@@ -737,8 +918,8 @@ def generate_plots(all_results: List[dict]):
     axes[1, 1].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # Python Peak Memory
-    avgs = [mean([r[m]['py_mem_peak'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['py_mem_peak'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['py_mem_peak_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['py_mem_peak_iqr'] for r in all_results]) for m in methods]
     bars = axes[1, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[1, 2].set_xticks(x_pos)
     axes[1, 2].set_xticklabels(labels, fontsize=8)
@@ -747,8 +928,8 @@ def generate_plots(all_results: List[dict]):
     axes[1, 2].bar_label(bars, fmt='%.1f', fontsize=7)
 
     # System Memory
-    avgs = [mean([r[m]['sys_mem'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['sys_mem'] for r in all_results]) for m in methods]
+    avgs = [median([r[m]['sys_mem_median'] for r in all_results]) for m in methods]
+    stds = [median([r[m]['sys_mem_iqr'] for r in all_results]) for m in methods]
     bars = axes[1, 3].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
     axes[1, 3].set_xticks(x_pos)
     axes[1, 3].set_xticklabels(labels, fontsize=8)

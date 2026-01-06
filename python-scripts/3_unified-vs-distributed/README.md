@@ -48,7 +48,7 @@ Realistic product data with multiple text fields:
 ## Running
 
 ```bash
-PYTHONPATH=.:proto python 3_unified-vs-distributed/benchmark.py
+PYTHONPATH=.:proto python3.13 3_unified-vs-distributed/benchmark.py
 ```
 
 ## Output
@@ -75,4 +75,4 @@ Results are grouped by scenario:
 - Each scenario sets up its own data independently
 - Warmup batches are not counted in final metrics
 - ChromaDB directories are cleaned up between runs
-- pgvector HNSW index uses `m = 16, ef_construction = 100` to match ChromaDB's defaults
+- pgvector HNSW index uses `m = 16, ef_construction = 100` to match ChromaDB's HNSW index for fair comparison

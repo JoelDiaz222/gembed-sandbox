@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from statistics import mean, stdev
+from statistics import mean, stdev, median, quantiles
 from typing import Callable, List
 
 import chromadb
@@ -23,9 +23,9 @@ DB_CONFIG = {
     'user': 'joeldiaz',
 }
 
-TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
+TEST_SIZES = [16, 32, 64, 128, 256, 512]
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
-RUNS_PER_SIZE = 3
+RUNS_PER_SIZE = 5  # Number of runs per test size
 
 # Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -33,6 +33,19 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 # Global model cache
 model_cache = {}
 
+
+# Simple wrapper matching Chroma's EmbeddingFunction interface
+class EmbeddingWrapper:
+    def __init__(self, fn: Callable):
+        self._fn = fn
+
+    def __call__(self, input):
+        return self._fn(list(input))
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 @dataclass
 class ResourceStats:
@@ -52,6 +65,27 @@ class BenchmarkResult:
     time_s: float
     stats: ResourceStats
 
+
+# =============================================================================
+# Statistics Functions
+# =============================================================================
+
+def safe_stdev(values: List[float]) -> float:
+    """Calculate standard deviation, returning 0 for lists with <2 elements."""
+    return stdev(values) if len(values) > 1 else 0.0
+
+
+def calc_iqr(values: List[float]) -> float:
+    """Calculate interquartile range (Q3 - Q1)."""
+    if len(values) < 4:
+        return 0.0
+    q = quantiles(values, n=4)
+    return q[2] - q[0]  # Q3 - Q1
+
+
+# =============================================================================
+# Resource Monitoring
+# =============================================================================
 
 class ResourceMonitor:
     """Monitor resource usage for Python and PostgreSQL processes."""
@@ -146,6 +180,10 @@ class ResourceMonitor:
         return result, stats
 
 
+# =============================================================================
+# Embedding Client
+# =============================================================================
+
 class EmbedAnythingDirectClient:
     """Direct Python client for EmbedAnything."""
 
@@ -166,7 +204,9 @@ class EmbedAnythingDirectClient:
         return model_cache[model_name]
 
 
-# --- Data Generation ---
+# =============================================================================
+# Data Generation
+# =============================================================================
 
 def generate_products(n: int) -> List[dict]:
     """Generate realistic product data with reviews from TPCx-AI dataset."""
@@ -235,7 +275,9 @@ def build_embedding_context(product: dict) -> str:
     )
 
 
-# --- PostgreSQL Functions ---
+# =============================================================================
+# PostgreSQL Functions
+# =============================================================================
 
 def connect_and_get_pid():
     """Connect to PostgreSQL and get backend PID."""
@@ -342,19 +384,37 @@ def insert_product_data(conn, products: List[dict]) -> List[int]:
     return product_ids
 
 
-# --- ChromaDB Functions ---
+# =============================================================================
+# ChromaDB Functions
+# =============================================================================
 
-def create_chroma_client(base_path: str = "./chroma_bench"):
-    """Create a fresh ChromaDB persistent client."""
+def create_chroma_client(base_path: str = "./chroma_bench", embed_fn: Callable = None):
+    """Create a fresh ChromaDB persistent client.
+
+    This benchmark uses HNSW on Chroma with the same parameters as
+    the pgvector index for a fair comparison: `max_neighbors=16`,
+    `ef_construction=100`.
+    If `embed_fn` is provided it will be registered as the collection's
+    `embedding_function` so Chroma persists the embedding wiring.
+    """
     db_path = f"{base_path}_{time.time_ns()}"
     if os.path.exists(db_path):
         shutil.rmtree(db_path)
 
     client = chromadb.PersistentClient(path=db_path)
-    collection = client.create_collection(
-        "products",
-        metadata={"hnsw:space": "cosine"}
-    )
+
+    configuration = {
+        "hnsw": {
+            "space": "cosine",
+            "max_neighbors": 16,
+            "ef_construction": 100
+        }
+    }
+
+    # Always register the provided embedding function for Chroma collections.
+    emb_obj = EmbeddingWrapper(embed_fn)
+    collection = client.create_collection("products", embedding_function=emb_obj, configuration=configuration)
+
     return client, collection, db_path
 
 
@@ -644,7 +704,7 @@ def run_scenario1_distributed(products: List[dict],
     # Warm up
     warmup_products = generate_products(8)
     conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
-    client, collection, db_path = create_chroma_client()
+    client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
     try:
         truncate_pg_tables(conn)
         scenario1_distributed(conn, warmup_products, embed_client, collection)
@@ -656,7 +716,7 @@ def run_scenario1_distributed(products: List[dict],
     results = []
     for _ in range(runs):
         conn, _ = connect_and_get_pid()
-        client, collection, db_path = create_chroma_client()
+        client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
         try:
             truncate_pg_tables(conn)
             elapsed, stats = ResourceMonitor.measure(
@@ -714,7 +774,7 @@ def run_scenario2_distributed(products: List[dict],
 
     # Warm up
     conn, _ = connect_and_get_pid()
-    client, collection, db_path = create_chroma_client()
+    client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
     try:
         scenario2_distributed(conn, embed_client, collection)
     finally:
@@ -725,7 +785,7 @@ def run_scenario2_distributed(products: List[dict],
     results = []
     for _ in range(runs):
         conn, _ = connect_and_get_pid()
-        client, collection, db_path = create_chroma_client()
+        client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
         try:
             elapsed, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
@@ -743,18 +803,24 @@ def run_scenario2_distributed(products: List[dict],
 # Output Functions
 # =============================================================================
 
-def safe_stdev(values: List[float]) -> float:
-    """Calculate standard deviation, returning 0 for single values."""
-    return stdev(values) if len(values) > 1 else 0.0
-
-
 def print_header():
     """Print benchmark results header."""
-    print(f"{'':14} | {'Time (s)':>12} | {'Py Δ MB':>10} | {'Py Peak':>10} | {'Py CPU%':>8} | "
-          f"{'PG Δ MB':>10} | {'PG Peak':>10} | {'PG CPU%':>8} | {'Sys MB':>10} | {'Sys CPU%':>8}")
-    print("=" * 135)
+    # Column widths match print_result row_fmt
+    lbl_w = 12
+    time_w = 12
+    col_w = 11
+    med_w = 7
 
-
+    # Prefix with two spaces to align with rows
+    header = (
+        "  " +
+        f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU μ±σ':>{col_w}} | "
+        f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU μ±σ':>{col_w}} | {'Sys MB μ±σ':>{col_w}} | {'Sys CPU% μ±σ':>{col_w}}"
+    )
+    print("Benchmark Results:", flush=True)
+    print(header, flush=True)
+    print("=" * len(header), flush=True)
+ 
 def print_result(label: str, results: List[BenchmarkResult]):
     """Print aggregated results from multiple runs with ± std dev."""
     times = [r.time_s for r in results]
@@ -767,7 +833,7 @@ def print_result(label: str, results: List[BenchmarkResult]):
     sys_mem = [r.stats.sys_mem_mb for r in results]
     sys_cpu = [r.stats.sys_cpu for r in results]
 
-    def fmt(values: List[float], precision: int = 1) -> str:
+    def fmt_mean(values: List[float], precision: int = 1) -> str:
         avg = mean(values)
         std = safe_stdev(values)
         if precision == 3:
@@ -777,39 +843,112 @@ def print_result(label: str, results: List[BenchmarkResult]):
         else:
             return f"{avg:.1f}±{std:.1f}"
 
-    print(f"  {label:12} | {fmt(times, 3):>12} | {fmt(py_delta):>10} | {fmt(py_peak):>10} | {fmt(py_cpu):>8} | "
-          f"{fmt(pg_delta):>10} | {fmt(pg_peak):>10} | {fmt(pg_cpu):>8} | {fmt(sys_mem, 0):>10} | {fmt(sys_cpu):>8}")
+    def fmt_median_iqr(values: List[float], precision: int = 1) -> str:
+        med = median(values)
+        iqr = calc_iqr(values)
+        if precision == 3:
+            return f"{med:.3f}±{iqr:.3f}"
+        elif precision == 0:
+            return f"{med:.0f}±{iqr:.0f}"
+        else:
+            return f"{med:.1f}±{iqr:.1f}"
+    # Print rows (mean ± std)
+    row_fmt = (
+        "  {label:<12}{med:>7} | {time:>12} | {pyd:>11} | {pyp:>11} | {pyc:>11} | {pgd:>11} | {pgp:>11} | {pgc:>11} | {sysm:>11} | {sysc:>11}"
+    )
+    print(row_fmt.format(
+        label=label,
+        med='',
+        time=fmt_mean(times, 3),
+        pyd=fmt_mean(py_delta),
+        pyp=fmt_mean(py_peak),
+        pyc=fmt_mean(py_cpu),
+        pgd=fmt_mean(pg_delta),
+        pgp=fmt_mean(pg_peak),
+        pgc=fmt_mean(pg_cpu),
+        sysm=fmt_mean(sys_mem, 0),
+        sysc=fmt_mean(sys_cpu),
+    ), flush=True)
+    # median ± IQR
+    print(row_fmt.format(
+        label=label,
+        med=' (med)',
+        time=fmt_median_iqr(times, 3),
+        pyd=fmt_median_iqr(py_delta),
+        pyp=fmt_median_iqr(py_peak),
+        pyc=fmt_median_iqr(py_cpu),
+        pgd=fmt_median_iqr(pg_delta),
+        pgp=fmt_median_iqr(pg_peak),
+        pgc=fmt_median_iqr(pg_cpu),
+        sysm=fmt_median_iqr(sys_mem, 0),
+        sysc=fmt_median_iqr(sys_cpu),
+    ), flush=True)
 
 
 def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
-    """Compute mean and std for all metrics from benchmark results."""
+    """Compute mean/std and median/IQR for all metrics from benchmark results."""
     times = [r.time_s for r in results]
+    py_cpu = [r.stats.py_cpu for r in results]
+    py_delta = [r.stats.py_delta_mb for r in results]
+    py_peak = [r.stats.py_peak_mb for r in results]
+    pg_cpu = [r.stats.pg_cpu for r in results]
+    pg_delta = [r.stats.pg_delta_mb for r in results]
+    pg_peak = [r.stats.pg_peak_mb for r in results]
+    sys_cpu = [r.stats.sys_cpu for r in results]
+    sys_mem = [r.stats.sys_mem_mb for r in results]
+    
     return {
+        # Throughput (mean-based)
         'throughput': size / mean(times),
         'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
+        'throughput_median': size / median(times),
+        'throughput_iqr': size / median(times) * calc_iqr(times) / median(times) if len(times) >= 4 else 0,
+        # Time
         'time_s': mean(times),
         'time_s_std': safe_stdev(times),
+        'time_s_median': median(times),
+        'time_s_iqr': calc_iqr(times),
         # Python process
-        'py_cpu': mean([r.stats.py_cpu for r in results]),
-        'py_cpu_std': safe_stdev([r.stats.py_cpu for r in results]),
-        'py_mem_delta': mean([r.stats.py_delta_mb for r in results]),
-        'py_mem_delta_std': safe_stdev([r.stats.py_delta_mb for r in results]),
-        'py_mem_peak': mean([r.stats.py_peak_mb for r in results]),
-        'py_mem_peak_std': safe_stdev([r.stats.py_peak_mb for r in results]),
+        'py_cpu': mean(py_cpu),
+        'py_cpu_std': safe_stdev(py_cpu),
+        'py_cpu_median': median(py_cpu),
+        'py_cpu_iqr': calc_iqr(py_cpu),
+        'py_mem_delta': mean(py_delta),
+        'py_mem_delta_std': safe_stdev(py_delta),
+        'py_mem_delta_median': median(py_delta),
+        'py_mem_delta_iqr': calc_iqr(py_delta),
+        'py_mem_peak': mean(py_peak),
+        'py_mem_peak_std': safe_stdev(py_peak),
+        'py_mem_peak_median': median(py_peak),
+        'py_mem_peak_iqr': calc_iqr(py_peak),
         # PostgreSQL process
-        'pg_cpu': mean([r.stats.pg_cpu for r in results]),
-        'pg_cpu_std': safe_stdev([r.stats.pg_cpu for r in results]),
-        'pg_mem_delta': mean([r.stats.pg_delta_mb for r in results]),
-        'pg_mem_delta_std': safe_stdev([r.stats.pg_delta_mb for r in results]),
-        'pg_mem_peak': mean([r.stats.pg_peak_mb for r in results]),
-        'pg_mem_peak_std': safe_stdev([r.stats.pg_peak_mb for r in results]),
+        'pg_cpu': mean(pg_cpu),
+        'pg_cpu_std': safe_stdev(pg_cpu),
+        'pg_cpu_median': median(pg_cpu),
+        'pg_cpu_iqr': calc_iqr(pg_cpu),
+        'pg_mem_delta': mean(pg_delta),
+        'pg_mem_delta_std': safe_stdev(pg_delta),
+        'pg_mem_delta_median': median(pg_delta),
+        'pg_mem_delta_iqr': calc_iqr(pg_delta),
+        'pg_mem_peak': mean(pg_peak),
+        'pg_mem_peak_std': safe_stdev(pg_peak),
+        'pg_mem_peak_median': median(pg_peak),
+        'pg_mem_peak_iqr': calc_iqr(pg_peak),
         # System-wide
-        'sys_cpu': mean([r.stats.sys_cpu for r in results]),
-        'sys_cpu_std': safe_stdev([r.stats.sys_cpu for r in results]),
-        'sys_mem': mean([r.stats.sys_mem_mb for r in results]),
-        'sys_mem_std': safe_stdev([r.stats.sys_mem_mb for r in results]),
+        'sys_cpu': mean(sys_cpu),
+        'sys_cpu_std': safe_stdev(sys_cpu),
+        'sys_cpu_median': median(sys_cpu),
+        'sys_cpu_iqr': calc_iqr(sys_cpu),
+        'sys_mem': mean(sys_mem),
+        'sys_mem_std': safe_stdev(sys_mem),
+        'sys_mem_median': median(sys_mem),
+        'sys_mem_iqr': calc_iqr(sys_mem),
     }
 
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 def main():
     # Initialize PostgreSQL schema
@@ -826,14 +965,14 @@ def main():
     # ==========================================================================
     # Scenario 1: Cold Start (insert + embedding generation)
     # ==========================================================================
-    print("=" * 95)
+    print("=" * 105)
     print("SCENARIO 1: Cold Start (insert + embedding generation)")
-    print("=" * 95)
+    print("=" * 105)
     print_header()
 
     for size in TEST_SIZES:
         products = generate_products(size)
-        print(f"Size: {size}")
+        print(f"Size: {size}", flush=True)
 
         unified_results = run_scenario1_unified(products, RUNS_PER_SIZE)
         distributed_results = run_scenario1_distributed(products, embed_client, RUNS_PER_SIZE)
@@ -858,7 +997,7 @@ def main():
 
     for size in TEST_SIZES:
         products = generate_products(size)
-        print(f"Size: {size}")
+        print(f"Size: {size}", flush=True)
 
         unified_results = run_scenario2_unified(products, RUNS_PER_SIZE)
         distributed_results = run_scenario2_distributed(products, embed_client, RUNS_PER_SIZE)
@@ -903,12 +1042,14 @@ def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
                'pg_cpu', 'pg_mem_delta', 'pg_mem_peak',
                'sys_cpu', 'sys_mem']
 
-    # Build header with _std columns
+    # Build header with _std, _median and _iqr columns
     header = ['size']
     for method in methods:
         for metric in metrics:
             header.append(f"{method}_{metric}")
             header.append(f"{method}_{metric}_std")
+            header.append(f"{method}_{metric}_median")
+            header.append(f"{method}_{metric}_iqr")
 
     # Scenario 1 CSV
     csv_path_s1 = OUTPUT_DIR / f"scenario1_cold_start_{timestamp}.csv"
@@ -919,8 +1060,10 @@ def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
             row = [r['size']]
             for method in methods:
                 for metric in metrics:
-                    row.append(r[method][metric])
+                    row.append(r[method].get(metric))
                     row.append(r[method].get(f"{metric}_std", 0))
+                    row.append(r[method].get(f"{metric}_median", 0))
+                    row.append(r[method].get(f"{metric}_iqr", 0))
             writer.writerow(row)
 
     # Scenario 2 CSV
@@ -932,8 +1075,10 @@ def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
             row = [r['size']]
             for method in methods:
                 for metric in metrics:
-                    row.append(r[method][metric])
+                    row.append(r[method].get(metric))
                     row.append(r[method].get(f"{metric}_std", 0))
+                    row.append(r[method].get(f"{metric}_median", 0))
+                    row.append(r[method].get(f"{metric}_iqr", 0))
             writer.writerow(row)
 
     print(f"\nResults saved to:")
@@ -956,13 +1101,13 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
     def plot_metric(results, sizes, metric, ylabel, title_suffix, filename):
         plt.figure(figsize=(10, 6))
         for method, label, color, marker in zip(methods, labels, colors, markers):
-            y_vals = [r[method][metric] for r in results]
-            y_errs = [r[method].get(f'{metric}_std', 0) for r in results]
+            y_vals = [r[method].get(f'{metric}_median', r[method].get(metric)) for r in results]
+            y_errs = [r[method].get(f'{metric}_iqr', r[method].get(f'{metric}_std', 0)) for r in results]
             plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                          linewidth=2, color=color, capsize=3, capthick=1)
         plt.xlabel('Number of Products')
         plt.ylabel(ylabel)
-        plt.title(f'{title_suffix}')
+        plt.title(f'{title_suffix} (Median ± IQR)')
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.xscale('log', base=2)
@@ -1011,8 +1156,8 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
 
     for col, (metric, mlabel) in enumerate(zip(metric_keys, metric_labels)):
         # Scenario 1
-        avgs = [mean([r[m][metric] for r in all_results_s1]) for m in methods]
-        stds = [safe_stdev([r[m][metric] for r in all_results_s1]) for m in methods]
+        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric)) for r in all_results_s1]) for m in methods]
+        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s1]) for m in methods]
         bars = axes[0, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
         axes[0, col].set_xticks(x_pos)
         axes[0, col].set_xticklabels(labels)
@@ -1021,8 +1166,8 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
         axes[0, col].tick_params(axis='x', rotation=15)
 
         # Scenario 2
-        avgs = [mean([r[m][metric] for r in all_results_s2]) for m in methods]
-        stds = [safe_stdev([r[m][metric] for r in all_results_s2]) for m in methods]
+        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric)) for r in all_results_s2]) for m in methods]
+        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s2]) for m in methods]
         bars = axes[1, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
         axes[1, col].set_xticks(x_pos)
         axes[1, col].set_xticklabels(labels)
