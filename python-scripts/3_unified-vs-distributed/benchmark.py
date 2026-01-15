@@ -9,11 +9,14 @@ from statistics import mean, stdev, median, quantiles
 from typing import Callable, List
 
 import chromadb
+import docker
 import embed_anything
 import matplotlib.pyplot as plt
 import psutil
 import psycopg2
 from embed_anything import EmbeddingModel, WhichModel
+from qdrant_client import QdrantClient, models
+from qdrant_client.models import Distance, VectorParams, PointStruct
 
 # Configuration
 DB_CONFIG = {
@@ -23,9 +26,12 @@ DB_CONFIG = {
     'user': 'joeldiaz',
 }
 
+QDRANT_URL = "http://localhost:6333"
+QDRANT_CONTAINER_NAME = "qdrant"
+
 TEST_SIZES = [16, 32, 64, 128, 256, 512]
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
-RUNS_PER_SIZE = 5  # Number of runs per test size
+RUNS_PER_SIZE = 5
 
 # Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -49,13 +55,16 @@ class EmbeddingWrapper:
 
 @dataclass
 class ResourceStats:
-    """Resource statistics for Python and PostgreSQL processes."""
+    """Resource statistics for Python, PostgreSQL, and Qdrant processes."""
     py_delta_mb: float
     py_peak_mb: float
     py_cpu: float
     pg_delta_mb: float
     pg_peak_mb: float
     pg_cpu: float
+    qd_delta_mb: float
+    qd_peak_mb: float
+    qd_cpu: float
     sys_mem_mb: float
     sys_cpu: float
 
@@ -88,95 +97,96 @@ def calc_iqr(values: List[float]) -> float:
 # =============================================================================
 
 class ResourceMonitor:
-    """Monitor resource usage for Python and PostgreSQL processes."""
-
-    def __init__(self, py_pid: int, pg_pid: int = None):
-        self.py_pid = py_pid
-        self.pg_pid = pg_pid
-        
-        # Python process
+    def __init__(self, py_pid: int, pg_pid: int = None, qd_name: str = QDRANT_CONTAINER_NAME):
         self.py_process = psutil.Process(py_pid)
+        self.pg_process = psutil.Process(pg_pid) if pg_pid else None
+
+        # Docker initialization
+        self.docker_client = docker.from_env()
         try:
-            mem_info = self.py_process.memory_full_info()
-            self.py_baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
-        except (psutil.AccessDenied, AttributeError):
-            mem_info = self.py_process.memory_info()
-            self.py_baseline = mem_info.rss
+            self.container = self.docker_client.containers.get(qd_name)
+        except Exception:
+            self.container = None
+
+        # Baselines
+        self.py_baseline = self._get_py_mem()
+        self.pg_baseline = self._get_pg_mem()
+        self.qd_baseline_stats = self._get_qd_stats() if self.container else None
+
+        # Warm up CPU counters
         self.py_process.cpu_percent()
-        
-        # PostgreSQL process
-        self.pg_process = None
-        self.pg_baseline = 0
-        if pg_pid:
-            try:
-                self.pg_process = psutil.Process(pg_pid)
-                try:
-                    mem_info = self.pg_process.memory_full_info()
-                    self.pg_baseline = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
-                except (psutil.AccessDenied, AttributeError):
-                    mem_info = self.pg_process.memory_info()
-                    self.pg_baseline = mem_info.rss
-                self.pg_process.cpu_percent()
-            except psutil.NoSuchProcess:
-                self.pg_process = None
-        
+        if self.pg_process: self.pg_process.cpu_percent()
         time.sleep(0.1)
+
+    def _get_py_mem(self):
+        m = self.py_process.memory_full_info()
+        return m.uss if hasattr(m, 'uss') else m.rss
+
+    def _get_pg_mem(self):
+        if not self.pg_process: return 0
+        try:
+            m = self.pg_process.memory_full_info()
+            return m.uss if hasattr(m, 'uss') else m.rss
+        except:
+            return 0
+
+    def _get_qd_stats(self):
+        """Returns a snapshot of Docker stats."""
+        return self.container.stats(stream=False)
+
+    def _calculate_qd_cpu(self, start_stats, end_stats):
+        """Calculates CPU percentage similar to 'docker stats'."""
+        cpu_delta = end_stats['cpu_stats']['cpu_usage']['total_usage'] - \
+                    start_stats['cpu_stats']['cpu_usage']['total_usage']
+        system_delta = end_stats['cpu_stats']['system_cpu_usage'] - \
+                       start_stats['cpu_stats']['system_cpu_usage']
+
+        if system_delta > 0.0 and cpu_delta > 0.0:
+            # We multiply by number of cores to get a 0-100% per-core scaled value
+            cpus = end_stats['cpu_stats'].get('online_cpus', psutil.cpu_count())
+            return (cpu_delta / system_delta) * cpus * 100.0
+        return 0.0
 
     @staticmethod
     def measure(py_pid: int, pg_pid: int, func: Callable):
-        """Measure resource usage for both Python and PostgreSQL processes."""
         monitor = ResourceMonitor(py_pid, pg_pid)
         result = func()
 
-        # Python process final stats
-        try:
-            mem_info = monitor.py_process.memory_full_info()
-            py_peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
-        except (psutil.AccessDenied, AttributeError):
-            mem_info = monitor.py_process.memory_info()
-            py_peak = mem_info.rss
+        # Gather final stats
+        py_peak = monitor._get_py_mem()
         py_cpu = monitor.py_process.cpu_percent()
-        
-        py_baseline_mb = monitor.py_baseline / (1024 * 1024)
-        py_peak_mb = py_peak / (1024 * 1024)
-        py_delta_mb = py_peak_mb - py_baseline_mb
 
-        # PostgreSQL process final stats
-        pg_delta_mb = 0.0
-        pg_peak_mb = 0.0
-        pg_cpu = 0.0
-        if monitor.pg_process:
-            try:
-                try:
-                    mem_info = monitor.pg_process.memory_full_info()
-                    pg_peak = mem_info.uss if hasattr(mem_info, 'uss') else mem_info.rss
-                except (psutil.AccessDenied, AttributeError):
-                    mem_info = monitor.pg_process.memory_info()
-                    pg_peak = mem_info.rss
-                pg_cpu = monitor.pg_process.cpu_percent()
-                
-                pg_baseline_mb = monitor.pg_baseline / (1024 * 1024)
-                pg_peak_mb = pg_peak / (1024 * 1024)
-                pg_delta_mb = pg_peak_mb - pg_baseline_mb
-            except psutil.NoSuchProcess:
-                pass
+        pg_peak = monitor._get_pg_mem()
+        pg_cpu = monitor.pg_process.cpu_percent() if monitor.pg_process else 0.0
 
-        # System-wide stats
-        sys_mem = psutil.virtual_memory()
-        sys_mem_mb = sys_mem.used / (1024 * 1024)
-        sys_cpu = psutil.cpu_percent()
+        qd_delta_mb = 0.0
+        qd_peak_mb = 0.0
+        qd_cpu = 0.0
+
+        if monitor.container:
+            end_qd_stats = monitor._get_qd_stats()
+            qd_peak_raw = end_qd_stats['memory_stats']['usage']
+            qd_peak_mb = qd_peak_raw / (1024 * 1024)
+
+            baseline_raw = monitor.qd_baseline_stats['memory_stats']['usage']
+            qd_delta_mb = qd_peak_mb - (baseline_raw / (1024 * 1024))
+            qd_cpu = monitor._calculate_qd_cpu(monitor.qd_baseline_stats, end_qd_stats)
+
+        sys_v = psutil.virtual_memory()
 
         stats = ResourceStats(
-            py_delta_mb=py_delta_mb,
-            py_peak_mb=py_peak_mb,
+            py_delta_mb=(py_peak - monitor.py_baseline) / 1e6,
+            py_peak_mb=py_peak / 1e6,
             py_cpu=py_cpu,
-            pg_delta_mb=pg_delta_mb,
-            pg_peak_mb=pg_peak_mb,
+            pg_delta_mb=(pg_peak - monitor.pg_baseline) / 1e6,
+            pg_peak_mb=pg_peak / 1e6,
             pg_cpu=pg_cpu,
-            sys_mem_mb=sys_mem_mb,
-            sys_cpu=sys_cpu
+            qd_delta_mb=qd_delta_mb,
+            qd_peak_mb=qd_peak_mb,
+            qd_cpu=qd_cpu,
+            sys_mem_mb=sys_v.used / 1e6,
+            sys_cpu=psutil.cpu_percent()
         )
-
         return result, stats
 
 
@@ -385,18 +395,11 @@ def insert_product_data(conn, products: List[dict]) -> List[int]:
 
 
 # =============================================================================
-# ChromaDB Functions
+# Vector DB Functions (ChromaDB + Qdrant)
 # =============================================================================
 
 def create_chroma_client(base_path: str = "./chroma_bench", embed_fn: Callable = None):
-    """Create a fresh ChromaDB persistent client.
-
-    This benchmark uses HNSW on Chroma with the same parameters as
-    the pgvector index for a fair comparison: `max_neighbors=16`,
-    `ef_construction=100`.
-    If `embed_fn` is provided it will be registered as the collection's
-    `embedding_function` so Chroma persists the embedding wiring.
-    """
+    """Create a fresh ChromaDB persistent client."""
     db_path = f"{base_path}_{time.time_ns()}"
     if os.path.exists(db_path):
         shutil.rmtree(db_path)
@@ -411,7 +414,6 @@ def create_chroma_client(base_path: str = "./chroma_bench", embed_fn: Callable =
         }
     }
 
-    # Always register the provided embedding function for Chroma collections.
     emb_obj = EmbeddingWrapper(embed_fn)
     collection = client.create_collection("products", embedding_function=emb_obj, configuration=configuration)
 
@@ -426,15 +428,42 @@ def cleanup_chroma(client, db_path: str):
         shutil.rmtree(db_path)
 
 
+def create_qdrant_client():
+    """Create a fresh Qdrant client."""
+    client = QdrantClient(url=QDRANT_URL)
+
+    if client.collection_exists("products"):
+        client.delete_collection("products")
+
+    # Configure HNSW index parameters
+    hnsw_config = models.HnswConfigDiff(
+        m=16,
+        ef_construct=100,
+    )
+
+    client.create_collection(
+        collection_name="products",
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE, hnsw_config=hnsw_config)
+    )
+
+    return client
+
+
+def cleanup_qdrant(client):
+    """Clean up Qdrant client and files."""
+    if client.collection_exists("products"):
+        client.delete_collection(collection_name="products")
+
+    client.close()
+    time.sleep(0.1)
+
+
 # =============================================================================
 # SCENARIO 2 FUNCTIONS: Pre-existing Data (embedding generation only)
 # =============================================================================
 
 def scenario2_unified(conn) -> float:
-    """
-    Scenario 2 - Unified: Generate embeddings for pre-existing data.
-    Uses SQL JOIN + pg_gembed. Data already exists in PostgreSQL.
-    """
+    """Scenario 2 - Unified: Generate embeddings for pre-existing data."""
     cur = conn.cursor()
     start = time.perf_counter()
 
@@ -476,35 +505,26 @@ def scenario2_unified(conn) -> float:
     return elapsed
 
 
-def scenario2_distributed(conn, embed_client: EmbedAnythingDirectClient,
-                          chroma_collection) -> float:
-    """
-    Scenario 2 - Distributed: Fetch data from PostgreSQL, embed, store in ChromaDB.
-    Data already exists in PostgreSQL, need to fetch and build context.
-    """
+def scenario2_distributed_chroma(conn, embed_client: EmbedAnythingDirectClient,
+                                 chroma_collection) -> float:
+    """Scenario 2 - Distributed (Chroma): Fetch data, embed, store in ChromaDB."""
     cur = conn.cursor()
     start = time.perf_counter()
 
-    # Fetch product data with reviews and categories (simulating the JOIN)
+    # Fetch product data with reviews and categories
     cur.execute("""
                 SELECT p.product_id,
                        p.name,
                        p.description,
                        p.price,
-                       COALESCE(
-                               (SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
-                                FROM (SELECT review_text, created_at
-                                      FROM reviews
-                                      WHERE product_id = p.product_id
-                                      LIMIT 5) r),
-                               'No reviews'
-                       ) AS reviews,
-                       COALESCE(
-                               (SELECT string_agg(category_name, ', ')
-                                FROM product_categories
-                                WHERE product_id = p.product_id),
-                               'Uncategorized'
-                       ) AS categories
+                       COALESCE((SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
+                                 FROM (SELECT review_text, created_at
+                                       FROM reviews
+                                       WHERE product_id = p.product_id
+                                       LIMIT 5) r), 'No reviews'),
+                       COALESCE((SELECT string_agg(category_name, ', ')
+                                 FROM product_categories
+                                 WHERE product_id = p.product_id), 'Uncategorized')
                 FROM products p
                 ORDER BY p.product_id
                 """)
@@ -534,15 +554,61 @@ def scenario2_distributed(conn, embed_client: EmbedAnythingDirectClient,
     return elapsed
 
 
+def scenario2_distributed_qdrant(conn, embed_client: EmbedAnythingDirectClient,
+                                 qdrant_client: QdrantClient) -> float:
+    """Scenario 2 - Distributed (Qdrant): Fetch data, embed, store in Qdrant."""
+    cur = conn.cursor()
+    start = time.perf_counter()
+
+    # Fetch product data
+    cur.execute("""
+                SELECT p.product_id,
+                       p.name,
+                       p.description,
+                       p.price,
+                       COALESCE((SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
+                                 FROM (SELECT review_text, created_at
+                                       FROM reviews
+                                       WHERE product_id = p.product_id
+                                       LIMIT 5) r), 'No reviews'),
+                       COALESCE((SELECT string_agg(category_name, ', ')
+                                 FROM product_categories
+                                 WHERE product_id = p.product_id), 'Uncategorized')
+                FROM products p
+                ORDER BY p.product_id
+                """)
+
+    rows = cur.fetchall()
+    product_ids = []
+    documents = []
+
+    for row in rows:
+        pid, name, desc, price, reviews, categories = row
+        product_ids.append(pid)
+        doc = f"{name}. {desc}. Price: ${price}. Reviews: {reviews}. Categories: {categories}"
+        documents.append(doc)
+
+    # Generate embeddings
+    embeddings = embed_client.embed(documents)
+
+    # Store in Qdrant
+    points = [
+        PointStruct(id=pid, vector=embedding, payload={"text": doc})
+        for pid, embedding, doc in zip(product_ids, embeddings, documents)
+    ]
+    qdrant_client.upsert(collection_name="products", points=points, wait=True)
+
+    elapsed = time.perf_counter() - start
+    cur.close()
+    return elapsed
+
+
 # =============================================================================
 # SCENARIO 1 FUNCTIONS: Cold Start (insert + embedding generation)
 # =============================================================================
 
 def scenario1_unified(conn, products: List[dict]) -> float:
-    """
-    Scenario 1 - Unified: Insert data and generate embeddings in PostgreSQL.
-    Uses SQL JOIN to build context after insertion.
-    """
+    """Scenario 1 - Unified: Insert data and generate embeddings in PostgreSQL."""
     cur = conn.cursor()
     start = time.perf_counter()
 
@@ -557,18 +623,11 @@ def scenario1_unified(conn, products: List[dict]) -> float:
         pid = cur.fetchone()[0]
 
         for review in p['reviews']:
-            cur.execute(
-                """INSERT INTO reviews (product_id, rating, review_text)
-                   VALUES (%s, %s, %s)""",
-                (pid, review['rating'], review['text'])
-            )
-
+            cur.execute("""INSERT INTO reviews (product_id, rating, review_text)
+                           VALUES (%s, %s, %s)""", (pid, review['rating'], review['text']))
         for category in p['categories']:
-            cur.execute(
-                """INSERT INTO product_categories (product_id, category_name)
-                   VALUES (%s, %s)""",
-                (pid, category)
-            )
+            cur.execute("""INSERT INTO product_categories (product_id, category_name)
+                           VALUES (%s, %s)""", (pid, category))
 
     # Generate embeddings using SQL JOIN + pg_gembed
     cur.execute("""
@@ -609,17 +668,14 @@ def scenario1_unified(conn, products: List[dict]) -> float:
     return elapsed
 
 
-def scenario1_distributed(conn, products: List[dict],
-                          embed_client: EmbedAnythingDirectClient,
-                          chroma_collection) -> float:
-    """
-    Scenario 1 - Distributed: Insert data into PostgreSQL, embed from app data,
-    store vectors in ChromaDB. No DB fetch needed since data is in memory.
-    """
+def scenario1_distributed_chroma(conn, products: List[dict],
+                                 embed_client: EmbedAnythingDirectClient,
+                                 chroma_collection) -> float:
+    """Scenario 1 - Distributed (Chroma): Insert data into PG, embed from app data, store in Chroma."""
     cur = conn.cursor()
     start = time.perf_counter()
 
-    # Insert relational data into PostgreSQL
+    # Insert relational data
     product_ids = []
     for p in products:
         cur.execute(
@@ -632,22 +688,15 @@ def scenario1_distributed(conn, products: List[dict],
         product_ids.append(pid)
 
         for review in p['reviews']:
-            cur.execute(
-                """INSERT INTO reviews (product_id, rating, review_text)
-                   VALUES (%s, %s, %s)""",
-                (pid, review['rating'], review['text'])
-            )
-
+            cur.execute("""INSERT INTO reviews (product_id, rating, review_text)
+                           VALUES (%s, %s, %s)""", (pid, review['rating'], review['text']))
         for category in p['categories']:
-            cur.execute(
-                """INSERT INTO product_categories (product_id, category_name)
-                   VALUES (%s, %s)""",
-                (pid, category)
-            )
+            cur.execute("""INSERT INTO product_categories (product_id, category_name)
+                           VALUES (%s, %s)""", (pid, category))
 
     conn.commit()
 
-    # Build context from app-level data (no DB fetch needed)
+    # Build context from app-level data
     documents = [build_embedding_context(p) for p in products]
 
     # Generate embeddings
@@ -665,13 +714,59 @@ def scenario1_distributed(conn, products: List[dict],
     return elapsed
 
 
+def scenario1_distributed_qdrant(conn, products: List[dict],
+                                 embed_client: EmbedAnythingDirectClient,
+                                 qdrant_client: QdrantClient) -> float:
+    """Scenario 1 - Distributed (Qdrant): Insert data into PG, embed from app data, store in Qdrant."""
+    cur = conn.cursor()
+    start = time.perf_counter()
+
+    # Insert relational data
+    product_ids = []
+    for p in products:
+        cur.execute(
+            """INSERT INTO products (name, description, price, stock_count)
+               VALUES (%s, %s, %s, %s)
+               RETURNING product_id""",
+            (p['name'], p['description'], p['price'], p['stock'])
+        )
+        pid = cur.fetchone()[0]
+        product_ids.append(pid)
+
+        for review in p['reviews']:
+            cur.execute("""INSERT INTO reviews (product_id, rating, review_text)
+                           VALUES (%s, %s, %s)""", (pid, review['rating'], review['text']))
+        for category in p['categories']:
+            cur.execute("""INSERT INTO product_categories (product_id, category_name)
+                           VALUES (%s, %s)""", (pid, category))
+
+    conn.commit()
+
+    # Build context from app-level data
+    documents = [build_embedding_context(p) for p in products]
+
+    # Generate embeddings
+    embeddings = embed_client.embed(documents)
+
+    # Store in Qdrant
+    points = [
+        PointStruct(id=pid, vector=embedding, payload={"text": doc})
+        for pid, embedding, doc in zip(product_ids, embeddings, documents)
+    ]
+    qdrant_client.upsert(collection_name="products", points=points, wait=True)
+
+    elapsed = time.perf_counter() - start
+    cur.close()
+    return elapsed
+
+
 # =============================================================================
 # Benchmark Runners
 # =============================================================================
 
 def run_scenario1_unified(products: List[dict], runs: int) -> List[BenchmarkResult]:
     """Run scenario 1 unified: cold start, insert + embed in PostgreSQL."""
-    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
+    conn, pg_pid = connect_and_get_pid()
     py_pid = os.getpid()
 
     try:
@@ -695,19 +790,19 @@ def run_scenario1_unified(products: List[dict], runs: int) -> List[BenchmarkResu
         conn.close()
 
 
-def run_scenario1_distributed(products: List[dict],
-                              embed_client: EmbedAnythingDirectClient,
-                              runs: int) -> List[BenchmarkResult]:
-    """Run scenario 1 distributed: cold start, insert + embed from app data."""
+def run_scenario1_distributed_chroma(products: List[dict],
+                                     embed_client: EmbedAnythingDirectClient,
+                                     runs: int) -> List[BenchmarkResult]:
+    """Run scenario 1 distributed (Chroma)."""
     py_pid = os.getpid()
 
     # Warm up
     warmup_products = generate_products(8)
-    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
+    conn, pg_pid = connect_and_get_pid()
     client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
     try:
         truncate_pg_tables(conn)
-        scenario1_distributed(conn, warmup_products, embed_client, collection)
+        scenario1_distributed_chroma(conn, warmup_products, embed_client, collection)
     finally:
         conn.close()
         cleanup_chroma(client, db_path)
@@ -715,13 +810,13 @@ def run_scenario1_distributed(products: List[dict],
     # Run benchmark
     results = []
     for _ in range(runs):
-        conn, _ = connect_and_get_pid()
+        conn, pg_pid = connect_and_get_pid()
         client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
         try:
             truncate_pg_tables(conn)
             elapsed, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
-                lambda: scenario1_distributed(conn, products, embed_client, collection)
+                lambda: scenario1_distributed_chroma(conn, products, embed_client, collection)
             )
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
         finally:
@@ -731,13 +826,49 @@ def run_scenario1_distributed(products: List[dict],
     return results
 
 
+def run_scenario1_distributed_qdrant(products: List[dict],
+                                     embed_client: EmbedAnythingDirectClient,
+                                     runs: int) -> List[BenchmarkResult]:
+    """Run scenario 1 distributed (Qdrant)."""
+    py_pid = os.getpid()
+
+    # Warm up
+    warmup_products = generate_products(8)
+    conn, pg_pid = connect_and_get_pid()
+    client = create_qdrant_client()
+    try:
+        truncate_pg_tables(conn)
+        scenario1_distributed_qdrant(conn, warmup_products, embed_client, client)
+    finally:
+        conn.close()
+        cleanup_qdrant(client)
+
+    # Run benchmark
+    results = []
+    for _ in range(runs):
+        conn, pg_pid = connect_and_get_pid()
+        client = create_qdrant_client()
+        try:
+            truncate_pg_tables(conn)
+            elapsed, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: scenario1_distributed_qdrant(conn, products, embed_client, client)
+            )
+            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
+        finally:
+            conn.close()
+            cleanup_qdrant(client)
+
+    return results
+
+
 def run_scenario2_unified(products: List[dict], runs: int) -> List[BenchmarkResult]:
-    """Run scenario 2 unified: pre-existing data, generate embeddings only."""
-    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
+    """Run scenario 2 unified: pre-existing data."""
+    conn, pg_pid = connect_and_get_pid()
     py_pid = os.getpid()
 
     try:
-        # Setup: insert data first (not timed)
+        # Setup
         truncate_pg_tables(conn)
         insert_product_data(conn, products)
 
@@ -760,14 +891,14 @@ def run_scenario2_unified(products: List[dict], runs: int) -> List[BenchmarkResu
         conn.close()
 
 
-def run_scenario2_distributed(products: List[dict],
-                              embed_client: EmbedAnythingDirectClient,
-                              runs: int) -> List[BenchmarkResult]:
-    """Run scenario 2 distributed: pre-existing data, fetch + embed + store."""
+def run_scenario2_distributed_chroma(products: List[dict],
+                                     embed_client: EmbedAnythingDirectClient,
+                                     runs: int) -> List[BenchmarkResult]:
+    """Run scenario 2 distributed (Chroma)."""
     py_pid = os.getpid()
 
-    # Setup: insert data into PostgreSQL first (not timed)
-    conn, pg_pid = connect_and_get_pid()  # pg_pid is the backend process handling this connection
+    # Setup
+    conn, pg_pid = connect_and_get_pid()
     truncate_pg_tables(conn)
     insert_product_data(conn, products)
     conn.close()
@@ -776,7 +907,7 @@ def run_scenario2_distributed(products: List[dict],
     conn, _ = connect_and_get_pid()
     client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
     try:
-        scenario2_distributed(conn, embed_client, collection)
+        scenario2_distributed_chroma(conn, embed_client, collection)
     finally:
         conn.close()
         cleanup_chroma(client, db_path)
@@ -784,17 +915,56 @@ def run_scenario2_distributed(products: List[dict],
     # Run benchmark
     results = []
     for _ in range(runs):
-        conn, _ = connect_and_get_pid()
+        conn, pg_pid = connect_and_get_pid()
         client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
         try:
             elapsed, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
-                lambda: scenario2_distributed(conn, embed_client, collection)
+                lambda: scenario2_distributed_chroma(conn, embed_client, collection)
             )
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
         finally:
             conn.close()
             cleanup_chroma(client, db_path)
+
+    return results
+
+
+def run_scenario2_distributed_qdrant(products: List[dict],
+                                     embed_client: EmbedAnythingDirectClient,
+                                     runs: int) -> List[BenchmarkResult]:
+    """Run scenario 2 distributed (Qdrant)."""
+    py_pid = os.getpid()
+
+    # Setup
+    conn, pg_pid = connect_and_get_pid()
+    truncate_pg_tables(conn)
+    insert_product_data(conn, products)
+    conn.close()
+
+    # Warm up
+    conn, _ = connect_and_get_pid()
+    client = create_qdrant_client()
+    try:
+        scenario2_distributed_qdrant(conn, embed_client, client)
+    finally:
+        conn.close()
+        cleanup_qdrant(client)
+
+    # Run benchmark
+    results = []
+    for _ in range(runs):
+        conn, pg_pid = connect_and_get_pid()
+        client = create_qdrant_client()
+        try:
+            elapsed, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: scenario2_distributed_qdrant(conn, embed_client, client)
+            )
+            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
+        finally:
+            conn.close()
+            cleanup_qdrant(client)
 
     return results
 
@@ -805,24 +975,23 @@ def run_scenario2_distributed(products: List[dict],
 
 def print_header():
     """Print benchmark results header."""
-    # Column widths match print_result row_fmt
     lbl_w = 12
     time_w = 12
     col_w = 11
     med_w = 7
 
-    # Prefix with two spaces to align with rows
     header = (
-        "  " +
-        f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU μ±σ':>{col_w}} | "
-        f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU μ±σ':>{col_w}} | {'Sys MB μ±σ':>{col_w}} | {'Sys CPU% μ±σ':>{col_w}}"
+            "  " +
+            f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU μ±σ':>{col_w}} | "
+            f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU μ±σ':>{col_w}} | {'QD Δ MB μ±σ':>{col_w}} | {'QD CPU μ±σ':>{col_w}}"
     )
     print("Benchmark Results:", flush=True)
     print(header, flush=True)
     print("=" * len(header), flush=True)
- 
+
+
 def print_result(label: str, results: List[BenchmarkResult]):
-    """Print aggregated results from multiple runs with ± std dev."""
+    """Print aggregated results."""
     times = [r.time_s for r in results]
     py_delta = [r.stats.py_delta_mb for r in results]
     py_peak = [r.stats.py_peak_mb for r in results]
@@ -830,31 +999,25 @@ def print_result(label: str, results: List[BenchmarkResult]):
     pg_delta = [r.stats.pg_delta_mb for r in results]
     pg_peak = [r.stats.pg_peak_mb for r in results]
     pg_cpu = [r.stats.pg_cpu for r in results]
-    sys_mem = [r.stats.sys_mem_mb for r in results]
-    sys_cpu = [r.stats.sys_cpu for r in results]
+    qd_delta = [r.stats.qd_delta_mb for r in results]
+    qd_cpu = [r.stats.qd_cpu for r in results]
 
     def fmt_mean(values: List[float], precision: int = 1) -> str:
         avg = mean(values)
         std = safe_stdev(values)
         if precision == 3:
             return f"{avg:.3f}±{std:.3f}"
-        elif precision == 0:
-            return f"{avg:.0f}±{std:.0f}"
-        else:
-            return f"{avg:.1f}±{std:.1f}"
+        return f"{avg:.1f}±{std:.1f}"
 
     def fmt_median_iqr(values: List[float], precision: int = 1) -> str:
         med = median(values)
         iqr = calc_iqr(values)
         if precision == 3:
             return f"{med:.3f}±{iqr:.3f}"
-        elif precision == 0:
-            return f"{med:.0f}±{iqr:.0f}"
-        else:
-            return f"{med:.1f}±{iqr:.1f}"
-    # Print rows (mean ± std)
+        return f"{med:.1f}±{iqr:.1f}"
+
     row_fmt = (
-        "  {label:<12}{med:>7} | {time:>12} | {pyd:>11} | {pyp:>11} | {pyc:>11} | {pgd:>11} | {pgp:>11} | {pgc:>11} | {sysm:>11} | {sysc:>11}"
+        "  {label:<12}{med:>7} | {time:>12} | {pyd:>11} | {pyp:>11} | {pyc:>11} | {pgd:>11} | {pgp:>11} | {pgc:>11} | {qdd:>11} | {qdc:>11}"
     )
     print(row_fmt.format(
         label=label,
@@ -866,10 +1029,9 @@ def print_result(label: str, results: List[BenchmarkResult]):
         pgd=fmt_mean(pg_delta),
         pgp=fmt_mean(pg_peak),
         pgc=fmt_mean(pg_cpu),
-        sysm=fmt_mean(sys_mem, 0),
-        sysc=fmt_mean(sys_cpu),
+        qdd=fmt_mean(qd_delta),
+        qdc=fmt_mean(qd_cpu),
     ), flush=True)
-    # median ± IQR
     print(row_fmt.format(
         label=label,
         med=' (med)',
@@ -880,8 +1042,8 @@ def print_result(label: str, results: List[BenchmarkResult]):
         pgd=fmt_median_iqr(pg_delta),
         pgp=fmt_median_iqr(pg_peak),
         pgc=fmt_median_iqr(pg_cpu),
-        sysm=fmt_median_iqr(sys_mem, 0),
-        sysc=fmt_median_iqr(sys_cpu),
+        qdd=fmt_median_iqr(qd_delta),
+        qdc=fmt_median_iqr(qd_cpu),
     ), flush=True)
 
 
@@ -894,11 +1056,14 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
     pg_cpu = [r.stats.pg_cpu for r in results]
     pg_delta = [r.stats.pg_delta_mb for r in results]
     pg_peak = [r.stats.pg_peak_mb for r in results]
+    qd_cpu = [r.stats.qd_cpu for r in results]
+    qd_delta = [r.stats.qd_delta_mb for r in results]
+    qd_peak = [r.stats.qd_peak_mb for r in results]
     sys_cpu = [r.stats.sys_cpu for r in results]
     sys_mem = [r.stats.sys_mem_mb for r in results]
-    
+
     return {
-        # Throughput (mean-based)
+        # Throughput
         'throughput': size / mean(times),
         'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
         'throughput_median': size / median(times),
@@ -908,33 +1073,40 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
         'time_s_std': safe_stdev(times),
         'time_s_median': median(times),
         'time_s_iqr': calc_iqr(times),
-        # Python process
+        # Python
         'py_cpu': mean(py_cpu),
         'py_cpu_std': safe_stdev(py_cpu),
         'py_cpu_median': median(py_cpu),
         'py_cpu_iqr': calc_iqr(py_cpu),
         'py_mem_delta': mean(py_delta),
         'py_mem_delta_std': safe_stdev(py_delta),
-        'py_mem_delta_median': median(py_delta),
-        'py_mem_delta_iqr': calc_iqr(py_delta),
         'py_mem_peak': mean(py_peak),
         'py_mem_peak_std': safe_stdev(py_peak),
         'py_mem_peak_median': median(py_peak),
         'py_mem_peak_iqr': calc_iqr(py_peak),
-        # PostgreSQL process
+        # PG
         'pg_cpu': mean(pg_cpu),
         'pg_cpu_std': safe_stdev(pg_cpu),
         'pg_cpu_median': median(pg_cpu),
         'pg_cpu_iqr': calc_iqr(pg_cpu),
         'pg_mem_delta': mean(pg_delta),
         'pg_mem_delta_std': safe_stdev(pg_delta),
-        'pg_mem_delta_median': median(pg_delta),
-        'pg_mem_delta_iqr': calc_iqr(pg_delta),
         'pg_mem_peak': mean(pg_peak),
         'pg_mem_peak_std': safe_stdev(pg_peak),
         'pg_mem_peak_median': median(pg_peak),
         'pg_mem_peak_iqr': calc_iqr(pg_peak),
-        # System-wide
+        # Qdrant
+        'qd_cpu': mean(qd_cpu),
+        'qd_cpu_std': safe_stdev(qd_cpu),
+        'qd_cpu_median': median(qd_cpu),
+        'qd_cpu_iqr': calc_iqr(qd_cpu),
+        'qd_mem_delta': mean(qd_delta),
+        'qd_mem_delta_std': safe_stdev(qd_delta),
+        'qd_mem_peak': mean(qd_peak),
+        'qd_mem_peak_std': safe_stdev(qd_peak),
+        'qd_mem_peak_median': median(qd_peak),
+        'qd_mem_peak_iqr': calc_iqr(qd_peak),
+        # System
         'sys_cpu': mean(sys_cpu),
         'sys_cpu_std': safe_stdev(sys_cpu),
         'sys_cpu_median': median(sys_cpu),
@@ -965,9 +1137,9 @@ def main():
     # ==========================================================================
     # Scenario 1: Cold Start (insert + embedding generation)
     # ==========================================================================
-    print("=" * 105)
+    print("=" * 120)
     print("SCENARIO 1: Cold Start (insert + embedding generation)")
-    print("=" * 105)
+    print("=" * 120)
     print_header()
 
     for size in TEST_SIZES:
@@ -975,24 +1147,27 @@ def main():
         print(f"Size: {size}", flush=True)
 
         unified_results = run_scenario1_unified(products, RUNS_PER_SIZE)
-        distributed_results = run_scenario1_distributed(products, embed_client, RUNS_PER_SIZE)
+        chroma_results = run_scenario1_distributed_chroma(products, embed_client, RUNS_PER_SIZE)
+        qdrant_results = run_scenario1_distributed_qdrant(products, embed_client, RUNS_PER_SIZE)
 
         print_result("Unified", unified_results)
-        print_result("Distributed", distributed_results)
+        print_result("Chroma", chroma_results)
+        print_result("Qdrant", qdrant_results)
         print()
 
         all_results_s1.append({
             'size': size,
             'unified': compute_metrics(size, unified_results),
-            'distributed': compute_metrics(size, distributed_results),
+            'chroma': compute_metrics(size, chroma_results),
+            'qdrant': compute_metrics(size, qdrant_results),
         })
 
     # ==========================================================================
     # Scenario 2: Pre-existing Data (embedding generation only)
     # ==========================================================================
-    print("=" * 105)
+    print("=" * 120)
     print("SCENARIO 2: Pre-existing Data (embedding generation only)")
-    print("=" * 105)
+    print("=" * 120)
     print_header()
 
     for size in TEST_SIZES:
@@ -1000,31 +1175,20 @@ def main():
         print(f"Size: {size}", flush=True)
 
         unified_results = run_scenario2_unified(products, RUNS_PER_SIZE)
-        distributed_results = run_scenario2_distributed(products, embed_client, RUNS_PER_SIZE)
+        chroma_results = run_scenario2_distributed_chroma(products, embed_client, RUNS_PER_SIZE)
+        qdrant_results = run_scenario2_distributed_qdrant(products, embed_client, RUNS_PER_SIZE)
 
         print_result("Unified", unified_results)
-        print_result("Distributed", distributed_results)
+        print_result("Chroma", chroma_results)
+        print_result("Qdrant", qdrant_results)
         print()
 
         all_results_s2.append({
             'size': size,
             'unified': compute_metrics(size, unified_results),
-            'distributed': compute_metrics(size, distributed_results),
+            'chroma': compute_metrics(size, chroma_results),
+            'qdrant': compute_metrics(size, qdrant_results),
         })
-
-    # ==========================================================================
-    # Summary
-    # ==========================================================================
-    print("=" * 105)
-    print("\nAverage Throughput (products/sec):")
-
-    print("\n  Scenario 1 - Cold Start:")
-    print(f"    Unified (PG+pg_gembed):      {mean([r['unified']['throughput'] for r in all_results_s1]):.2f}")
-    print(f"    Distributed (PG+ChromaDB):   {mean([r['distributed']['throughput'] for r in all_results_s1]):.2f}")
-
-    print("\n  Scenario 2 - Pre-existing Data:")
-    print(f"    Unified (PG+pg_gembed):      {mean([r['unified']['throughput'] for r in all_results_s2]):.2f}")
-    print(f"    Distributed (PG+ChromaDB):   {mean([r['distributed']['throughput'] for r in all_results_s2]):.2f}")
 
     # Save results to CSV and generate plots
     save_results_csv(all_results_s1, all_results_s2)
@@ -1032,17 +1196,18 @@ def main():
 
 
 def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
-    """Save benchmark results to CSV files with mean and std values."""
+    """Save benchmark results to CSV files."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    methods = ['unified', 'distributed']
-    metrics = ['throughput', 'time_s', 
+    methods = ['unified', 'chroma', 'qdrant']
+    metrics = ['throughput', 'time_s',
                'py_cpu', 'py_mem_delta', 'py_mem_peak',
                'pg_cpu', 'pg_mem_delta', 'pg_mem_peak',
+               'qd_cpu', 'qd_mem_delta', 'qd_mem_peak',
                'sys_cpu', 'sys_mem']
 
-    # Build header with _std, _median and _iqr columns
+    # Build header
     header = ['size']
     for method in methods:
         for metric in metrics:
@@ -1051,57 +1216,41 @@ def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
             header.append(f"{method}_{metric}_median")
             header.append(f"{method}_{metric}_iqr")
 
-    # Scenario 1 CSV
-    csv_path_s1 = OUTPUT_DIR / f"scenario1_cold_start_{timestamp}.csv"
-    with open(csv_path_s1, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        for r in all_results_s1:
-            row = [r['size']]
-            for method in methods:
-                for metric in metrics:
-                    row.append(r[method].get(metric))
-                    row.append(r[method].get(f"{metric}_std", 0))
-                    row.append(r[method].get(f"{metric}_median", 0))
-                    row.append(r[method].get(f"{metric}_iqr", 0))
-            writer.writerow(row)
-
-    # Scenario 2 CSV
-    csv_path_s2 = OUTPUT_DIR / f"scenario2_preexisting_{timestamp}.csv"
-    with open(csv_path_s2, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        for r in all_results_s2:
-            row = [r['size']]
-            for method in methods:
-                for metric in metrics:
-                    row.append(r[method].get(metric))
-                    row.append(r[method].get(f"{metric}_std", 0))
-                    row.append(r[method].get(f"{metric}_median", 0))
-                    row.append(r[method].get(f"{metric}_iqr", 0))
-            writer.writerow(row)
-
-    print(f"\nResults saved to:")
-    print(f"  {csv_path_s1}")
-    print(f"  {csv_path_s2}")
+    for scenario, results in [('scenario1_cold_start', all_results_s1), ('scenario2_preexisting', all_results_s2)]:
+        csv_path = OUTPUT_DIR / f"{scenario}_{timestamp}.csv"
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            for r in results:
+                row = [r['size']]
+                for method in methods:
+                    for metric in metrics:
+                        val = r[method].get(metric)
+                        row.append(val)
+                        row.append(r[method].get(f"{metric}_std", 0))
+                        row.append(r[method].get(f"{metric}_median", 0))
+                        row.append(r[method].get(f"{metric}_iqr", 0))
+                writer.writerow(row)
+        print(f"Saved {csv_path}")
 
 
 def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
-    """Generate comparison plots for throughput, CPU, and memory with error bars."""
+    """Generate comparison plots."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     sizes_s1 = [r['size'] for r in all_results_s1]
     sizes_s2 = [r['size'] for r in all_results_s2]
-    methods = ['unified', 'distributed']
-    labels = ['Unified (PG)', 'Distributed (PG + ChromaDB)']
-    colors = ['#2ecc71', '#e74c3c']
-    markers = ['o', 's']
+
+    methods = ['unified', 'chroma', 'qdrant']
+    labels = ['Unified (PG)', 'Distributed (Chroma)', 'Distributed (Qdrant)']
+    colors = ['#2ecc71', '#e74c3c', '#3498db']
+    markers = ['o', 's', '^']
 
     def plot_metric(results, sizes, metric, ylabel, title_suffix, filename):
         plt.figure(figsize=(10, 6))
         for method, label, color, marker in zip(methods, labels, colors, markers):
-            y_vals = [r[method].get(f'{metric}_median', r[method].get(metric)) for r in results]
+            y_vals = [r[method].get(f'{metric}_median', r[method].get(metric, 0)) for r in results]
             y_errs = [r[method].get(f'{metric}_iqr', r[method].get(f'{metric}_std', 0)) for r in results]
             plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
                          linewidth=2, color=color, capsize=3, capthick=1)
@@ -1114,71 +1263,52 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
         plt.savefig(OUTPUT_DIR / filename, dpi=150, bbox_inches='tight')
         plt.close()
 
-    # Scenario 1 plots
-    plot_metric(all_results_s1, sizes_s1, 'throughput', 'Throughput (products/sec)',
-                'Scenario 1 Cold Start: Throughput', f"s1_throughput_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'py_cpu', 'Python Process CPU (%)',
-                'Scenario 1 Cold Start: Python Process CPU', f"s1_py_cpu_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'py_mem_peak', 'Python Peak Memory (MB)',
-                'Scenario 1 Cold Start: Python Peak Memory', f"s1_py_memory_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'pg_cpu', 'PostgreSQL Process CPU (%)',
-                'Scenario 1 Cold Start: PostgreSQL CPU', f"s1_pg_cpu_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'pg_mem_peak', 'PostgreSQL Peak Memory (MB)',
-                'Scenario 1 Cold Start: PostgreSQL Peak Memory', f"s1_pg_memory_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'sys_cpu', 'System CPU Usage (%)',
-                'Scenario 1 Cold Start: System CPU', f"s1_cpu_system_{timestamp}.png")
-    plot_metric(all_results_s1, sizes_s1, 'sys_mem', 'System Memory Used (MB)',
-                'Scenario 1 Cold Start: System Memory', f"s1_memory_system_{timestamp}.png")
+    # Generate plots for both scenarios
+    scenarios = [
+        (all_results_s1, sizes_s1, 's1', 'Scenario 1 Cold Start'),
+        (all_results_s2, sizes_s2, 's2', 'Scenario 2 Pre-existing')
+    ]
 
-    # Scenario 2 plots
-    plot_metric(all_results_s2, sizes_s2, 'throughput', 'Throughput (products/sec)',
-                'Scenario 2 Pre-existing: Throughput', f"s2_throughput_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'py_cpu', 'Python Process CPU (%)',
-                'Scenario 2 Pre-existing: Python Process CPU', f"s2_py_cpu_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'py_mem_peak', 'Python Peak Memory (MB)',
-                'Scenario 2 Pre-existing: Python Peak Memory', f"s2_py_memory_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'pg_cpu', 'PostgreSQL Process CPU (%)',
-                'Scenario 2 Pre-existing: PostgreSQL CPU', f"s2_pg_cpu_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'pg_mem_peak', 'PostgreSQL Peak Memory (MB)',
-                'Scenario 2 Pre-existing: PostgreSQL Peak Memory', f"s2_pg_memory_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'sys_cpu', 'System CPU Usage (%)',
-                'Scenario 2 Pre-existing: System CPU', f"s2_cpu_system_{timestamp}.png")
-    plot_metric(all_results_s2, sizes_s2, 'sys_mem', 'System Memory Used (MB)',
-                'Scenario 2 Pre-existing: System Memory', f"s2_memory_system_{timestamp}.png")
+    for results, sizes, prefix, title in scenarios:
+        plot_metric(results, sizes, 'throughput', 'Throughput (products/sec)',
+                    f'{title}: Throughput', f"{prefix}_throughput_{timestamp}.png")
+        plot_metric(results, sizes, 'py_cpu', 'Python Process CPU (%)',
+                    f'{title}: Python Process CPU', f"{prefix}_py_cpu_{timestamp}.png")
+        plot_metric(results, sizes, 'pg_cpu', 'PostgreSQL Process CPU (%)',
+                    f'{title}: PostgreSQL CPU', f"{prefix}_pg_cpu_{timestamp}.png")
+        plot_metric(results, sizes, 'qd_cpu', 'Qdrant CPU (%)',
+                    f'{title}: Qdrant CPU', f"{prefix}_qd_cpu_{timestamp}.png")
+        plot_metric(results, sizes, 'sys_mem', 'System Memory (MB)',
+                    f'{title}: System Memory', f"{prefix}_memory_system_{timestamp}.png")
 
-    # Summary bar charts (2x8 grid: 2 scenarios x 8 metrics) with error bars
-    fig, axes = plt.subplots(2, 8, figsize=(28, 8))
-    metric_labels = ['Throughput\n(prod/sec)', 'Py CPU (%)', 'Py Mem (MB)', 'PG CPU (%)', 
-                     'PG Mem (MB)', 'Sys CPU (%)', 'Sys Mem (MB)', 'Time (s)']
-    metric_keys = ['throughput', 'py_cpu', 'py_mem_peak', 'pg_cpu', 
-                   'pg_mem_peak', 'sys_cpu', 'sys_mem', 'time_s']
+    # Summary bar charts
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    metric_labels = ['Throughput\n(prod/sec)', 'Py CPU (%)', 'PG CPU (%)', 'QD CPU (%)', 'Time (s)']
+    metric_keys = ['throughput', 'py_cpu', 'pg_cpu', 'qd_cpu', 'time_s']
     x_pos = range(len(methods))
 
     for col, (metric, mlabel) in enumerate(zip(metric_keys, metric_labels)):
         # Scenario 1
-        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric)) for r in all_results_s1]) for m in methods]
-        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s1]) for m in methods]
-        bars = axes[0, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric, 0)) for r in all_results_s1]) for m in methods]
+        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s1]) for m in
+                methods]
+        axes[0, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
         axes[0, col].set_xticks(x_pos)
-        axes[0, col].set_xticklabels(labels)
+        axes[0, col].set_xticklabels(labels, rotation=45, ha='right')
         axes[0, col].set_title(f'S1: {mlabel}')
-        axes[0, col].bar_label(bars, fmt='%.1f')
-        axes[0, col].tick_params(axis='x', rotation=15)
 
         # Scenario 2
-        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric)) for r in all_results_s2]) for m in methods]
-        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s2]) for m in methods]
-        bars = axes[1, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
+        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric, 0)) for r in all_results_s2]) for m in methods]
+        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s2]) for m in
+                methods]
+        axes[1, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
         axes[1, col].set_xticks(x_pos)
-        axes[1, col].set_xticklabels(labels)
+        axes[1, col].set_xticklabels(labels, rotation=45, ha='right')
         axes[1, col].set_title(f'S2: {mlabel}')
-        axes[1, col].bar_label(bars, fmt='%.1f')
-        axes[1, col].tick_params(axis='x', rotation=15)
 
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / f"summary_{timestamp}.png", dpi=150, bbox_inches='tight')
     plt.close()
-
     print(f"Plots saved to: {OUTPUT_DIR}/")
 
 
