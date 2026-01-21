@@ -1,6 +1,7 @@
 # Embedding Benchmarks
 
-This repository contains benchmarks comparing different approaches for generating and storing embeddings with PostgreSQL, pgvector, pg_gembed and ChromaDB.
+This repository contains benchmarks comparing different approaches for generating and storing embeddings with
+PostgreSQL, pgvector, pg_gembed and ChromaDB.
 
 ## Project Structure
 
@@ -16,7 +17,7 @@ python-scripts/
 │   ├── grpc_server.py                  # gRPC embedding server
 │   └── http_server.py                  # HTTP embedding server
 ├── 1_internal-vs-external-gen/         # Benchmark 1: Embedding generation methods
-├── 2_pg_gembed-vs-chromadb/            # Benchmark 2: Generation + storage comparison
+├── 2_pg_gembed-vs-vectordbs/           # Benchmark 2: Generation + storage comparison
 └── 3_unified-vs-distributed/           # Benchmark 3: Architecture comparison
 ```
 
@@ -49,11 +50,13 @@ python3.13 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. tei.proto
 ## Running Servers
 
 ### gRPC Server
+
 ```bash
 PYTHONPATH=.:proto python3.13 servers/grpc_server.py
 ```
 
 ### HTTP Server
+
 ```bash
 PYTHONPATH=.:proto python3.13 servers/http_server.py
 ```
@@ -65,6 +68,7 @@ PYTHONPATH=.:proto python3.13 servers/http_server.py
 **Directory:** `1_internal-vs-external-gen/`
 
 Compares embedding generation methods:
+
 - **PG Local**: PostgreSQL with pg_gembed (internal embedding generation)
 - **PG gRPC**: PostgreSQL with pg_gembed (internal) + gRPC warmup
 - **In-Process**: EmbedAnything in Python process (no server)
@@ -75,17 +79,19 @@ Compares embedding generation methods:
 PYTHONPATH=.:proto python3.13 1_internal-vs-external-gen/benchmark.py
 ```
 
-### Benchmark 2: PG+pgvector vs ChromaDB Generation + Storage
+### Benchmark 2: PG+pgvector vs Vector DBs (ChromaDB, Qdrant)
 
-**Directory:** `2_pg_gembed-vs-chromadb/`
+**Directory:** `2_pg_gembed-vs-vectordbs/`
 
 Compares both embedding generation location and storage systems:
+
 - **PG Local**: pg_gembed generates embeddings inside PostgreSQL
 - **PG gRPC**: Same as above with gRPC warmup
 - **Chroma**: EmbedAnything in Python process (no server) → stored in ChromaDB
+- **Qdrant**: EmbedAnything in Python process (no server) → stored in Qdrant (requires Docker)
 
 ```bash
-PYTHONPATH=.:proto python3.13 2_pg_gembed-vs-chromadb/benchmark.py
+PYTHONPATH=.:proto python3.13 2_pg_gembed-vs-vectordbs/benchmark.py
 ```
 
 ### Benchmark 3: Unified vs Distributed Architecture
@@ -95,20 +101,23 @@ PYTHONPATH=.:proto python3.13 2_pg_gembed-vs-chromadb/benchmark.py
 Compares architectural patterns with two scenarios:
 
 **Scenario 1: Cold Start (Insert + Embed)**
+
 - Fresh insert of all data
 - Measures total time including data insertion
 - Simulates initial data loading or migration
 
 **Scenario 2: Pre-existing Data (Update Only)**
+
 - Data already exists in both systems
 - Only measures embedding generation time
 - Simulates updating embeddings after model change
 
 Each scenario compares:
+
 - **Unified**: All data + embeddings in PostgreSQL with pg_gembed
 - **Distributed**: Metadata in PostgreSQL + embeddings in ChromaDB
-Both PostgreSQL and ChromaDB use an HNSW index with matching parameters for fair
-comparison: `m = 16`, `ef_construction = 100`.
+  Both PostgreSQL and ChromaDB use an HNSW index with matching parameters for fair
+  comparison: `m = 16`, `ef_construction = 100`.
 
 ```bash
 PYTHONPATH=.:proto python3.13 3_unified-vs-distributed/benchmark.py
@@ -116,7 +125,8 @@ PYTHONPATH=.:proto python3.13 3_unified-vs-distributed/benchmark.py
 
 ## Benchmark Data
 
-The benchmarks can use **real product review data** from the [TPCx-AI](http://tpc.org/tpcx-ai/default5.asp) benchmark suite. If the data file is not present, benchmarks will automatically fall back to synthetic data.
+The benchmarks can use **real product review data** from the [TPCx-AI](http://tpc.org/tpcx-ai/default5.asp) benchmark
+suite. If the data file is not present, benchmarks will automatically fall back to synthetic data.
 
 ### Quick Start (Synthetic Data)
 
@@ -124,13 +134,20 @@ Benchmarks work out of the box with synthetic data—no additional setup require
 
 ### Using TPCx-AI Data (Recommended)
 
-For more realistic benchmarks, obtain the TPCx-AI review data:
+For more realistic benchmarks, obtain the TPCx-AI review and image data:
 
 1. **Download TPCx-AI toolkit** from [tpc.org](http://tpc.org/tpcx-ai/default5.asp) (requires free registration)
 
-2. **Generate the data** using Docker:
+2. **Fix dictionary dependency** for image generation:
    ```bash
    cd /path/to/tpcx-ai-v2.0.0
+   ln -s lib/pdgf/dicts .
+   ```
+
+3. **Generate the data** using Docker:
+
+   **Review Data (Use Case 4):**
+   ```bash
    docker run --platform linux/amd64 --rm \
      -v "$(pwd)":/tpcx-ai \
      -w /tpcx-ai eclipse-temurin:8-jdk bash -c \
@@ -143,12 +160,27 @@ For more realistic benchmarks, obtain the TPCx-AI review data:
       -ns -sf 1 -s Review"
    ```
 
-3. **Copy the Review table** to the data directory:
+   **Image Data (Use Case 9):**
    ```bash
-   cp /path/to/tpcx-ai-v2.0.0/output/Review.psv data/
+   docker run --platform linux/amd64 --rm \
+     -v "$(pwd)":/tpcx-ai \
+     -w /tpcx-ai eclipse-temurin:8-jdk bash -c \
+     "apt-get update -qq && \
+      apt-get install -y -qq libx11-6 libxext6 libxrender1 libxtst6 libxi6 \
+      libgl1 libxrandr2 libxcursor1 libxinerama1 libxfixes3 xvfb 2>/dev/null && \
+      printf '\nYES\n' | xvfb-run java -jar lib/pdgf/pdgf.jar \
+      -l data-gen/config/tpcxai-schema-noplugins.xml \
+      -l data-gen/config/tpcxai-generation.xml \
+      -ns -sf 1 -s CUSTOMER_IMAGES"
    ```
 
-The Review.psv file contains 200,000 product reviews (~135MB) with realistic text and spam labels.
+4. **Copy the data** to the data directory:
+   ```bash
+   cp /path/to/tpcx-ai-v2.0.0/output/Review.psv data/
+   cp -r /path/to/tpcx-ai-v2.0.0/output/CUSTOMER_IMAGES data/
+   ```
+
+The `Review.psv` file contains 200,000 product reviews (~135MB). The `CUSTOMER_IMAGES` directory contains facial images organized by customer name.
 
 ### Data Loading
 
@@ -163,4 +195,12 @@ if is_using_synthetic():
 
 # Get 1000 legitimate reviews
 texts = get_review_texts(1000)
+```
+
+```shell
+docker pull qdrant/qdrant
+
+docker run --name qdrant -p 6333:6333 -p 6334:6334 \
+    -v "$(pwd)/qdrant_storage:/qdrant/storage:z" \
+    qdrant/qdrant
 ```

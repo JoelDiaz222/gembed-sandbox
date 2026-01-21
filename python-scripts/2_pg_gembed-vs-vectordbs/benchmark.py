@@ -30,10 +30,10 @@ POSTGRESQL_CONFIG = {
 QDRANT_URL = "http://localhost:6333"
 QDRANT_CONTAINER_NAME = "qdrant"
 
-TEST_SIZES = [16, 32, 64, 128, 256, 512]
+TEST_SIZES = [16]
 BATCH_SIZE = 32
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
-RUNS_PER_SIZE = 5  # Number of runs per test size
+RUNS_PER_SIZE = 5
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -116,8 +116,12 @@ class ResourceMonitor:
     def _get_pg_mem(self):
         if not self.pg_process: return 0
         try:
-            m = self.pg_process.memory_full_info()
-            return m.uss if hasattr(m, 'uss') else m.rss
+            return self.pg_process.memory_full_info().uss
+        except (psutil.AccessDenied, AttributeError):
+            try:
+                return self.pg_process.memory_info().rss
+            except:
+                return 0
         except:
             return 0
 
@@ -355,15 +359,22 @@ def create_qdrant_client(use_index: bool = True):
             m=16,
             ef_construct=100,
         )
+        optimizers_config = models.OptimizersConfigDiff(
+            indexing_threshold=0,
+        )
     else:
         # Deactivate HNSW index
         hnsw_config = models.HnswConfigDiff(
             m=0,
         )
+        optimizers_config = models.OptimizersConfigDiff(
+            indexing_threshold=20000,
+        )
 
     client.create_collection(
         collection_name="bench",
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE, hnsw_config=hnsw_config)
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE, hnsw_config=hnsw_config),
+        optimizers_config=optimizers_config
     )
 
     return client
@@ -512,13 +523,14 @@ def print_header():
     """Print benchmark results header with QD (Qdrant) columns."""
     lbl_w, time_w, col_w, med_w = 12, 14, 13, 7
 
-    print("\nBenchmark Results (Peak RAM in MB):", flush=True)
+    print("\nBenchmark Results:", flush=True)
     header = (
-        f"{'':{lbl_w}}{'':{med_w}} | {'Time (s)':>{time_w}} | "
-        f"{'Py Δ MB':>{col_w}} | {'Py Peak':>{col_w}} | {'Py CPU%':>{col_w}} | "
-        f"{'PG Δ MB':>{col_w}} | {'PG Peak':>{col_w}} | {'PG CPU%':>{col_w}} | "
-        f"{'QD Δ MB':>{col_w}} | {'QD Peak':>{col_w}} | {'QD CPU%':>{col_w}} | "
-        f"{'Sys MB':>{col_w}} | {'Sys CPU%':>{col_w}}"
+            "  " +
+            f"{'':{lbl_w}}{'':{med_w}} | {'Time (s)':>{time_w}} | "
+            f"{'Py Δ MB':>{col_w}} | {'Py Peak MB':>{col_w}} | {'Py CPU%':>{col_w}} | "
+            f"{'PG Δ MB':>{col_w}} | {'PG Peak MB':>{col_w}} | {'PG CPU%':>{col_w}} | "
+            f"{'QD Δ MB':>{col_w}} | {'QD Peak MB':>{col_w}} | {'QD CPU%':>{col_w}} | "
+            f"{'Sys MB':>{col_w}} | {'Sys CPU%':>{col_w}}"
     )
     print(header, flush=True)
     print("=" * len(header), flush=True)

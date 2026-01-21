@@ -14,6 +14,7 @@ import embed_anything
 import matplotlib.pyplot as plt
 import psutil
 import psycopg2
+from psycopg2 import extras
 from embed_anything import EmbeddingModel, WhichModel
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -125,8 +126,12 @@ class ResourceMonitor:
     def _get_pg_mem(self):
         if not self.pg_process: return 0
         try:
-            m = self.pg_process.memory_full_info()
-            return m.uss if hasattr(m, 'uss') else m.rss
+            return self.pg_process.memory_full_info().uss
+        except (psutil.AccessDenied, AttributeError):
+            try:
+                return self.pg_process.memory_info().rss
+            except:
+                return 0
         except:
             return 0
 
@@ -360,35 +365,56 @@ def clear_embeddings(conn):
     cur.close()
 
 
+def batch_insert_products(cur, products: List[dict]) -> List[int]:
+    """Efficiently batch insert products and their dependencies."""
+    # Prepare data for products
+    product_values = [
+        (p['name'], p['description'], p['price'], p['stock'])
+        for p in products
+    ]
+
+    # Insert products and get IDs
+    query = """
+        INSERT INTO products (name, description, price, stock_count)
+        VALUES %s
+        RETURNING product_id
+    """
+    extras.execute_values(cur, query, product_values)
+    product_ids = [row[0] for row in cur.fetchall()]
+
+    # Prepare data for reviews and categories
+    review_values = []
+    category_values = []
+
+    for pid, p in zip(product_ids, products):
+        for review in p['reviews']:
+            review_values.append((pid, review['rating'], review['text']))
+        for category in p['categories']:
+            category_values.append((pid, category))
+
+    # Batch insert reviews
+    if review_values:
+        extras.execute_values(
+            cur,
+            "INSERT INTO reviews (product_id, rating, review_text) VALUES %s",
+            review_values
+        )
+
+    # Batch insert categories
+    if category_values:
+        extras.execute_values(
+            cur,
+            "INSERT INTO product_categories (product_id, category_name) VALUES %s",
+            category_values
+        )
+
+    return product_ids
+
+
 def insert_product_data(conn, products: List[dict]) -> List[int]:
     """Insert product relational data (without embeddings)."""
     cur = conn.cursor()
-    product_ids = []
-
-    for p in products:
-        cur.execute(
-            """INSERT INTO products (name, description, price, stock_count)
-               VALUES (%s, %s, %s, %s)
-               RETURNING product_id""",
-            (p['name'], p['description'], p['price'], p['stock'])
-        )
-        pid = cur.fetchone()[0]
-        product_ids.append(pid)
-
-        for review in p['reviews']:
-            cur.execute(
-                """INSERT INTO reviews (product_id, rating, review_text)
-                   VALUES (%s, %s, %s)""",
-                (pid, review['rating'], review['text'])
-            )
-
-        for category in p['categories']:
-            cur.execute(
-                """INSERT INTO product_categories (product_id, category_name)
-                   VALUES (%s, %s)""",
-                (pid, category)
-            )
-
+    product_ids = batch_insert_products(cur, products)
     conn.commit()
     cur.close()
     return product_ids
@@ -613,21 +639,7 @@ def scenario1_unified(conn, products: List[dict]) -> float:
     start = time.perf_counter()
 
     # Insert relational data
-    for p in products:
-        cur.execute(
-            """INSERT INTO products (name, description, price, stock_count)
-               VALUES (%s, %s, %s, %s)
-               RETURNING product_id""",
-            (p['name'], p['description'], p['price'], p['stock'])
-        )
-        pid = cur.fetchone()[0]
-
-        for review in p['reviews']:
-            cur.execute("""INSERT INTO reviews (product_id, rating, review_text)
-                           VALUES (%s, %s, %s)""", (pid, review['rating'], review['text']))
-        for category in p['categories']:
-            cur.execute("""INSERT INTO product_categories (product_id, category_name)
-                           VALUES (%s, %s)""", (pid, category))
+    batch_insert_products(cur, products)
 
     # Generate embeddings using SQL JOIN + pg_gembed
     cur.execute("""
@@ -676,24 +688,7 @@ def scenario1_distributed_chroma(conn, products: List[dict],
     start = time.perf_counter()
 
     # Insert relational data
-    product_ids = []
-    for p in products:
-        cur.execute(
-            """INSERT INTO products (name, description, price, stock_count)
-               VALUES (%s, %s, %s, %s)
-               RETURNING product_id""",
-            (p['name'], p['description'], p['price'], p['stock'])
-        )
-        pid = cur.fetchone()[0]
-        product_ids.append(pid)
-
-        for review in p['reviews']:
-            cur.execute("""INSERT INTO reviews (product_id, rating, review_text)
-                           VALUES (%s, %s, %s)""", (pid, review['rating'], review['text']))
-        for category in p['categories']:
-            cur.execute("""INSERT INTO product_categories (product_id, category_name)
-                           VALUES (%s, %s)""", (pid, category))
-
+    product_ids = batch_insert_products(cur, products)
     conn.commit()
 
     # Build context from app-level data
@@ -722,24 +717,7 @@ def scenario1_distributed_qdrant(conn, products: List[dict],
     start = time.perf_counter()
 
     # Insert relational data
-    product_ids = []
-    for p in products:
-        cur.execute(
-            """INSERT INTO products (name, description, price, stock_count)
-               VALUES (%s, %s, %s, %s)
-               RETURNING product_id""",
-            (p['name'], p['description'], p['price'], p['stock'])
-        )
-        pid = cur.fetchone()[0]
-        product_ids.append(pid)
-
-        for review in p['reviews']:
-            cur.execute("""INSERT INTO reviews (product_id, rating, review_text)
-                           VALUES (%s, %s, %s)""", (pid, review['rating'], review['text']))
-        for category in p['categories']:
-            cur.execute("""INSERT INTO product_categories (product_id, category_name)
-                           VALUES (%s, %s)""", (pid, category))
-
+    product_ids = batch_insert_products(cur, products)
     conn.commit()
 
     # Build context from app-level data
@@ -1216,8 +1194,11 @@ def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
             header.append(f"{method}_{metric}_median")
             header.append(f"{method}_{metric}_iqr")
 
-    for scenario, results in [('scenario1_cold_start', all_results_s1), ('scenario2_preexisting', all_results_s2)]:
-        csv_path = OUTPUT_DIR / f"{scenario}_{timestamp}.csv"
+    for scenario_name, results in [('scenario1', all_results_s1), ('scenario2', all_results_s2)]:
+        scenario_dir = OUTPUT_DIR / scenario_name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = scenario_dir / f"benchmark_{timestamp}.csv"
+
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(header)
@@ -1247,7 +1228,7 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
     colors = ['#2ecc71', '#e74c3c', '#3498db']
     markers = ['o', 's', '^']
 
-    def plot_metric(results, sizes, metric, ylabel, title_suffix, filename):
+    def plot_metric(results, sizes, metric, ylabel, title_suffix, output_path):
         plt.figure(figsize=(10, 6))
         for method, label, color, marker in zip(methods, labels, colors, markers):
             y_vals = [r[method].get(f'{metric}_median', r[method].get(metric, 0)) for r in results]
@@ -1260,26 +1241,41 @@ def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.xscale('log', base=2)
-        plt.savefig(OUTPUT_DIR / filename, dpi=150, bbox_inches='tight')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
 
     # Generate plots for both scenarios
     scenarios = [
-        (all_results_s1, sizes_s1, 's1', 'Scenario 1 Cold Start'),
-        (all_results_s2, sizes_s2, 's2', 'Scenario 2 Pre-existing')
+        (all_results_s1, sizes_s1, 'scenario1', 'Scenario 1 Cold Start'),
+        (all_results_s2, sizes_s2, 'scenario2', 'Scenario 2 Pre-existing')
     ]
 
-    for results, sizes, prefix, title in scenarios:
+    for results, sizes, folder_name, title in scenarios:
+        scenario_dir = OUTPUT_DIR / folder_name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
         plot_metric(results, sizes, 'throughput', 'Throughput (products/sec)',
-                    f'{title}: Throughput', f"{prefix}_throughput_{timestamp}.png")
+                    f'{title}: Throughput', scenario_dir / f"throughput_{timestamp}.png")
+
+        # CPU Usage
+        plot_metric(results, sizes, 'sys_cpu', 'System CPU (%)',
+                    f'{title}: System CPU', scenario_dir / f"cpu_system_{timestamp}.png")
         plot_metric(results, sizes, 'py_cpu', 'Python Process CPU (%)',
-                    f'{title}: Python Process CPU', f"{prefix}_py_cpu_{timestamp}.png")
+                    f'{title}: Python Process CPU', scenario_dir / f"py_cpu_{timestamp}.png")
         plot_metric(results, sizes, 'pg_cpu', 'PostgreSQL Process CPU (%)',
-                    f'{title}: PostgreSQL CPU', f"{prefix}_pg_cpu_{timestamp}.png")
+                    f'{title}: PostgreSQL CPU', scenario_dir / f"pg_cpu_{timestamp}.png")
         plot_metric(results, sizes, 'qd_cpu', 'Qdrant CPU (%)',
-                    f'{title}: Qdrant CPU', f"{prefix}_qd_cpu_{timestamp}.png")
+                    f'{title}: Qdrant CPU', scenario_dir / f"qd_cpu_{timestamp}.png")
+
+        # Memory Usage
         plot_metric(results, sizes, 'sys_mem', 'System Memory (MB)',
-                    f'{title}: System Memory', f"{prefix}_memory_system_{timestamp}.png")
+                    f'{title}: System Memory', scenario_dir / f"memory_system_{timestamp}.png")
+        plot_metric(results, sizes, 'py_mem_peak', 'Python Peak Memory (MB)',
+                    f'{title}: Python Peak Memory', scenario_dir / f"py_memory_{timestamp}.png")
+        plot_metric(results, sizes, 'pg_mem_peak', 'PostgreSQL Peak Memory (MB)',
+                    f'{title}: PostgreSQL Peak Memory', scenario_dir / f"pg_memory_{timestamp}.png")
+        plot_metric(results, sizes, 'qd_mem_peak', 'Qdrant Peak Memory (MB)',
+                    f'{title}: Qdrant Peak Memory', scenario_dir / f"qd_memory_{timestamp}.png")
 
     # Summary bar charts
     fig, axes = plt.subplots(2, 5, figsize=(20, 8))

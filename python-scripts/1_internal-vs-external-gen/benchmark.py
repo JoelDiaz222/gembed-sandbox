@@ -406,9 +406,9 @@ def print_header():
     # Include a small med-marker column between label and values
     med_w = 7
     header = (
-        "  " +
-        f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU% μ±σ':>{col_w}} | "
-        f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU% μ±σ':>{col_w}} | {'Sys MB μ±σ':>{col_w}} | {'Sys CPU% μ±σ':>{col_w}}"
+            "  " +
+            f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU% μ±σ':>{col_w}} | "
+            f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU% μ±σ':>{col_w}} | {'Sys MB μ±σ':>{col_w}} | {'Sys CPU% μ±σ':>{col_w}}"
     )
     print(header, flush=True)
     print("=" * len(header), flush=True)
@@ -445,6 +445,7 @@ def print_result(label: str, results: List[BenchmarkResult]):
             return f"{med:.0f}±{iqr:.0f}"
         else:
             return f"{med:.1f}±{iqr:.1f}"
+
     # Print mean±std
     row_fmt = (
         "  {label:<12}{med:>7} | {time:>12} | {pyd:>11} | {pyp:>11} | {pyc:>11} | {pgd:>11} | {pgp:>11} | {pgc:>11} | {sysm:>11} | {sysc:>11}"
@@ -489,7 +490,7 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
     pg_peak = [r.stats.pg_peak_mb for r in results]
     sys_cpu = [r.stats.sys_cpu for r in results]
     sys_mem = [r.stats.sys_mem_mb for r in results]
-    
+
     return {
         # Throughput (mean-based)
         'throughput': size / mean(times),

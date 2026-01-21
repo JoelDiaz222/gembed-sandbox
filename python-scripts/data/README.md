@@ -8,7 +8,7 @@ Benchmarks work immediately with synthetic data—no setup required. For more re
 
 ## Obtaining TPCx-AI Data (Optional)
 
-The TPCx-AI benchmark suite provides realistic product review data for AI/ML workloads.
+The TPCx-AI benchmark suite provides realistic datasets for AI/ML workloads.
 
 ### Steps
 
@@ -16,9 +16,16 @@ The TPCx-AI benchmark suite provides realistic product review data for AI/ML wor
    - Free registration required
    - Download version 2.0.0 or later
 
-2. **Generate data using Docker** (PDGF requires Java 8 + X11 libs):
+2. **Fix dictionary dependency** for image generation:
    ```bash
    cd /path/to/tpcx-ai-v2.0.0
+   ln -s lib/pdgf/dicts .
+   ```
+
+3. **Generate data using Docker** (PDGF requires Java 8 + X11 libs):
+
+   **Review Data (Use Case 4):**
+   ```bash
    docker run --platform linux/amd64 --rm \
      -v "$(pwd)":/tpcx-ai \
      -w /tpcx-ai eclipse-temurin:8-jdk bash -c \
@@ -31,12 +38,29 @@ The TPCx-AI benchmark suite provides realistic product review data for AI/ML wor
       -ns -sf 1 -s Review"
    ```
 
-3. **Copy Review.psv to this directory**:
+   **Image Data (Use Case 9):**
    ```bash
-   cp /path/to/tpcx-ai-v2.0.0/output/Review.psv /path/to/python-scripts/data/
+   docker run --platform linux/amd64 --rm \
+     -v "$(pwd)":/tpcx-ai \
+     -w /tpcx-ai eclipse-temurin:8-jdk bash -c \
+     "apt-get update -qq && \
+      apt-get install -y -qq libx11-6 libxext6 libxrender1 libxtst6 libxi6 \
+      libgl1 libxrandr2 libxcursor1 libxinerama1 libxfixes3 xvfb 2>/dev/null && \
+      printf '\nYES\n' | xvfb-run java -jar lib/pdgf/pdgf.jar \
+      -l data-gen/config/tpcxai-schema-noplugins.xml \
+      -l data-gen/config/tpcxai-generation.xml \
+      -ns -sf 1 -s CUSTOMER_IMAGES"
    ```
 
-### Review.psv Format
+4. **Copy data to this directory**:
+   ```bash
+   cp /path/to/tpcx-ai-v2.0.0/output/Review.psv /path/to/python-scripts/data/
+   cp -r /path/to/tpcx-ai-v2.0.0/output/CUSTOMER_IMAGES /path/to/python-scripts/data/
+   ```
+
+### Dataset Formats
+
+#### Review.psv (UC4)
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -46,9 +70,11 @@ The TPCx-AI benchmark suite provides realistic product review data for AI/ML wor
 
 **Statistics** (SF=1):
 - Total reviews: 200,000
-- Legitimate reviews (~70%): 140,048  
-- Spam reviews (~30%): 59,952
 - File size: ~135MB
+
+#### CUSTOMER_IMAGES (UC9)
+
+The images are stored in subdirectories organized by customer name (e.g., `Ada_Potesta/`). Each directory contains several `.png` facial images used for facial recognition benchmarks.
 
 ## loader.py
 

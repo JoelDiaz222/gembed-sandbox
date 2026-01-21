@@ -11,10 +11,9 @@ psycopg2-binary
 chromadb
 fastembed
 numpy
-
 matplotlib
 pandas
 psutil
-
 embed_anything
-
+docker
+qdrant_client
