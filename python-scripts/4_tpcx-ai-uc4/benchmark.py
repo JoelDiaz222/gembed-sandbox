@@ -1,7 +1,5 @@
-import csv
 import os
 import shutil
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,16 +10,12 @@ from typing import Callable, List
 import chromadb
 import docker
 import embed_anything
-import matplotlib.pyplot as plt
 import psutil
 import psycopg2
 from embed_anything import EmbeddingModel, WhichModel
+from plot_utils import save_results_csv, generate_plots
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
-
-# Add parent directory to path to import data.loader
-sys.path.append(str(Path(__file__).parent.parent))
-from data.loader import get_reviews_with_labels
 
 # Configuration
 DB_CONFIG = {
@@ -36,7 +30,6 @@ QDRANT_CONTAINER_NAME = "qdrant"
 
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
 
-INGEST_BATCH_SIZE = 32
 INGESTION_SET_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
 RUNS_INGESTION = 5
 
@@ -255,23 +248,16 @@ def setup_pg_schema(conn):
 
 def populate_pg_database(conn, ingestion_data):
     cur = conn.cursor()
-    from psycopg2.extras import execute_values
 
-    # Process in batches
-    for i in range(0, len(ingestion_data), INGEST_BATCH_SIZE):
-        batch = ingestion_data[i:i + INGEST_BATCH_SIZE]
-        args_list = [(t, s) for t, s in batch]
-        execute_values(cur, "INSERT INTO reviews (text, spam) VALUES %s", args_list)
+    texts = [b[0] for b in ingestion_data]
+    spams = [b[1] for b in ingestion_data]
 
-        # Update embeddings for the newly inserted rows (where embedding IS NULL)
-        cur.execute('''
-                    UPDATE reviews t
-                    SET embedding = e.embedding
-                    FROM embed_texts_with_ids('embed_anything', %s,
-                                              (SELECT array_agg(id) FROM reviews WHERE embedding IS NULL),
-                                              (SELECT array_agg(text) FROM reviews WHERE embedding IS NULL)) e
-                    WHERE t.id = e.sentence_id;
-                    ''', (EMBED_ANYTHING_MODEL,))
+    cur.execute('''
+                INSERT INTO reviews (text, spam, embedding)
+                SELECT t, s, e
+                FROM unnest(%s::text[], %s::boolean[], embed_texts('embed_anything', %s, %s::text[])) AS i(t, s, e);
+                ''', (texts, spams, EMBED_ANYTHING_MODEL, texts))
+
     cur.close()
 
 
@@ -322,8 +308,7 @@ def setup_qdrant_common(client, embed_client, ingestion_data, deferred: bool):
     if deferred:
         client.update_collection("reviews", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
 
-    for i in range(0, len(points), INGEST_BATCH_SIZE):
-        client.upsert("reviews", points[i:i + INGEST_BATCH_SIZE], wait=True)
+    client.upsert("reviews", points, wait=True)
 
     if deferred:
         client.update_collection("reviews",
@@ -346,9 +331,7 @@ def setup_chroma(client, embed_client, ingestion_data):
     spams = [{"spam": s} for t, s in ingestion_data]
     ids = [str(i) for i in range(len(ingestion_data))]
 
-    for i in range(0, len(texts), INGEST_BATCH_SIZE):
-        end = min(i + INGEST_BATCH_SIZE, len(texts))
-        collection.add(ids=ids[i:end], embeddings=embeddings[i:end], metadatas=spams[i:end], documents=texts[i:end])
+    collection.add(ids=ids, embeddings=embeddings, metadatas=spams, documents=texts)
     return collection
 
 
@@ -358,14 +341,23 @@ def setup_chroma(client, embed_client, ingestion_data):
 
 def serve_pg(conn, input_texts):
     cur = conn.cursor()
-    # Process entire batch at once
-    cur.execute('''
-                SELECT i.txt, t.spam
-                FROM unnest(%s::text[], embed_texts('embed_anything', %s, %s::text[])) AS i(txt, embedding)
-                         CROSS JOIN LATERAL (
-                    SELECT spam FROM reviews t ORDER BY t.embedding <-> i.embedding LIMIT 5
-                    ) t
-                ''', (input_texts, EMBED_ANYTHING_MODEL, input_texts))
+    # SQL to get majority vote
+    sql = '''
+          WITH predictions AS (SELECT i.ord, (count(*) filter (where t.spam) >= 3)::boolean as predicted_spam
+                               FROM unnest(%s::text[],
+                                           embed_texts('embed_anything', %s, %s::text[])) WITH ORDINALITY AS i(txt, embedding, ord)
+                                        CROSS JOIN LATERAL (
+                                   SELECT spam
+                                   FROM reviews t
+                                   ORDER BY t.embedding <-> i.embedding
+                                   LIMIT 5
+                                   ) t
+                               GROUP BY i.ord)
+          SELECT predicted_spam
+          FROM predictions
+          ORDER BY ord;
+          '''
+    cur.execute(sql, (input_texts, EMBED_ANYTHING_MODEL, input_texts))
     _ = cur.fetchall()
     conn.commit()
     cur.close()
@@ -374,15 +366,32 @@ def serve_pg(conn, input_texts):
 def serve_chroma(collection, embed_client, input_texts):
     # Process entire batch at once
     embs = embed_client.embed(input_texts)
-    collection.query(query_embeddings=embs, n_results=5, include=["metadatas"])
+    results = collection.query(query_embeddings=embs, n_results=5, include=["metadatas"])
+
+    predictions = []
+    for metas in results['metadatas']:
+        spam_votes = sum(1 for m in metas if m.get('spam'))
+        predictions.append(spam_votes >= 3)
+    return predictions
 
 
 def serve_qdrant(client, embed_client, input_texts):
     # Process entire batch at once
     embs = embed_client.embed(input_texts)
-    # Qdrant search is per-vector, so we must loop, but the embedding is batched.
-    for emb in embs:
-        client.query_points("reviews", query=emb, limit=5, with_payload=True)
+
+    # Use Batch Search API to send all queries in one request
+    requests = [
+        models.QueryRequest(query=emb, limit=5, with_payload=True)
+        for emb in embs
+    ]
+    results = client.query_batch_points(collection_name="reviews", requests=requests)
+
+    predictions = []
+    # results is a list of QueryResponse
+    for response in results:
+        spam_votes = sum(1 for p in response.points if p.payload.get('spam'))
+        predictions.append(spam_votes >= 3)
+    return predictions
 
 
 # =============================================================================
@@ -535,60 +544,6 @@ def print_result(label: str, results: List[BenchmarkResult]):
     ), flush=True)
 
 
-def save_serving_csv(all_results, timestamp):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUTPUT_DIR / f"serving_results_{timestamp}.csv"
-
-    methods = ['pg', 'qdrant', 'chroma']
-    metrics = ['throughput', 'time_s', 'py_cpu', 'py_mem_delta', 'py_mem_peak',
-               'pg_cpu', 'pg_mem_delta', 'pg_mem_peak',
-               'qd_cpu', 'qd_mem_delta', 'qd_mem_peak',
-               'sys_cpu', 'sys_mem']
-
-    with open(path, "w", newline='') as f:
-        writer = csv.writer(f)
-        header = ['size']
-        for method in methods:
-            for metric in metrics:
-                header.append(f"{method}_{metric}")
-                header.append(f"{method}_{metric}_std")
-                header.append(f"{method}_{metric}_median")
-                header.append(f"{method}_{metric}_iqr")
-        writer.writerow(header)
-
-        for r in all_results:
-            row = [r['size']]
-            for method in methods:
-                for metric in metrics:
-                    row.append(r[method].get(metric))
-                    row.append(r[method].get(f"{metric}_std", 0))
-                    row.append(r[method].get(f"{metric}_median", 0))
-                    row.append(r[method].get(f"{metric}_iqr", 0))
-            writer.writerow(row)
-    print(f"\nServing results saved to {path}")
-
-
-def generate_plots(metrics, timestamp):
-    sizes = [m['size'] for m in metrics]
-    methods = ['pg', 'qdrant', 'chroma']
-    labels = {'pg': 'PG Unified', 'qdrant': 'Qdrant', 'chroma': 'Chroma'}
-
-    plt.figure(figsize=(10, 6))
-    for method in methods:
-        y_vals = [m[method]['throughput_median'] for m in metrics]
-        y_errs = [m[method]['throughput_iqr'] for m in metrics]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt='o-', label=labels[method], capsize=3)
-
-    plt.xlabel('Batch Size')
-    plt.ylabel('Throughput (items/s)')
-    plt.title('Spam Classification Throughput (Serving) [Median ± IQR]')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(OUTPUT_DIR / f"serving_throughput_{timestamp}.png")
-    plt.close()
-    print(f"Plots saved to {OUTPUT_DIR}")
-
-
 # =============================================================================
 # Main
 # =============================================================================
@@ -601,6 +556,9 @@ def main():
 
     max_ingestion = max(INGESTION_SET_SIZES)
     print(f"Loading {max_ingestion} reviews...")
+
+    from data.loader import get_reviews_with_labels
+
     full_data_raw = get_reviews_with_labels(max_ingestion + max(SERVING_TEST_SIZES), shuffle=True,
                                             legitimate_only=False)
     full_data = [(text, bool(spam)) for text, spam in full_data_raw]
@@ -611,6 +569,8 @@ def main():
     # Phase 1: Ingestion
     embed_client = EmbedAnythingDirectClient()
     final_chroma_path = None
+
+    all_ingestion_metrics = []
 
     print_header("Phase 1: Ingestion Benchmark")
     print_detailed_header()
@@ -682,6 +642,29 @@ def main():
         print_result("QD Indexed", results_qd_indexed)
         print_result("QD Deferred", results_qd_deferred)
         print_result("Chroma", results_chroma)
+
+        # Collect metrics
+        all_ingestion_metrics.append({
+            'size': ingestion_size,
+            'pg_indexed': compute_metrics(ingestion_size, results_pg_indexed),
+            'pg_deferred': compute_metrics(ingestion_size, results_pg_deferred),
+            'qd_indexed': compute_metrics(ingestion_size, results_qd_indexed),
+            'qd_deferred': compute_metrics(ingestion_size, results_qd_deferred),
+            'chroma': compute_metrics(ingestion_size, results_chroma),
+        })
+
+    # Save Ingestion Results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ingestion_methods = ['pg_indexed', 'pg_deferred', 'qd_indexed', 'qd_deferred', 'chroma']
+    ingestion_labels = {
+        'pg_indexed': 'PG Indexed', 'pg_deferred': 'PG Deferred',
+        'qd_indexed': 'Qdrant Indexed', 'qd_deferred': 'Qdrant Deferred',
+        'chroma': 'Chroma'
+    }
+
+    save_results_csv(all_ingestion_metrics, OUTPUT_DIR / "ingestion", timestamp, ingestion_methods)
+    generate_plots(all_ingestion_metrics, OUTPUT_DIR / "ingestion", timestamp, ingestion_methods)
+
     # Phase 2: Serving
     print_header("Phase 2: Serving Benchmark")
     print("Using DBs populated in the last run of Phase 1...")
@@ -697,8 +680,7 @@ def main():
         print("Error: No Chroma DB path retained.")
         return
 
-    all_metrics = []
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    all_serving_metrics = []
 
     print_detailed_header()
 
@@ -723,7 +705,7 @@ def main():
                                                      lambda: serve_chroma(c_collection, embed_client, test_inputs))
             m_ch.append(BenchmarkResult(elapsed, stats))
 
-        print_result("PG Unified", m_pg)
+        print_result("PostgreSQL", m_pg)
         print_result("Qdrant", m_qd)
         print_result("Chroma", m_ch)
         print()
@@ -734,10 +716,13 @@ def main():
             'qdrant': compute_metrics(size, m_qd),
             'chroma': compute_metrics(size, m_ch)
         }
-        all_metrics.append(res)
+        all_serving_metrics.append(res)
 
-    save_serving_csv(all_metrics, timestamp)
-    generate_plots(all_metrics, timestamp)
+    # Save Serving Results
+    serving_methods = ['pg', 'qdrant', 'chroma']
+
+    save_results_csv(all_serving_metrics, OUTPUT_DIR / "serving", timestamp, serving_methods)
+    generate_plots(all_serving_metrics, OUTPUT_DIR / "serving", timestamp, serving_methods)
 
     # Cleanup: Prune all testing data
     print("\nPruning testing data...")

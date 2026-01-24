@@ -9,29 +9,31 @@ This benchmark compares different methods for generating embeddings before stori
 
 ## Methods Tested
 
-| Method | Embedding Location | Transport | Description |
-|--------|-------------------|-----------|-------------|
-| PG Local | PostgreSQL (pg_gembed) | Direct | Internal embedding via SQL function |
-| PG gRPC | PostgreSQL (pg_gembed) | Direct | Same as above with gRPC warmup |
-| In-Process | Python (EmbedAnything) | Direct | ONNX model in Python process (no server) |
-| External gRPC | Python (EmbedAnything) | gRPC | Embeddings via gRPC server |
-| External HTTP | Python (EmbedAnything) | HTTP | Embeddings via HTTP server |
+| Method        | Embedding Location     | Transport | Description                              |
+|---------------|------------------------|-----------|------------------------------------------|
+| PG Local      | PostgreSQL (pg_gembed) | Direct    | Internal embedding via SQL function      |
+| PG gRPC       | PostgreSQL (pg_gembed) | Direct    | Same as above with gRPC warmup           |
+| In-Process    | Python (EmbedAnything) | Direct    | ONNX model in Python process (no server) |
+| External gRPC | Python (EmbedAnything) | gRPC      | Embeddings via gRPC server               |
+| External HTTP | Python (EmbedAnything) | HTTP      | Embeddings via HTTP server               |
 
 ## Key Features
 
 - **Fresh connection per method**: Each method gets a new database connection to ensure fair comparison
-- **Warmup phase**: Configurable warmup batches to stabilize performance
+- **Warmup phase**: Stabilize performance before measurement
 - **Resource monitoring**: Tracks CPU, memory (process and system-wide)
-- **Batch processing**: Uses `execute_values` for efficient batch inserts
+- **All-at-once processing**: Measures latency of fully processing a subset of the dataset for each size
 
 ## Running
 
 1. Start the gRPC server (if testing gRPC methods):
+
 ```bash
 PYTHONPATH=.:proto python3.13 servers/grpc_server.py
 ```
 
 2. Start the HTTP server (if testing HTTP methods):
+
 ```bash
 PYTHONPATH=.:proto python3.13 servers/http_server.py
 ```

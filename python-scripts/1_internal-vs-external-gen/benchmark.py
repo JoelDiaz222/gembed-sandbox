@@ -1,4 +1,3 @@
-import csv
 import os
 import time
 from dataclasses import dataclass
@@ -9,13 +8,14 @@ from typing import Callable, List
 
 import embed_anything
 import grpc
-import matplotlib.pyplot as plt
 import psutil
 import psycopg2
 import requests
 import tei_pb2 as pb2
 import tei_pb2_grpc as pb2_grpc
+from data.loader import get_review_texts
 from embed_anything import EmbeddingModel, WhichModel
+from plot_utils import save_results_csv, generate_plots
 from psycopg2.extras import execute_values
 
 # Configuration
@@ -26,15 +26,12 @@ DB_CONFIG = {
     'user': 'joeldiaz',
 }
 
-TEST_SIZES = [16, 32, 64, 128, 256, 512]
-BATCH_SIZE = 32
+TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
-RUNS_PER_SIZE = 5  # Number of runs per test size
+RUNS_PER_SIZE = 5
 
-# Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
 
-# Global model cache for direct Python calls
 model_cache = {}
 
 
@@ -271,31 +268,20 @@ def truncate_table(conn):
     cur.close()
 
 
-def make_inputs(n: int) -> List[str]:
-    """Load review texts from TPCx-AI dataset."""
-    from data.loader import get_review_texts
-    return get_review_texts(n, shuffle=True)
-
-
-# =============================================================================
-# Benchmark Functions
-# =============================================================================
-
 def benchmark_internal_db_gen(conn, texts: List[str], provider: str, model: str) -> float:
     """Benchmark pg_gembed internal generation."""
     cur = conn.cursor()
     start = time.perf_counter()
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        chunk = texts[i:i + BATCH_SIZE]
-
-        sql = """
-              INSERT INTO embeddings_test (text, embedding)
-              SELECT t, e
-              FROM unnest(%s::text[]) t,
-                   unnest(embed_texts(%s, %s, %s::text[])) e \
-              """
-        cur.execute(sql, (chunk, provider, model, chunk))
+    sql = """
+          WITH input_data AS (SELECT %s::text[] AS texts)
+          INSERT
+          INTO embeddings_test (text, embedding)
+          SELECT t, e
+          FROM input_data,
+               unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
+          """
+    cur.execute(sql, (texts, provider, model))
 
     conn.commit()
     elapsed = time.perf_counter() - start
@@ -309,17 +295,16 @@ def benchmark_external_client_gen(conn, texts: List[str], embed_fn: Callable) ->
     cur = conn.cursor()
     start = time.perf_counter()
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        chunk = texts[i:i + BATCH_SIZE]
-        embeddings = embed_fn(chunk)
+    embeddings = embed_fn(texts)
 
-        values = [(text, embedding) for text, embedding in zip(chunk, embeddings)]
-        execute_values(
-            cur,
-            "INSERT INTO embeddings_test (text, embedding) VALUES %s",
-            values,
-            template="(%s, %s::vector)"
-        )
+    values = [(text, embedding) for text, embedding in zip(texts, embeddings)]
+    execute_values(
+        cur,
+        "INSERT INTO embeddings_test (text, embedding) VALUES %s",
+        values,
+        template="(%s, %s::vector)",
+        page_size=len(texts)
+    )
 
     conn.commit()
     elapsed = time.perf_counter() - start
@@ -357,9 +342,11 @@ def run_method_with_fresh_connection(texts: List[str], benchmark_fn: Callable,
     conn, pg_pid = connect_and_get_pid()
     py_pid = os.getpid()
 
+    from data.loader import get_review_texts
+
     try:
         # Warm up this specific method on the fresh connection
-        warmup_texts = make_inputs(8)
+        warmup_texts = get_review_texts(8, shuffle=False)
         truncate_table(conn)
         benchmark_fn(conn, warmup_texts)
 
@@ -395,87 +382,72 @@ def calc_iqr(values: List[float]) -> float:
 # Output Functions
 # =============================================================================
 
-def print_header():
-    """Print benchmark results header."""
-    # Column widths
-    lbl_w = 12
-    time_w = 12
-    col_w = 11
+def print_header(title):
+    print(f"\n{'=' * 60}")
+    print(f" {title}")
+    print(f"{'=' * 60}")
 
-    print("Benchmark Results:", flush=True)
-    # Include a small med-marker column between label and values
-    med_w = 7
+
+def print_detailed_header():
+    """Print detailed benchmark results header."""
+    lbl_w, time_w, col_w, med_w = 12, 14, 13, 7
+
+    print("\nBenchmark Results:", flush=True)
     header = (
             "  " +
-            f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU% μ±σ':>{col_w}} | "
-            f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU% μ±σ':>{col_w}} | {'Sys MB μ±σ':>{col_w}} | {'Sys CPU% μ±σ':>{col_w}}"
+            f"{'':{lbl_w}}{'':{med_w}} | {'Time (s)':>{time_w}} | "
+            f"{'Py Δ MB':>{col_w}} | {'Py Peak MB':>{col_w}} | {'Py CPU%':>{col_w}} | "
+            f"{'PG Δ MB':>{col_w}} | {'PG Peak MB':>{col_w}} | {'PG CPU%':>{col_w}} | "
+            f"{'Sys MB':>{col_w}} | {'Sys CPU%':>{col_w}}"
     )
     print(header, flush=True)
     print("=" * len(header), flush=True)
 
 
 def print_result(label: str, results: List[BenchmarkResult]):
-    """Print aggregated results from multiple runs with ± std dev."""
+    """Print aggregated results with mean and median rows."""
     times = [r.time_s for r in results]
-    py_delta = [r.stats.py_delta_mb for r in results]
-    py_peak = [r.stats.py_peak_mb for r in results]
-    py_cpu = [r.stats.py_cpu for r in results]
-    pg_delta = [r.stats.pg_delta_mb for r in results]
-    pg_peak = [r.stats.pg_peak_mb for r in results]
-    pg_cpu = [r.stats.pg_cpu for r in results]
-    sys_mem = [r.stats.sys_mem_mb for r in results]
-    sys_cpu = [r.stats.sys_cpu for r in results]
 
-    def fmt_mean(values: List[float], precision: int = 1) -> str:
-        avg = mean(values)
-        std = safe_stdev(values)
-        if precision == 3:
-            return f"{avg:.3f}±{std:.3f}"
-        elif precision == 0:
-            return f"{avg:.0f}±{std:.0f}"
-        else:
-            return f"{avg:.1f}±{std:.1f}"
+    py_deltas = [r.stats.py_delta_mb for r in results]
+    py_peaks = [r.stats.py_peak_mb for r in results]
+    py_cpus = [r.stats.py_cpu for r in results]
 
-    def fmt_median_iqr(values: List[float], precision: int = 1) -> str:
-        med = median(values)
-        iqr = calc_iqr(values)
-        if precision == 3:
-            return f"{med:.3f}±{iqr:.3f}"
-        elif precision == 0:
-            return f"{med:.0f}±{iqr:.0f}"
-        else:
-            return f"{med:.1f}±{iqr:.1f}"
+    pg_deltas = [r.stats.pg_delta_mb for r in results]
+    pg_peaks = [r.stats.pg_peak_mb for r in results]
+    pg_cpus = [r.stats.pg_cpu for r in results]
 
-    # Print mean±std
+    sys_mems = [r.stats.sys_mem_mb for r in results]
+    sys_cpus = [r.stats.sys_cpu for r in results]
+
+    def fmt(vals, p=1):
+        return f"{mean(vals):.{p}f}±{safe_stdev(vals):.{p}f}"
+
+    def fmt_med(vals, p=1):
+        return f"{median(vals):.{p}f}±{calc_iqr(vals):.{p}f}"
+
+    # Mean row
     row_fmt = (
-        "  {label:<12}{med:>7} | {time:>12} | {pyd:>11} | {pyp:>11} | {pyc:>11} | {pgd:>11} | {pgp:>11} | {pgc:>11} | {sysm:>11} | {sysc:>11}"
+        "  {label:<12}{med:>7} | {time:>14} | "
+        "{pyd:>13} | {pyp:>13} | {pyc:>13} | "
+        "{pgd:>13} | {pgp:>13} | {pgc:>13} | "
+        "{sysm:>13} | {sysc:>13}"
     )
+
     print(row_fmt.format(
-        label=label,
-        med='',
-        time=fmt_mean(times, 3),
-        pyd=fmt_mean(py_delta),
-        pyp=fmt_mean(py_peak),
-        pyc=fmt_mean(py_cpu),
-        pgd=fmt_mean(pg_delta),
-        pgp=fmt_mean(pg_peak),
-        pgc=fmt_mean(pg_cpu),
-        sysm=fmt_mean(sys_mem, 0),
-        sysc=fmt_mean(sys_cpu),
+        label=label, med='',
+        time=fmt(times, 3),
+        pyd=fmt(py_deltas), pyp=fmt(py_peaks), pyc=fmt(py_cpus),
+        pgd=fmt(pg_deltas), pgp=fmt(pg_peaks), pgc=fmt(pg_cpus),
+        sysm=fmt(sys_mems, 0), sysc=fmt(sys_cpus)
     ), flush=True)
-    # Also print median ± IQR for more robust central tendency
+
+    # Median row
     print(row_fmt.format(
-        label=label,
-        med=' (med)',
-        time=fmt_median_iqr(times, 3),
-        pyd=fmt_median_iqr(py_delta),
-        pyp=fmt_median_iqr(py_peak),
-        pyc=fmt_median_iqr(py_cpu),
-        pgd=fmt_median_iqr(pg_delta),
-        pgp=fmt_median_iqr(pg_peak),
-        pgc=fmt_median_iqr(pg_cpu),
-        sysm=fmt_median_iqr(sys_mem, 0),
-        sysc=fmt_median_iqr(sys_cpu),
+        label=label, med=' (med)',
+        time=fmt_med(times, 3),
+        pyd=fmt_med(py_deltas), pyp=fmt_med(py_peaks), pyc=fmt_med(py_cpus),
+        pgd=fmt_med(pg_deltas), pgp=fmt_med(pg_peaks), pgc=fmt_med(pg_cpus),
+        sysm=fmt_med(sys_mems, 0), sysc=fmt_med(sys_cpus)
     ), flush=True)
 
 
@@ -556,12 +528,12 @@ def main():
     direct_client = EmbedAnythingDirectClient()
 
     try:
-        print_header()
+        print_detailed_header()
 
         all_results = []
 
         for size in TEST_SIZES:
-            texts = make_inputs(size)
+            texts = get_review_texts(size, shuffle=False)
 
             print(f"Size: {size}", flush=True)
 
@@ -644,271 +616,14 @@ def main():
         print(f"  External HTTP:     {avg_ext_http:.2f}")
 
         # Save results to CSV and generate plots
-        save_results_csv(all_results)
-        generate_plots(all_results)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        methods = ['pg_local', 'pg_grpc', 'ext_direct', 'ext_grpc', 'ext_http']
+
+        save_results_csv(all_results, OUTPUT_DIR, timestamp, methods)
+        generate_plots(all_results, OUTPUT_DIR, timestamp, methods)
 
     finally:
         grpc_client.close()
-
-
-def save_results_csv(all_results: List[dict]):
-    """Save benchmark results to CSV file with mean and std values."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = OUTPUT_DIR / f"benchmark_{timestamp}.csv"
-
-    methods = ['pg_local', 'pg_grpc', 'ext_direct', 'ext_grpc', 'ext_http']
-    metrics = ['throughput', 'time_s',
-               'py_cpu', 'py_mem_delta', 'py_mem_peak',
-               'pg_cpu', 'pg_mem_delta', 'pg_mem_peak',
-               'sys_cpu', 'sys_mem']
-
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        # Header: size, then method_metric, _std, _median, _iqr for each combination
-        header = ['size']
-        for method in methods:
-            for metric in metrics:
-                header.append(f"{method}_{metric}")
-                header.append(f"{method}_{metric}_std")
-                header.append(f"{method}_{metric}_median")
-                header.append(f"{method}_{metric}_iqr")
-        writer.writerow(header)
-
-        for r in all_results:
-            row = [r['size']]
-            for method in methods:
-                for metric in metrics:
-                    row.append(r[method].get(metric))
-                    row.append(r[method].get(f"{metric}_std", 0))
-                    row.append(r[method].get(f"{metric}_median", 0))
-                    row.append(r[method].get(f"{metric}_iqr", 0))
-            writer.writerow(row)
-
-    print(f"\nResults saved to: {csv_path}")
-
-
-def generate_plots(all_results: List[dict]):
-    """Generate comparison plots for throughput, CPU, and memory."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    sizes = [r['size'] for r in all_results]
-    methods = ['pg_local', 'pg_grpc', 'ext_direct', 'ext_grpc', 'ext_http']
-    labels = ['PG Local', 'PG gRPC', 'In-Process', 'Ext gRPC', 'Ext HTTP']
-    colors = ['#2ecc71', '#27ae60', '#3498db', '#e74c3c', '#c0392b']
-    markers = ['o', 's', '^', 'd', 'x']
-
-    # Plot 1: Throughput comparison
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['throughput_median'] for r in all_results]
-        y_errs = [r[method]['throughput_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('Throughput (texts/sec)')
-    plt.title(f'Embedding Generation: Throughput (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"throughput_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 2: Python Process CPU Usage
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['py_cpu_median'] for r in all_results]
-        y_errs = [r[method]['py_cpu_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('Python Process CPU Usage (%)')
-    plt.title(f'Python Process CPU Usage (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"py_cpu_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 3: PostgreSQL Process CPU Usage
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['pg_cpu_median'] for r in all_results]
-        y_errs = [r[method]['pg_cpu_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('PostgreSQL Process CPU Usage (%)')
-    plt.title(f'PostgreSQL Process CPU Usage (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"pg_cpu_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 4: System CPU Usage
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['sys_cpu_median'] for r in all_results]
-        y_errs = [r[method]['sys_cpu_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('System CPU Usage (%)')
-    plt.title(f'Embedding Generation: System CPU (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"cpu_system_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 5: Python Process Peak Memory
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['py_mem_peak_median'] for r in all_results]
-        y_errs = [r[method]['py_mem_peak_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('Python Peak Memory (MB)')
-    plt.title(f'Python Process Peak Memory (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"py_memory_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 6: PostgreSQL Process Peak Memory
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['pg_mem_peak'] for r in all_results]
-        y_errs = [r[method]['pg_mem_peak_std'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('PostgreSQL Peak Memory (MB)')
-    plt.title(f'PostgreSQL Process Peak Memory (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"pg_memory_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 7: System Memory
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['sys_mem'] for r in all_results]
-        y_errs = [r[method]['sys_mem_std'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('System Memory (MB)')
-    plt.title(f'Embedding Generation: System Memory (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"memory_system_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 8: Summary bar chart (2x4 grid) with error bars
-    fig, axes = plt.subplots(2, 4, figsize=(18, 10))
-    fig.suptitle(f'Average Metrics (batch size={BATCH_SIZE})', fontsize=14)
-    x_pos = range(len(methods))
-
-    # Throughput
-    avgs = [mean([r[m]['throughput'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['throughput'] for r in all_results]) for m in methods]
-    bars = axes[0, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[0, 0].set_xticks(x_pos)
-    axes[0, 0].set_xticklabels(labels)
-    axes[0, 0].set_ylabel('Throughput (texts/sec)')
-    axes[0, 0].set_title('Throughput')
-    axes[0, 0].bar_label(bars, fmt='%.1f')
-    axes[0, 0].tick_params(axis='x', rotation=15)
-
-    # Python CPU
-    avgs = [mean([r[m]['py_cpu'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['py_cpu'] for r in all_results]) for m in methods]
-    bars = axes[0, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[0, 1].set_xticks(x_pos)
-    axes[0, 1].set_xticklabels(labels)
-    axes[0, 1].set_ylabel('CPU Usage (%)')
-    axes[0, 1].set_title('Python CPU')
-    axes[0, 1].bar_label(bars, fmt='%.1f')
-    axes[0, 1].tick_params(axis='x', rotation=15)
-
-    # PostgreSQL CPU
-    avgs = [mean([r[m]['pg_cpu'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['pg_cpu'] for r in all_results]) for m in methods]
-    bars = axes[0, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[0, 2].set_xticks(x_pos)
-    axes[0, 2].set_xticklabels(labels)
-    axes[0, 2].set_ylabel('CPU Usage (%)')
-    axes[0, 2].set_title('PostgreSQL CPU')
-    axes[0, 2].bar_label(bars, fmt='%.1f')
-    axes[0, 2].tick_params(axis='x', rotation=15)
-
-    # System CPU
-    avgs = [mean([r[m]['sys_cpu'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['sys_cpu'] for r in all_results]) for m in methods]
-    bars = axes[0, 3].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[0, 3].set_xticks(x_pos)
-    axes[0, 3].set_xticklabels(labels)
-    axes[0, 3].set_ylabel('CPU Usage (%)')
-    axes[0, 3].set_title('System CPU')
-    axes[0, 3].bar_label(bars, fmt='%.1f')
-    axes[0, 3].tick_params(axis='x', rotation=15)
-
-    # Python Memory Peak
-    avgs = [mean([r[m]['py_mem_peak'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['py_mem_peak'] for r in all_results]) for m in methods]
-    bars = axes[1, 0].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[1, 0].set_xticks(x_pos)
-    axes[1, 0].set_xticklabels(labels)
-    axes[1, 0].set_ylabel('Memory (MB)')
-    axes[1, 0].set_title('Python Peak Mem')
-    axes[1, 0].bar_label(bars, fmt='%.1f')
-    axes[1, 0].tick_params(axis='x', rotation=15)
-
-    # PostgreSQL Memory Peak
-    avgs = [mean([r[m]['pg_mem_peak'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['pg_mem_peak'] for r in all_results]) for m in methods]
-    bars = axes[1, 1].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[1, 1].set_xticks(x_pos)
-    axes[1, 1].set_xticklabels(labels)
-    axes[1, 1].set_ylabel('Memory (MB)')
-    axes[1, 1].set_title('PostgreSQL Peak Mem')
-    axes[1, 1].bar_label(bars, fmt='%.1f')
-    axes[1, 1].tick_params(axis='x', rotation=15)
-
-    # System Memory
-    avgs = [mean([r[m]['sys_mem'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['sys_mem'] for r in all_results]) for m in methods]
-    bars = axes[1, 2].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[1, 2].set_xticks(x_pos)
-    axes[1, 2].set_xticklabels(labels)
-    axes[1, 2].set_ylabel('Memory (MB)')
-    axes[1, 2].set_title('System Memory')
-    axes[1, 2].bar_label(bars, fmt='%.0f')
-    axes[1, 2].tick_params(axis='x', rotation=15)
-
-    # Time
-    avgs = [mean([r[m]['time_s'] for r in all_results]) for m in methods]
-    stds = [safe_stdev([r[m]['time_s'] for r in all_results]) for m in methods]
-    bars = axes[1, 3].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-    axes[1, 3].set_xticks(x_pos)
-    axes[1, 3].set_xticklabels(labels)
-    axes[1, 3].set_ylabel('Time (s)')
-    axes[1, 3].set_title('Avg Time')
-    axes[1, 3].bar_label(bars, fmt='%.2f')
-    axes[1, 3].tick_params(axis='x', rotation=15)
-
-    plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"summary_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"Plots saved to: {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":

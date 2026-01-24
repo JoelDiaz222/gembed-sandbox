@@ -1,4 +1,3 @@
-import csv
 import os
 import shutil
 import time
@@ -11,11 +10,11 @@ from typing import Callable, List
 import chromadb
 import docker
 import embed_anything
-import matplotlib.pyplot as plt
 import psutil
 import psycopg2
-from psycopg2 import extras
 from embed_anything import EmbeddingModel, WhichModel
+from plot_utils import save_results_csv, generate_plots
+from psycopg2 import extras
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
@@ -30,7 +29,7 @@ DB_CONFIG = {
 QDRANT_URL = "http://localhost:6333"
 QDRANT_CONTAINER_NAME = "qdrant"
 
-TEST_SIZES = [16, 32, 64, 128, 256, 512]
+TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
 RUNS_PER_SIZE = 5
 
@@ -237,7 +236,7 @@ def generate_products(n: int) -> List[dict]:
     # Load real reviews from TPCx-AI dataset
     # Estimate ~3.5 reviews per product on average
     total_reviews_needed = int(n * 3.5) + 100
-    reviews_pool = get_review_texts(total_reviews_needed, shuffle=True)
+    reviews_pool = get_review_texts(total_reviews_needed, shuffle=False)
     review_idx = 0
 
     products = []
@@ -375,12 +374,13 @@ def batch_insert_products(cur, products: List[dict]) -> List[int]:
 
     # Insert products and get IDs
     query = """
-        INSERT INTO products (name, description, price, stock_count)
-        VALUES %s
-        RETURNING product_id
-    """
-    extras.execute_values(cur, query, product_values)
-    product_ids = [row[0] for row in cur.fetchall()]
+            INSERT INTO products (name, description, price, stock_count)
+            VALUES
+            %s
+        RETURNING product_id \
+            """
+    results = extras.execute_values(cur, query, product_values, fetch=True)
+    product_ids = [row[0] for row in results]
 
     # Prepare data for reviews and categories
     review_values = []
@@ -951,77 +951,79 @@ def run_scenario2_distributed_qdrant(products: List[dict],
 # Output Functions
 # =============================================================================
 
-def print_header():
-    """Print benchmark results header."""
-    lbl_w = 12
-    time_w = 12
-    col_w = 11
-    med_w = 7
+def print_header(title):
+    print(f"\n{'=' * 60}")
+    print(f" {title}")
+    print(f"{'=' * 60}")
 
+
+def print_detailed_header():
+    """Print detailed benchmark results header."""
+    lbl_w, time_w, col_w, med_w = 24, 14, 13, 7
+
+    print("\nBenchmark Results:", flush=True)
     header = (
             "  " +
-            f"{'':{lbl_w}}{'':{med_w}} | {'Time (s) μ±σ':>{time_w}} | {'Py Δ MB μ±σ':>{col_w}} | {'Py Peak μ±σ':>{col_w}} | {'Py CPU μ±σ':>{col_w}} | "
-            f"{'PG Δ MB μ±σ':>{col_w}} | {'PG Peak μ±σ':>{col_w}} | {'PG CPU μ±σ':>{col_w}} | {'QD Δ MB μ±σ':>{col_w}} | {'QD CPU μ±σ':>{col_w}}"
+            f"{'':{lbl_w}}{'':{med_w}} | {'Time (s)':>{time_w}} | "
+            f"{'Py Δ MB':>{col_w}} | {'Py Peak MB':>{col_w}} | {'Py CPU%':>{col_w}} | "
+            f"{'PG Δ MB':>{col_w}} | {'PG Peak MB':>{col_w}} | {'PG CPU%':>{col_w}} | "
+            f"{'QD Δ MB':>{col_w}} | {'QD Peak MB':>{col_w}} | {'QD CPU%':>{col_w}} | "
+            f"{'Sys MB':>{col_w}} | {'Sys CPU%':>{col_w}}"
     )
-    print("Benchmark Results:", flush=True)
     print(header, flush=True)
     print("=" * len(header), flush=True)
 
 
 def print_result(label: str, results: List[BenchmarkResult]):
-    """Print aggregated results."""
     times = [r.time_s for r in results]
-    py_delta = [r.stats.py_delta_mb for r in results]
-    py_peak = [r.stats.py_peak_mb for r in results]
-    py_cpu = [r.stats.py_cpu for r in results]
-    pg_delta = [r.stats.pg_delta_mb for r in results]
-    pg_peak = [r.stats.pg_peak_mb for r in results]
-    pg_cpu = [r.stats.pg_cpu for r in results]
-    qd_delta = [r.stats.qd_delta_mb for r in results]
-    qd_cpu = [r.stats.qd_cpu for r in results]
 
-    def fmt_mean(values: List[float], precision: int = 1) -> str:
-        avg = mean(values)
-        std = safe_stdev(values)
-        if precision == 3:
-            return f"{avg:.3f}±{std:.3f}"
-        return f"{avg:.1f}±{std:.1f}"
+    py_deltas = [r.stats.py_delta_mb for r in results]
+    py_peaks = [r.stats.py_peak_mb for r in results]
+    py_cpus = [r.stats.py_cpu for r in results]
 
-    def fmt_median_iqr(values: List[float], precision: int = 1) -> str:
-        med = median(values)
-        iqr = calc_iqr(values)
-        if precision == 3:
-            return f"{med:.3f}±{iqr:.3f}"
-        return f"{med:.1f}±{iqr:.1f}"
+    pg_deltas = [r.stats.pg_delta_mb for r in results]
+    pg_peaks = [r.stats.pg_peak_mb for r in results]
+    pg_cpus = [r.stats.pg_cpu for r in results]
 
+    qd_deltas = [r.stats.qd_delta_mb for r in results]
+    qd_peaks = [r.stats.qd_peak_mb for r in results]
+    qd_cpus = [r.stats.qd_cpu for r in results]
+
+    sys_mems = [r.stats.sys_mem_mb for r in results]
+    sys_cpus = [r.stats.sys_cpu for r in results]
+
+    def fmt(vals, p=1):
+        return f"{mean(vals):.{p}f}±{safe_stdev(vals):.{p}f}"
+
+    def fmt_med(vals, p=1):
+        return f"{median(vals):.{p}f}±{calc_iqr(vals):.{p}f}"
+
+    # Mean row
     row_fmt = (
-        "  {label:<12}{med:>7} | {time:>12} | {pyd:>11} | {pyp:>11} | {pyc:>11} | {pgd:>11} | {pgp:>11} | {pgc:>11} | {qdd:>11} | {qdc:>11}"
+        "  {label:<24}{med:>7} | {time:>14} | "
+        "{pyd:>13} | {pyp:>13} | {pyc:>13} | "
+        "{pgd:>13} | {pgp:>13} | {pgc:>13} | "
+        "{qdd:>13} | {qdp:>13} | {qdc:>13} | "
+        "{sysm:>13} | {sysc:>13}"
     )
+
     print(row_fmt.format(
-        label=label,
-        med='',
-        time=fmt_mean(times, 3),
-        pyd=fmt_mean(py_delta),
-        pyp=fmt_mean(py_peak),
-        pyc=fmt_mean(py_cpu),
-        pgd=fmt_mean(pg_delta),
-        pgp=fmt_mean(pg_peak),
-        pgc=fmt_mean(pg_cpu),
-        qdd=fmt_mean(qd_delta),
-        qdc=fmt_mean(qd_cpu),
+        label=label, med='',
+        time=fmt(times, 3),
+        pyd=fmt(py_deltas), pyp=fmt(py_peaks), pyc=fmt(py_cpus),
+        pgd=fmt(pg_deltas), pgp=fmt(pg_peaks), pgc=fmt(pg_cpus),
+        qdd=fmt(qd_deltas), qdp=fmt(qd_peaks), qdc=fmt(qd_cpus),
+        sysm=fmt(sys_mems, 0), sysc=fmt(sys_cpus)
     ), flush=True)
+
+    # Median row
     print(row_fmt.format(
-        label=label,
-        med=' (med)',
-        time=fmt_median_iqr(times, 3),
-        pyd=fmt_median_iqr(py_delta),
-        pyp=fmt_median_iqr(py_peak),
-        pyc=fmt_median_iqr(py_cpu),
-        pgd=fmt_median_iqr(pg_delta),
-        pgp=fmt_median_iqr(pg_peak),
-        pgc=fmt_median_iqr(pg_cpu),
-        qdd=fmt_median_iqr(qd_delta),
-        qdc=fmt_median_iqr(qd_cpu),
+        label=label, med=' (med)',
+        time=fmt_med(times, 3),
+        pyd=fmt_med(py_deltas), pyp=fmt_med(py_peaks), pyc=fmt_med(py_cpus),
+        pgd=fmt_med(pg_deltas), pgp=fmt_med(pg_peaks), pgc=fmt_med(pg_cpus),
+        qdd=fmt_med(qd_deltas), qdp=fmt_med(qd_peaks), qdc=fmt_med(qd_cpus),
+        sysm=fmt_med(sys_mems, 0), sysc=fmt_med(sys_cpus)
     ), flush=True)
 
 
@@ -1115,10 +1117,8 @@ def main():
     # ==========================================================================
     # Scenario 1: Cold Start (insert + embedding generation)
     # ==========================================================================
-    print("=" * 120)
-    print("SCENARIO 1: Cold Start (insert + embedding generation)")
-    print("=" * 120)
-    print_header()
+    print_header("SCENARIO 1: Cold Start (insert + embedding generation)")
+    print_detailed_header()
 
     for size in TEST_SIZES:
         products = generate_products(size)
@@ -1129,24 +1129,22 @@ def main():
         qdrant_results = run_scenario1_distributed_qdrant(products, embed_client, RUNS_PER_SIZE)
 
         print_result("Unified", unified_results)
-        print_result("Chroma", chroma_results)
-        print_result("Qdrant", qdrant_results)
+        print_result("Distributed (ChromaDB)", chroma_results)
+        print_result("Distributed (Qdrant)", qdrant_results)
         print()
 
         all_results_s1.append({
             'size': size,
             'unified': compute_metrics(size, unified_results),
-            'chroma': compute_metrics(size, chroma_results),
-            'qdrant': compute_metrics(size, qdrant_results),
+            'dist_chroma': compute_metrics(size, chroma_results),
+            'dist_qdrant': compute_metrics(size, qdrant_results),
         })
 
     # ==========================================================================
     # Scenario 2: Pre-existing Data (embedding generation only)
     # ==========================================================================
-    print("=" * 120)
-    print("SCENARIO 2: Pre-existing Data (embedding generation only)")
-    print("=" * 120)
-    print_header()
+    print_header("SCENARIO 2: Pre-existing Data (embedding generation only)")
+    print_detailed_header()
 
     for size in TEST_SIZES:
         products = generate_products(size)
@@ -1157,155 +1155,30 @@ def main():
         qdrant_results = run_scenario2_distributed_qdrant(products, embed_client, RUNS_PER_SIZE)
 
         print_result("Unified", unified_results)
-        print_result("Chroma", chroma_results)
-        print_result("Qdrant", qdrant_results)
+        print_result("Distributed (ChromaDB)", chroma_results)
+        print_result("Distributed (Qdrant)", qdrant_results)
         print()
 
         all_results_s2.append({
             'size': size,
             'unified': compute_metrics(size, unified_results),
-            'chroma': compute_metrics(size, chroma_results),
-            'qdrant': compute_metrics(size, qdrant_results),
+            'dist_chroma': compute_metrics(size, chroma_results),
+            'dist_qdrant': compute_metrics(size, qdrant_results),
         })
 
     # Save results to CSV and generate plots
-    save_results_csv(all_results_s1, all_results_s2)
-    generate_plots(all_results_s1, all_results_s2)
-
-
-def save_results_csv(all_results_s1: List[dict], all_results_s2: List[dict]):
-    """Save benchmark results to CSV files."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    methods = ['unified', 'dist_chroma', 'dist_qdrant']
 
-    methods = ['unified', 'chroma', 'qdrant']
-    metrics = ['throughput', 'time_s',
-               'py_cpu', 'py_mem_delta', 'py_mem_peak',
-               'pg_cpu', 'pg_mem_delta', 'pg_mem_peak',
-               'qd_cpu', 'qd_mem_delta', 'qd_mem_peak',
-               'sys_cpu', 'sys_mem']
+    # Scenario 1
+    s1_dir = OUTPUT_DIR / "scenario1"
+    save_results_csv(all_results_s1, s1_dir, timestamp, methods)
+    generate_plots(all_results_s1, s1_dir, timestamp, methods)
 
-    # Build header
-    header = ['size']
-    for method in methods:
-        for metric in metrics:
-            header.append(f"{method}_{metric}")
-            header.append(f"{method}_{metric}_std")
-            header.append(f"{method}_{metric}_median")
-            header.append(f"{method}_{metric}_iqr")
-
-    for scenario_name, results in [('scenario1', all_results_s1), ('scenario2', all_results_s2)]:
-        scenario_dir = OUTPUT_DIR / scenario_name
-        scenario_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = scenario_dir / f"benchmark_{timestamp}.csv"
-
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            for r in results:
-                row = [r['size']]
-                for method in methods:
-                    for metric in metrics:
-                        val = r[method].get(metric)
-                        row.append(val)
-                        row.append(r[method].get(f"{metric}_std", 0))
-                        row.append(r[method].get(f"{metric}_median", 0))
-                        row.append(r[method].get(f"{metric}_iqr", 0))
-                writer.writerow(row)
-        print(f"Saved {csv_path}")
-
-
-def generate_plots(all_results_s1: List[dict], all_results_s2: List[dict]):
-    """Generate comparison plots."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    sizes_s1 = [r['size'] for r in all_results_s1]
-    sizes_s2 = [r['size'] for r in all_results_s2]
-
-    methods = ['unified', 'chroma', 'qdrant']
-    labels = ['Unified (PG)', 'Distributed (Chroma)', 'Distributed (Qdrant)']
-    colors = ['#2ecc71', '#e74c3c', '#3498db']
-    markers = ['o', 's', '^']
-
-    def plot_metric(results, sizes, metric, ylabel, title_suffix, output_path):
-        plt.figure(figsize=(10, 6))
-        for method, label, color, marker in zip(methods, labels, colors, markers):
-            y_vals = [r[method].get(f'{metric}_median', r[method].get(metric, 0)) for r in results]
-            y_errs = [r[method].get(f'{metric}_iqr', r[method].get(f'{metric}_std', 0)) for r in results]
-            plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                         linewidth=2, color=color, capsize=3, capthick=1)
-        plt.xlabel('Number of Products')
-        plt.ylabel(ylabel)
-        plt.title(f'{title_suffix} (Median ± IQR)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.xscale('log', base=2)
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-    # Generate plots for both scenarios
-    scenarios = [
-        (all_results_s1, sizes_s1, 'scenario1', 'Scenario 1 Cold Start'),
-        (all_results_s2, sizes_s2, 'scenario2', 'Scenario 2 Pre-existing')
-    ]
-
-    for results, sizes, folder_name, title in scenarios:
-        scenario_dir = OUTPUT_DIR / folder_name
-        scenario_dir.mkdir(parents=True, exist_ok=True)
-
-        plot_metric(results, sizes, 'throughput', 'Throughput (products/sec)',
-                    f'{title}: Throughput', scenario_dir / f"throughput_{timestamp}.png")
-
-        # CPU Usage
-        plot_metric(results, sizes, 'sys_cpu', 'System CPU (%)',
-                    f'{title}: System CPU', scenario_dir / f"cpu_system_{timestamp}.png")
-        plot_metric(results, sizes, 'py_cpu', 'Python Process CPU (%)',
-                    f'{title}: Python Process CPU', scenario_dir / f"py_cpu_{timestamp}.png")
-        plot_metric(results, sizes, 'pg_cpu', 'PostgreSQL Process CPU (%)',
-                    f'{title}: PostgreSQL CPU', scenario_dir / f"pg_cpu_{timestamp}.png")
-        plot_metric(results, sizes, 'qd_cpu', 'Qdrant CPU (%)',
-                    f'{title}: Qdrant CPU', scenario_dir / f"qd_cpu_{timestamp}.png")
-
-        # Memory Usage
-        plot_metric(results, sizes, 'sys_mem', 'System Memory (MB)',
-                    f'{title}: System Memory', scenario_dir / f"memory_system_{timestamp}.png")
-        plot_metric(results, sizes, 'py_mem_peak', 'Python Peak Memory (MB)',
-                    f'{title}: Python Peak Memory', scenario_dir / f"py_memory_{timestamp}.png")
-        plot_metric(results, sizes, 'pg_mem_peak', 'PostgreSQL Peak Memory (MB)',
-                    f'{title}: PostgreSQL Peak Memory', scenario_dir / f"pg_memory_{timestamp}.png")
-        plot_metric(results, sizes, 'qd_mem_peak', 'Qdrant Peak Memory (MB)',
-                    f'{title}: Qdrant Peak Memory', scenario_dir / f"qd_memory_{timestamp}.png")
-
-    # Summary bar charts
-    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-    metric_labels = ['Throughput\n(prod/sec)', 'Py CPU (%)', 'PG CPU (%)', 'QD CPU (%)', 'Time (s)']
-    metric_keys = ['throughput', 'py_cpu', 'pg_cpu', 'qd_cpu', 'time_s']
-    x_pos = range(len(methods))
-
-    for col, (metric, mlabel) in enumerate(zip(metric_keys, metric_labels)):
-        # Scenario 1
-        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric, 0)) for r in all_results_s1]) for m in methods]
-        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s1]) for m in
-                methods]
-        axes[0, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-        axes[0, col].set_xticks(x_pos)
-        axes[0, col].set_xticklabels(labels, rotation=45, ha='right')
-        axes[0, col].set_title(f'S1: {mlabel}')
-
-        # Scenario 2
-        avgs = [median([r[m].get(f"{metric}_median", r[m].get(metric, 0)) for r in all_results_s2]) for m in methods]
-        stds = [median([r[m].get(f"{metric}_iqr", r[m].get(f"{metric}_std", 0)) for r in all_results_s2]) for m in
-                methods]
-        axes[1, col].bar(x_pos, avgs, yerr=stds, color=colors, capsize=3)
-        axes[1, col].set_xticks(x_pos)
-        axes[1, col].set_xticklabels(labels, rotation=45, ha='right')
-        axes[1, col].set_title(f'S2: {mlabel}')
-
-    plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"summary_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Plots saved to: {OUTPUT_DIR}/")
+    # Scenario 2
+    s2_dir = OUTPUT_DIR / "scenario2"
+    save_results_csv(all_results_s2, s2_dir, timestamp, methods)
+    generate_plots(all_results_s2, s2_dir, timestamp, methods)
 
 
 if __name__ == "__main__":
