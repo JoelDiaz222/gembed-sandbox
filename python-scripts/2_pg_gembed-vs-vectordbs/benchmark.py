@@ -1,4 +1,3 @@
-import csv
 import os
 import shutil
 import sys
@@ -12,15 +11,16 @@ from typing import Callable, List
 import chromadb
 import docker
 import embed_anything
-import matplotlib.pyplot as plt
 import psutil
 import psycopg2
+from data.loader import get_review_texts
 from embed_anything import EmbeddingModel, WhichModel
+from plot_utils import save_results_csv, generate_plots
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
 # Configuration
-POSTGRESQL_CONFIG = {
+DB_CONFIG = {
     'host': 'localhost',
     'port': 5432,
     'dbname': 'joeldiaz',
@@ -30,8 +30,7 @@ POSTGRESQL_CONFIG = {
 QDRANT_URL = "http://localhost:6333"
 QDRANT_CONTAINER_NAME = "qdrant"
 
-TEST_SIZES = [16]
-BATCH_SIZE = 32
+TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
 EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
 RUNS_PER_SIZE = 5
 
@@ -215,7 +214,7 @@ class EmbedAnythingDirectClient:
 
 def connect_and_get_pid():
     """Connect to PostgreSQL and get backend PID."""
-    conn = psycopg2.connect(**POSTGRESQL_CONFIG)
+    conn = psycopg2.connect(**DB_CONFIG)
     conn.autocommit = False
     cur = conn.cursor()
     cur.execute("SELECT pg_backend_pid();")
@@ -255,26 +254,20 @@ def truncate_pg_table(conn):
     cur.close()
 
 
-def make_inputs(n: int) -> List[str]:
-    """Load review texts from TPCx-AI dataset."""
-    from data.loader import get_review_texts
-    return get_review_texts(n, shuffle=True)
-
-
 def benchmark_pg_internal(conn, texts: List[str], provider: str, model: str) -> float:
     """Benchmark pg_gembed internal generation."""
     cur = conn.cursor()
     start = time.perf_counter()
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        chunk = texts[i:i + BATCH_SIZE]
-        sql = """
-              INSERT INTO embeddings_test (text, embedding)
-              SELECT t, e
-              FROM unnest(%s::text[]) t,
-                   unnest(embed_texts(%s, %s, %s::text[])) e
-              """
-        cur.execute(sql, (chunk, provider, model, chunk))
+    sql = """
+          WITH input_data AS (SELECT %s::text[] AS texts)
+          INSERT
+          INTO embeddings_test (text, embedding)
+          SELECT t, e
+          FROM input_data,
+               unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
+          """
+    cur.execute(sql, (texts, provider, model))
 
     conn.commit()
     elapsed = time.perf_counter() - start
@@ -328,15 +321,13 @@ def benchmark_chroma(collection, texts: List[str], embed_fn: Callable) -> float:
     """Benchmark ChromaDB with external embeddings."""
     start = time.perf_counter()
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        chunk = texts[i:i + BATCH_SIZE]
-        embeddings = embed_fn(chunk)
+    embeddings = embed_fn(texts)
 
-        collection.add(
-            ids=[f"id_{i + j}" for j in range(len(chunk))],
-            embeddings=embeddings,
-            documents=chunk
-        )
+    collection.add(
+        ids=[f"id_{j}" for j in range(len(texts))],
+        embeddings=embeddings,
+        documents=texts
+    )
 
     elapsed = time.perf_counter() - start
     return elapsed
@@ -393,23 +384,22 @@ def benchmark_qdrant(client, texts: List[str], embed_fn: Callable) -> float:
     """Benchmark Qdrant with external embeddings."""
     start = time.perf_counter()
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        chunk = texts[i:i + BATCH_SIZE]
-        embeddings = embed_fn(chunk)
+    embeddings = embed_fn(texts)
 
-        points = [
-            PointStruct(
-                id=i + j,
-                vector=embeddings[j],
-                payload={"text": chunk[j]}
-            )
-            for j in range(len(chunk))
-        ]
-
-        client.upsert(
-            collection_name="bench",
-            points=points
+    points = [
+        PointStruct(
+            id=j,
+            vector=embeddings[j],
+            payload={"text": texts[j]}
         )
+        for j in range(len(texts))
+    ]
+
+    client.upsert(
+        collection_name="bench",
+        points=points,
+        wait=True
+    )
 
     elapsed = time.perf_counter() - start
     return elapsed
@@ -443,7 +433,7 @@ def run_pg_method(texts: List[str], provider: str, runs: int) -> List[BenchmarkR
     py_pid = os.getpid()
 
     try:
-        warmup_texts = make_inputs(8)
+        warmup_texts = get_review_texts(8, shuffle=False)
         truncate_pg_table(conn)
         benchmark_pg_internal(conn, warmup_texts, provider, EMBED_ANYTHING_MODEL)
 
@@ -466,7 +456,7 @@ def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
 
     client, collection, db_path = create_chroma_client(use_index=use_index, embed_fn=embed_client.embed)
     try:
-        warmup_texts = make_inputs(8)
+        warmup_texts = get_review_texts(8, shuffle=False)
         benchmark_chroma(collection, warmup_texts, embed_client.embed)
     finally:
         cleanup_chroma(client, db_path)
@@ -494,7 +484,7 @@ def run_qdrant_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
 
     client = create_qdrant_client(use_index=use_index)
     try:
-        warmup_texts = make_inputs(8)
+        warmup_texts = get_review_texts(8, shuffle=False)
         benchmark_qdrant(client, warmup_texts, embed_client.embed)
     finally:
         cleanup_qdrant(client)
@@ -693,7 +683,7 @@ def run_benchmark(use_index: bool):
     all_results = []
 
     for size in TEST_SIZES:
-        texts = make_inputs(size)
+        texts = get_review_texts(size, shuffle=False)
         print(f"Size: {size}", flush=True)
 
         pg_local_results = run_pg_method(texts, "embed_anything", RUNS_PER_SIZE)
@@ -728,159 +718,11 @@ def run_benchmark(use_index: bool):
     print(f"  Chroma:      {avg_chroma:.2f}")
     print(f"  Qdrant:      {avg_qdrant:.2f}")
 
-    save_results_csv(all_results)
-    generate_plots(all_results)
-
-
-def save_results_csv(all_results: List[dict]):
-    """Save benchmark results to CSV file with mean and std values."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = OUTPUT_DIR / f"benchmark_{timestamp}.csv"
-
     methods = ['pg_local', 'pg_grpc', 'chroma', 'qdrant']
-    metrics = ['throughput', 'time_s', 'py_cpu', 'py_mem_delta', 'py_mem_peak',
-               'pg_cpu', 'pg_mem_delta', 'pg_mem_peak',
-               'qd_cpu', 'qd_mem_delta', 'qd_mem_peak',
-               'sys_cpu', 'sys_mem']
 
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        header = ['size']
-        for method in methods:
-            for metric in metrics:
-                header.append(f"{method}_{metric}")
-                header.append(f"{method}_{metric}_std")
-                header.append(f"{method}_{metric}_median")
-                header.append(f"{method}_{metric}_iqr")
-        writer.writerow(header)
-
-        for r in all_results:
-            row = [r['size']]
-            for method in methods:
-                for metric in metrics:
-                    row.append(r[method].get(metric))
-                    row.append(r[method].get(f"{metric}_std", 0))
-                    row.append(r[method].get(f"{metric}_median", 0))
-                    row.append(r[method].get(f"{metric}_iqr", 0))
-            writer.writerow(row)
-
-    print(f"\nResults saved to: {csv_path}")
-
-
-def generate_plots(all_results: List[dict]):
-    """Generate comparison plots for throughput, CPU, and memory with error bars."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    sizes = [r['size'] for r in all_results]
-    methods = ['pg_local', 'pg_grpc', 'chroma', 'qdrant']
-    labels = ['PG Local', 'PG gRPC', 'ChromaDB', 'Qdrant']
-    colors = ['#2ecc71', '#27ae60', '#e74c3c', '#3498db']
-    markers = ['o', 's', '^', 'd']
-
-    # Plot 1: Throughput
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['throughput_median'] for r in all_results]
-        y_errs = [r[method]['throughput_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('Throughput (texts/sec)')
-    plt.title(f'Vector Database Comparison: Throughput (Median ± IQR, batch size={BATCH_SIZE})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"throughput_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 2: Python Memory Peak
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['py_mem_peak_median'] for r in all_results]
-        y_errs = [r[method]['py_mem_peak_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('Peak Python Memory (MB)')
-    plt.title('Python Client Memory Usage (Median ± IQR)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"py_memory_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 3: Postgres Memory Peak
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['pg_mem_peak_median'] for r in all_results]
-        y_errs = [r[method]['pg_mem_peak_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('Peak PostgreSQL Memory (MB)')
-    plt.title('PostgreSQL Backend Memory Usage (Median ± IQR)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"pg_memory_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 4: Qdrant Memory Peak (Only valid for Qdrant method)
-    plt.figure(figsize=(10, 6))
-    # We only plot Qdrant series for Qdrant metrics, or maybe we want to see if others trigger it (they shouldn't)
-    # But for comparison, we only have Qdrant container stats when running Qdrant.
-    # Actually, the logic in ResourceMonitor only captures qd stats if container exists.
-    # So for other methods, it might be 0 or baseline.
-    # Let's just plot it for all methods to be safe and see if there's noise.
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['qd_mem_peak_median'] for r in all_results]
-        y_errs = [r[method]['qd_mem_peak_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('Peak Qdrant Memory (MB)')
-    plt.title('Qdrant Container Memory Usage (Median ± IQR)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"qd_memory_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 5: System Memory
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['sys_mem_median'] for r in all_results]
-        y_errs = [r[method]['sys_mem_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('System Memory (MB)')
-    plt.title('Total System Memory Usage (Median ± IQR)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"memory_system_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Plot 6: System CPU
-    plt.figure(figsize=(10, 6))
-    for method, label, color, marker in zip(methods, labels, colors, markers):
-        y_vals = [r[method]['sys_cpu_median'] for r in all_results]
-        y_errs = [r[method]['sys_cpu_iqr'] for r in all_results]
-        plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=f'{marker}-', label=label,
-                     linewidth=2, color=color, capsize=3, capthick=1)
-    plt.xlabel('Number of Texts')
-    plt.ylabel('System CPU (%)')
-    plt.title('Total System CPU Usage (Median ± IQR)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xscale('log', base=2)
-    plt.savefig(OUTPUT_DIR / f"cpu_system_{timestamp}.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"Plots saved to: {OUTPUT_DIR}/")
+    save_results_csv(all_results, OUTPUT_DIR, timestamp, methods)
+    generate_plots(all_results, OUTPUT_DIR, timestamp, methods)
 
 
 def main():

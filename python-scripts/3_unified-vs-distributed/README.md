@@ -15,7 +15,7 @@ Simulates initial data loading or migration:
 
 - Fresh insert of all data (timed)
 - Data insertion + embedding generation measured together
-- Common use case: Initial system setup, data migration, batch loading
+- Common use case: Initial system setup, data migration, full loading
 
 **What's measured:**
 
@@ -90,7 +90,7 @@ Results are grouped by scenario:
 ## Notes
 
 - Each scenario sets up its own data independently
-- Warmup batches are not counted in final metrics
+- Warmup phase is not counted in final metrics
 - ChromaDB directories are cleaned up between runs
 - Qdrant collection is recreated for each run
 - All indices (pgvector, Chroma, Qdrant) use HNSW with `m = 16, ef_construction = 100` for fair comparison
