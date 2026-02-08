@@ -1,4 +1,3 @@
-import glob
 import os
 import shutil
 import time
@@ -31,11 +30,14 @@ QDRANT_CONTAINER_NAME = "qdrant"
 
 MODEL_NAME = "openai/clip-vit-base-patch32"
 
-INGESTION_SET_SIZES = [100]
-RUNS_INGESTION = 1
+INGEST_PER_PERSON = 64
+QUERY_PER_PERSON = 16
 
-SERVING_TEST_SIZES = [100]
-RUNS_SERVING = 1
+INGESTION_SET_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+SERVING_TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
+
+RUNS_INGESTION = 5
+RUNS_SERVING = 5
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 DATA_DIR = Path(__file__).parent.parent / "data" / "CUSTOMER_IMAGES"
@@ -264,19 +266,32 @@ def create_qdrant_client():
     return QdrantClient(url=QDRANT_URL)
 
 
-def get_image_paths(n: int) -> List[str]:
-    all_images = []
-    for ext in ['*.png', '*.jpg', '*.jpeg']:
-        all_images.extend(glob.glob(str(DATA_DIR / "**" / ext), recursive=True))
+def get_image_paths(n_people: int, n_images_per_person: int, offset: int = 0) -> List[str]:
+    """
+    Collects images from people.
+    """
+    # Safe limit: 97 people have >= 80 images with the dataset generated.
+    REQUIRED_TOTAL = INGEST_PER_PERSON + QUERY_PER_PERSON
+    all_people_dirs = sorted([
+        d for d in DATA_DIR.iterdir()
+        if d.is_dir() and len(list(d.glob('*'))) >= REQUIRED_TOTAL
+    ])
 
-    if not all_images:
-        raise ValueError(f"No images found in {DATA_DIR}")
+    if len(all_people_dirs) < n_people:
+        mult = (n_people // len(all_people_dirs)) + 1
+        all_people_dirs = all_people_dirs * mult
 
-    if len(all_images) < n:
-        mult = (n // len(all_images)) + 1
-        all_images = all_images * mult
+    selected_people = all_people_dirs[:n_people]
+    all_paths = []
 
-    return [os.path.abspath(p) for p in all_images[:n]]
+    for person_dir in selected_people:
+        person_imgs = []
+        for ext in ['*.png', '*.jpg', '*.jpeg']:
+            person_imgs.extend(sorted(list(person_dir.glob(ext))))
+
+        all_paths.extend([str(p.absolute()) for p in person_imgs[offset: offset + n_images_per_person]])
+
+    return all_paths
 
 
 def get_person_name(path: str) -> str:
@@ -316,37 +331,42 @@ def truncate_pg_table(conn):
 
 # --- Scenario 1: Paths Only ---
 
-def s1_ingest_pg(conn, image_paths):
+def s1_populate_pg(conn, image_paths):
     cur = conn.cursor()
-    # Note: TRUNCATE handled by runner
+    batch_names = [get_person_name(p) for p in image_paths]
+    batch_images = []
+    for p in image_paths:
+        with open(p, "rb") as f:
+            batch_images.append(f.read())
 
-    # Ensure Index
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS faces_emb_idx ON faces USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
-
-    chunk_size = 32
-    total = len(image_paths)
-    for i in range(0, total, chunk_size):
-        batch_paths = image_paths[i: i + chunk_size]
-        batch_names = [get_person_name(p) for p in batch_paths]
-        batch_images = []
-        for p in batch_paths:
-            with open(p, "rb") as f:
-                batch_images.append(f.read())
-
-        sql = '''
-              INSERT INTO faces (path, person_name, embedding)
-              SELECT t.p, t.n, t.e
-              FROM unnest(%s::text[],
-                          %s::text[],
-                          embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, e)
-              '''
-        cur.execute(sql, (batch_paths, batch_names, MODEL_NAME, batch_images))
+    sql = '''
+          INSERT INTO faces (path, person_name, embedding)
+          SELECT t.p, t.n, t.e
+          FROM unnest(%s::text[],
+                      %s::text[],
+                      embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, e)
+          '''
+    cur.execute(sql, (image_paths, batch_names, MODEL_NAME, batch_images))
     conn.commit()
     cur.close()
 
 
-def s1_ingest_qdrant(client, image_paths, embed_client):
+def s1_ingest_pg_indexed(conn, image_paths):
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    cur.close()
+    s1_populate_pg(conn, image_paths)
+
+
+def s1_ingest_pg_deferred(conn, image_paths):
+    s1_populate_pg(conn, image_paths)
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    conn.commit()
+    cur.close()
+
+
+def s1_ingest_qdrant(client, image_paths, embed_client, deferred: bool = False):
     if client.collection_exists("faces"):
         client.delete_collection("faces")
 
@@ -356,105 +376,92 @@ def s1_ingest_qdrant(client, image_paths, embed_client):
         vectors_config=VectorParams(size=512, distance=Distance.COSINE, hnsw_config=hnsw_config)
     )
 
-    chunk_size = 32
-    total = len(image_paths)
-    for i in range(0, total, chunk_size):
-        batch_paths = image_paths[i: i + chunk_size]
-        embeddings = embed_client.embed_files(batch_paths)
-        points = [
-            PointStruct(
-                id=i + j,
-                vector=emb,
-                payload={"path": p, "person_name": get_person_name(p)}
-            )
-            for j, (emb, p) in enumerate(zip(embeddings, batch_paths))
-        ]
-        if points:
-            client.upsert("faces", points, wait=True)
+    if deferred:
+        client.update_collection("faces", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
+
+    embeddings = embed_client.embed_files(image_paths)
+    points = [
+        PointStruct(
+            id=idx,
+            vector=emb,
+            payload={"path": p, "person_name": get_person_name(p)}
+        )
+        for idx, (emb, p) in enumerate(zip(embeddings, image_paths))
+    ]
+    if points:
+        client.upsert("faces", points, wait=True)
+
+    if deferred:
+        client.update_collection("faces", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
 
 
 def s1_ingest_chroma(collection, image_paths, embed_client):
-    # Collection is assumed fresh/empty or handled by runner
-    chunk_size = 32
-    total = len(image_paths)
-    for i in range(0, total, chunk_size):
-        batch_paths = image_paths[i: i + chunk_size]
-        embeddings = embed_client.embed_files(batch_paths)
-        ids = [str(i + j) for j in range(len(batch_paths))]
-        metas = [{"path": p, "person_name": get_person_name(p)} for p in batch_paths]
-        if embeddings:
-            collection.add(ids=ids, embeddings=embeddings, metadatas=metas)
+    embeddings = embed_client.embed_files(image_paths)
+    ids = [str(idx) for idx in range(len(image_paths))]
+    metas = [{"path": p, "person_name": get_person_name(p)} for p in image_paths]
+    if embeddings:
+        collection.add(ids=ids, embeddings=embeddings, metadatas=metas)
 
 
 # --- Scenario 2: Blobs in PG ---
 
-def s2_ingest_pg(conn, image_paths):
+def s2_populate_pg(conn, image_paths):
     cur = conn.cursor()
-    # TRUNCATE handled by runner
+    batch_names = [get_person_name(p) for p in image_paths]
+    batch_images = []
+    for p in image_paths:
+        with open(p, "rb") as f:
+            batch_images.append(f.read())
 
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS faces_emb_idx ON faces USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    sql = '''
+          INSERT INTO faces (path, person_name, image_data, embedding)
+          SELECT t.p, t.n, t.i, t.e
+          FROM unnest(%s::text[],
+                      %s::text[],
+                      %s::bytea[],
+                      embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, i, e)
+          '''
+    cur.execute(sql, (image_paths, batch_names, batch_images, MODEL_NAME, batch_images))
+    conn.commit()
+    cur.close()
 
-    chunk_size = 32
-    total = len(image_paths)
-    for i in range(0, total, chunk_size):
-        batch_paths = image_paths[i: i + chunk_size]
-        batch_names = [get_person_name(p) for p in batch_paths]
-        batch_images = []
-        for p in batch_paths:
-            with open(p, "rb") as f:
-                batch_images.append(f.read())
 
-        sql = '''
-              INSERT INTO faces (path, person_name, image_data, embedding)
-              SELECT t.p, t.n, t.i, t.e
-              FROM unnest(%s::text[],
-                          %s::text[],
-                          %s::bytea[],
-                          embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, i, e)
-              '''
-        cur.execute(sql, (batch_paths, batch_names, batch_images, MODEL_NAME, batch_images))
+def s2_ingest_pg_indexed(conn, image_paths):
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    cur.close()
+    s2_populate_pg(conn, image_paths)
+
+
+def s2_ingest_pg_deferred(conn, image_paths):
+    s2_populate_pg(conn, image_paths)
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
     conn.commit()
     cur.close()
 
 
 def s2_ingest_dist_common(conn, image_paths):
-    """Common PG ingestion for distributed S2 (Insert Blob, return IDs)."""
     cur = conn.cursor()
-    # TRUNCATE handled by runner
+    batch_names = [get_person_name(p) for p in image_paths]
+    batch_images = []
+    for p in image_paths:
+        with open(p, "rb") as f:
+            batch_images.append(f.read())
 
-    all_pg_ids = []
-
-    chunk_size = 32
-    total = len(image_paths)
-    for i in range(0, total, chunk_size):
-        batch_paths = image_paths[i: i + chunk_size]
-        batch_names = [get_person_name(p) for p in batch_paths]
-        batch_images = []
-        for p in batch_paths:
-            with open(p, "rb") as f:
-                batch_images.append(f.read())
-
-        # Insert blobs
-        execute_values(
-            cur,
-            "INSERT INTO faces (path, person_name, image_data) VALUES %s RETURNING id",
-            list(zip(batch_paths, batch_names, batch_images))
-        )
-        # Fetch IDs
-        ids = [r[0] for r in cur.fetchall()]
-        all_pg_ids.extend(ids)
-
+    execute_values(
+        cur,
+        "INSERT INTO faces (path, person_name, image_data) VALUES %s RETURNING id",
+        list(zip(image_paths, batch_names, batch_images))
+    )
+    ids = [r[0] for r in cur.fetchall()]
     conn.commit()
     cur.close()
-    return all_pg_ids
+    return ids
 
 
-def s2_ingest_qdrant(conn, client, image_paths, embed_client):
-    # 1. Insert to PG (PG is truncated by runner before this)
+def s2_ingest_qdrant(conn, client, image_paths, embed_client, deferred: bool = False):
     pg_ids = s2_ingest_dist_common(conn, image_paths)
-
-    # 2. Setup Qdrant
     if client.collection_exists("faces"):
         client.delete_collection("faces")
     hnsw_config = models.HnswConfigDiff(m=16, ef_construct=100)
@@ -463,53 +470,33 @@ def s2_ingest_qdrant(conn, client, image_paths, embed_client):
         vectors_config=VectorParams(size=512, distance=Distance.COSINE, hnsw_config=hnsw_config)
     )
 
-    # 3. Embed & Push
-    chunk_size = 32
-    total = len(image_paths)
-    current_idx = 0
+    if deferred:
+        client.update_collection("faces", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
 
-    for i in range(0, total, chunk_size):
-        batch_paths = image_paths[i: i + chunk_size]
-        # Get corresponding PG IDs
-        batch_ids = pg_ids[current_idx: current_idx + len(batch_paths)]
-        current_idx += len(batch_paths)
+    embeddings = embed_client.embed_files(image_paths)
+    points = [
+        PointStruct(
+            id=pg_id,
+            vector=emb,
+            payload={"path": p, "person_name": get_person_name(p), "pg_id": pg_id}
+        )
+        for pg_id, emb, p in zip(pg_ids, embeddings, image_paths)
+    ]
+    if points:
+        client.upsert("faces", points, wait=True)
 
-        embeddings = embed_client.embed_files(batch_paths)
-
-        points = [
-            PointStruct(
-                id=pg_id,
-                vector=emb,
-                payload={"path": p, "person_name": get_person_name(p), "pg_id": pg_id}
-            )
-            for pg_id, emb, p in zip(batch_ids, embeddings, batch_paths)
-        ]
-        if points:
-            client.upsert("faces", points, wait=True)
+    if deferred:
+        client.update_collection("faces", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
 
 
 def s2_ingest_chroma(conn, collection, image_paths, embed_client):
-    # 1. Insert to PG
     pg_ids = s2_ingest_dist_common(conn, image_paths)
-
-    # 2. Embed & Push
-    chunk_size = 32
-    total = len(image_paths)
-    current_idx = 0
-
-    for i in range(0, total, chunk_size):
-        batch_paths = image_paths[i: i + chunk_size]
-        batch_ids = pg_ids[current_idx: current_idx + len(batch_paths)]
-        current_idx += len(batch_paths)
-
-        embeddings = embed_client.embed_files(batch_paths)
-
-        ids = [str(pg_id) for pg_id in batch_ids]
-        metas = [{"path": p, "person_name": get_person_name(p), "pg_id": pg_id}
-                 for p, pg_id in zip(batch_paths, batch_ids)]
-
-        if embeddings:
-            collection.add(ids=ids, embeddings=embeddings, metadatas=metas)
+    embeddings = embed_client.embed_files(image_paths)
+    ids = [str(pg_id) for pg_id in pg_ids]
+    metas = [{"path": p, "person_name": get_person_name(p), "pg_id": pg_id}
+             for p, pg_id in zip(image_paths, pg_ids)]
+    if embeddings:
+        collection.add(ids=ids, embeddings=embeddings, metadatas=metas)
 
 
 # --- Serving Functions ---
@@ -586,16 +573,13 @@ def serve_s2_qdrant(client, conn, embed_client, query_paths):
         for emb in embeddings
     ]
     if not requests: return
-
     results = client.query_batch_points(collection_name="faces", requests=requests)
-
     all_pg_ids = []
     for batch in results:
         for point in batch.points:
             pid = point.payload.get('pg_id')
             if pid is not None:
                 all_pg_ids.append(pid)
-
     if all_pg_ids:
         cur = conn.cursor()
         sql = "SELECT image_data FROM faces WHERE id = ANY(%s::int[])"
@@ -608,9 +592,7 @@ def serve_s2_qdrant(client, conn, embed_client, query_paths):
 def serve_s2_chroma(collection, conn, embed_client, query_paths):
     embeddings = embed_client.embed_files(query_paths)
     if not embeddings: return
-
     results = collection.query(query_embeddings=embeddings, n_results=TOP_K)
-
     all_pg_ids = []
     if results.get('metadatas'):
         for batch_meta in results['metadatas']:
@@ -618,7 +600,6 @@ def serve_s2_chroma(collection, conn, embed_client, query_paths):
                 pid = meta.get('pg_id')
                 if pid is not None:
                     all_pg_ids.append(pid)
-
     if all_pg_ids:
         cur = conn.cursor()
         sql = "SELECT image_data FROM faces WHERE id = ANY(%s::int[])"
@@ -626,315 +607,6 @@ def serve_s2_chroma(collection, conn, embed_client, query_paths):
         _ = cur.fetchall()
         cur.close()
         conn.commit()
-
-
-# =============================================================================
-# Explicit Benchmark Runners (Cleanup separated from Logic)
-# =============================================================================
-
-def run_s1_ingest_pg(image_paths, runs):
-    conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        # Warmup
-        warmup = get_image_paths(8)
-        truncate_pg_table(conn)
-        s1_ingest_pg(conn, warmup)
-
-        results = []
-        for _ in range(runs):
-            truncate_pg_table(conn)
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: s1_ingest_pg(conn, image_paths))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        conn.close()
-
-
-def run_s1_ingest_qdrant(image_paths, runs, embed_client):
-    client = create_qdrant_client()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        s1_ingest_qdrant(client, warmup, embed_client)
-
-        results = []
-        for _ in range(runs):
-            elapsed, stats = ResourceMonitor.measure(py_pid, None,
-                                                     lambda: s1_ingest_qdrant(client, image_paths, embed_client))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        client.close()
-
-
-def run_s1_ingest_chroma(image_paths, runs, embed_client):
-    client, path = create_chroma_client()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-
-        try:
-            client.delete_collection("faces")
-        except:
-            pass
-        col = client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-        s1_ingest_chroma(col, warmup, embed_client)
-
-        results = []
-        for _ in range(runs):
-            try:
-                client.delete_collection("faces")
-            except:
-                pass
-            col = client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-
-            elapsed, stats = ResourceMonitor.measure(py_pid, None,
-                                                     lambda: s1_ingest_chroma(col, image_paths, embed_client))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        cleanup_chroma(client, path)
-
-
-def run_s2_ingest_pg(image_paths, runs):
-    conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        truncate_pg_table(conn)
-        s2_ingest_pg(conn, warmup)
-
-        results = []
-        for _ in range(runs):
-            truncate_pg_table(conn)
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: s2_ingest_pg(conn, image_paths))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        conn.close()
-
-
-def run_s2_ingest_qdrant(image_paths, runs, embed_client):
-    client = create_qdrant_client()
-    conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        truncate_pg_table(conn)
-        s2_ingest_qdrant(conn, client, warmup, embed_client)
-
-        results = []
-        for _ in range(runs):
-            truncate_pg_table(conn)
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: s2_ingest_qdrant(conn, client, image_paths, embed_client))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        client.close()
-        conn.close()
-
-
-def run_s2_ingest_chroma(image_paths, runs, embed_client):
-    client, path = create_chroma_client()
-    conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        truncate_pg_table(conn)
-
-        try:
-            client.delete_collection("faces")
-        except:
-            pass
-        col = client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-        s2_ingest_chroma(conn, col, warmup, embed_client)
-
-        results = []
-        for _ in range(runs):
-            truncate_pg_table(conn)
-            try:
-                client.delete_collection("faces")
-            except:
-                pass
-            col = client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: s2_ingest_chroma(conn, col, image_paths, embed_client))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        conn.close()
-        cleanup_chroma(client, path)
-
-
-# --- Serving Runners ---
-
-def run_s1_serve_pg(queries, max_img, runs):
-    # Setup data (once)
-    conn, _ = connect_and_get_pid()
-    setup_pg_schema(conn)  # Ensure table exists
-    truncate_pg_table(conn)
-    s1_ingest_pg(conn, max_img)
-    conn.close()
-
-    # Serve loop
-    serve_conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        # Warmup
-        warmup = get_image_paths(8)
-        serve_s1_pg(serve_conn, warmup)
-
-        results = []
-        for _ in range(runs):
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: serve_s1_pg(serve_conn, queries))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        serve_conn.close()
-
-
-def run_s1_serve_qdrant(queries, max_img, runs, embed_client):
-    client = create_qdrant_client()
-    s1_ingest_qdrant(client, max_img, embed_client)
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        serve_s1_qdrant(client, embed_client, warmup)
-
-        results = []
-        for _ in range(runs):
-            elapsed, stats = ResourceMonitor.measure(py_pid, None,
-                                                     lambda: serve_s1_qdrant(client, embed_client, queries))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        client.close()
-
-
-def run_s1_serve_chroma(queries, max_img, runs, embed_client):
-    client, path = create_chroma_client()
-    try:
-        client.delete_collection("faces")
-    except:
-        pass
-    col = client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-    s1_ingest_chroma(col, max_img, embed_client)
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        serve_s1_chroma(col, embed_client, warmup)
-
-        results = []
-        for _ in range(runs):
-            elapsed, stats = ResourceMonitor.measure(py_pid, None,
-                                                     lambda: serve_s1_chroma(col, embed_client, queries))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        cleanup_chroma(client, path)
-
-
-def run_s2_serve_pg(queries, max_img, runs):
-    # Setup data
-    conn, _ = connect_and_get_pid()
-    setup_pg_schema(conn)
-    truncate_pg_table(conn)
-    s2_ingest_pg(conn, max_img)
-    conn.close()
-
-    # Serve loop
-    serve_conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        serve_s2_pg(serve_conn, warmup)
-
-        results = []
-        for _ in range(runs):
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: serve_s2_pg(serve_conn, queries))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        serve_conn.close()
-
-
-def run_s2_serve_qdrant(queries, max_img, runs, embed_client):
-    # Setup data (Shared PG + Qdrant)
-    pg_data_conn = connect_pg()
-    setup_pg_schema(pg_data_conn)
-    truncate_pg_table(pg_data_conn)
-    client = create_qdrant_client()
-    s2_ingest_qdrant(pg_data_conn, client, max_img, embed_client)
-    pg_data_conn.close()
-
-    # Serve loop
-    serve_conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        serve_s2_qdrant(client, serve_conn, embed_client, warmup)
-
-        results = []
-        for _ in range(runs):
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: serve_s2_qdrant(client, serve_conn, embed_client, queries))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        serve_conn.close()
-        client.close()
-
-
-def run_s2_serve_chroma(queries, max_img, runs, embed_client):
-    # Setup data (Shared PG + Chroma)
-    pg_data_conn = connect_pg()
-    setup_pg_schema(pg_data_conn)
-    truncate_pg_table(pg_data_conn)
-    client, path = create_chroma_client()
-
-    try:
-        client.delete_collection("faces")
-    except:
-        pass
-    col = client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-    s2_ingest_chroma(pg_data_conn, col, max_img, embed_client)
-    pg_data_conn.close()
-
-    # Serve loop
-    serve_conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        warmup = get_image_paths(8)
-        serve_s2_chroma(col, serve_conn, embed_client, warmup)
-
-        results = []
-        for _ in range(runs):
-            elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid,
-                                                     lambda: serve_s2_chroma(col, serve_conn, embed_client, queries))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        return results
-    finally:
-        serve_conn.close()
-        cleanup_chroma(client, path)
 
 
 # =============================================================================
@@ -971,12 +643,15 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
 
 
 def print_detailed_header():
+    """Print detailed benchmark results header."""
     lbl_w, time_w, col_w = 20, 14, 13
     print("\nBenchmark Results:", flush=True)
     header = (
             "  " +
             f"{'':{lbl_w}} | {'Time (s)':>{time_w}} | "
-            f"{'Py Δ MB':>{col_w}} | {'PG Peak MB':>{col_w}} | {'QD Peak MB':>{col_w}} | "
+            f"{'Py Δ MB':>{col_w}} | {'Py Peak MB':>{col_w}} | {'Py CPU%':>{col_w}} | "
+            f"{'PG Peak MB':>{col_w}} | {'PG CPU%':>{col_w}} | "
+            f"{'QD Peak MB':>{col_w}} | {'QD CPU%':>{col_w}} | "
             f"{'Sys CPU%':>{col_w}}"
     )
     print(header, flush=True)
@@ -986,8 +661,12 @@ def print_detailed_header():
 def print_result(label: str, results: List[BenchmarkResult]):
     times = [r.time_s for r in results]
     py_deltas = [r.stats.py_delta_mb for r in results]
+    py_peaks = [r.stats.py_peak_mb for r in results]
+    py_cpus = [r.stats.py_cpu for r in results]
     pg_peaks = [r.stats.pg_peak_mb for r in results]
+    pg_cpus = [r.stats.pg_cpu for r in results]
     qd_peaks = [r.stats.qd_peak_mb for r in results]
+    qd_cpus = [r.stats.qd_cpu for r in results]
     sys_cpus = [r.stats.sys_cpu for r in results]
 
     def fmt(vals, p=1):
@@ -995,140 +674,202 @@ def print_result(label: str, results: List[BenchmarkResult]):
 
     row_fmt = (
         "  {label:<20} | {time:>14} | "
-        "{pyd:>13} | {pgp:>13} | {qdp:>13} | "
+        "{pyd:>13} | {pyp:>13} | {pyc:>13} | "
+        "{pgp:>13} | {pgc:>13} | "
+        "{qdp:>13} | {qdc:>13} | "
         "{sysc:>13}"
     )
     print(row_fmt.format(
         label=label,
         time=fmt(times, 3),
-        pyd=fmt(py_deltas), pgp=fmt(pg_peaks), qdp=fmt(qd_peaks),
+        pyd=fmt(py_deltas), pyp=fmt(py_peaks), pyc=fmt(py_cpus),
+        pgp=fmt(pg_peaks), pgc=fmt(pg_cpus),
+        qdp=fmt(qd_peaks), qdc=fmt(qd_cpus),
         sysc=fmt(sys_cpus)
     ), flush=True)
 
 
 def main():
-    pg_conn = connect_pg()
-    setup_pg_schema(pg_conn)  # Initial table creation (DDL)
-    pg_conn.close()
-
+    py_pid = os.getpid()
     print("Loading model...", flush=True)
     EmbedAnythingImageClient._get_model()
     embed_client = EmbedAnythingImageClient()
-
-    print_detailed_header()
-
-    # --- Scenario 1 Ingestion ---
-    print("\n=== SCENARIO 1: Return Paths (No Blobs in DB) ===\n")
-    print("--- Ingestion (S1) ---")
-    s1_ing_results = []
-    for size in INGESTION_SET_SIZES:
-        print(f"Size: {size}")
-        paths = get_image_paths(size)
-
-        m_pg = run_s1_ingest_pg(paths, RUNS_INGESTION)
-        print_result("PG Unified", m_pg)
-
-        m_qd = run_s1_ingest_qdrant(paths, RUNS_INGESTION, embed_client)
-        print_result("Qdrant", m_qd)
-
-        m_ch = run_s1_ingest_chroma(paths, RUNS_INGESTION, embed_client)
-        print_result("Chroma", m_ch)
-
-        s1_ing_results.append({
-            'size': size,
-            'pg_unified': compute_metrics(size, m_pg),
-            'dist_qdrant': compute_metrics(size, m_qd),
-            'dist_chroma': compute_metrics(size, m_ch)
-        })
-
-    # --- Scenario 1 Serving ---
-    print("\n--- Serving (S1) ---")
-    s1_srv_results = []
-    max_img = get_image_paths(max(SERVING_TEST_SIZES))
-
-    for size in SERVING_TEST_SIZES:
-        print(f"Size: {size}")
-        queries = get_image_paths(size)
-
-        m_pg = run_s1_serve_pg(queries, max_img, RUNS_SERVING)
-        print_result("PG Unified", m_pg)
-
-        m_qd = run_s1_serve_qdrant(queries, max_img, RUNS_SERVING, embed_client)
-        print_result("Qdrant", m_qd)
-
-        m_ch = run_s1_serve_chroma(queries, max_img, RUNS_SERVING, embed_client)
-        print_result("Chroma", m_ch)
-
-        s1_srv_results.append({
-            'size': size,
-            'pg_unified': compute_metrics(size, m_pg),
-            'dist_qdrant': compute_metrics(size, m_qd),
-            'dist_chroma': compute_metrics(size, m_ch)
-        })
-
-    # --- Scenario 2 Ingestion ---
-    print("\n\n=== SCENARIO 2: Return Blobs (Images in PG) ===\n")
-    print("--- Ingestion (S2) ---")
-    s2_ing_results = []
-    for size in INGESTION_SET_SIZES:
-        print(f"Size: {size}")
-        paths = get_image_paths(size)
-
-        m_pg = run_s2_ingest_pg(paths, RUNS_INGESTION)
-        print_result("PG Unified", m_pg)
-
-        m_qd = run_s2_ingest_qdrant(paths, RUNS_INGESTION, embed_client)
-        print_result("Qdrant", m_qd)
-
-        m_ch = run_s2_ingest_chroma(paths, RUNS_INGESTION, embed_client)
-        print_result("Chroma", m_ch)
-
-        s2_ing_results.append({
-            'size': size,
-            'pg_unified': compute_metrics(size, m_pg),
-            'dist_qdrant': compute_metrics(size, m_qd),
-            'dist_chroma': compute_metrics(size, m_ch)
-        })
-
-    # --- Scenario 2 Serving ---
-    print("\n--- Serving (S2) ---")
-    s2_srv_results = []
-
-    for size in SERVING_TEST_SIZES:
-        print(f"Size: {size}")
-        queries = get_image_paths(size)
-
-        m_pg = run_s2_serve_pg(queries, max_img, RUNS_SERVING)
-        print_result("PG Unified", m_pg)
-
-        m_qd = run_s2_serve_qdrant(queries, max_img, RUNS_SERVING, embed_client)
-        print_result("Qdrant", m_qd)
-
-        m_ch = run_s2_serve_chroma(queries, max_img, RUNS_SERVING, embed_client)
-        print_result("Chroma", m_ch)
-
-        s2_srv_results.append({
-            'size': size,
-            'pg_unified': compute_metrics(size, m_pg),
-            'dist_qdrant': compute_metrics(size, m_qd),
-            'dist_chroma': compute_metrics(size, m_ch)
-        })
-
-    # Save
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_unified', 'dist_qdrant', 'dist_chroma']
+    methods = ['pg_indexed', 'pg_deferred', 'qd_indexed', 'qd_deferred', 'chroma']
 
-    save_results_csv(s1_ing_results, OUTPUT_DIR / "scenario1_ingestion", timestamp, methods)
-    generate_plots(s1_ing_results, OUTPUT_DIR / "scenario1_ingestion", timestamp, methods)
+    for scenario_idx in [1, 2]:
+        scenario_name = f"Scenario {scenario_idx}: {'Paths' if scenario_idx == 1 else 'Blobs'}"
+        print(f"\n{'=' * 120}\n{scenario_name.upper()}\n{'=' * 120}")
 
-    save_results_csv(s1_srv_results, OUTPUT_DIR / "scenario1_serving", timestamp, methods)
-    generate_plots(s1_srv_results, OUTPUT_DIR / "scenario1_serving", timestamp, methods)
+        # --- Phase 1: Ingestion ---
+        print("\n--- Phase 1: Ingestion ---")
+        ing_results = []
+        final_chroma_path = None
 
-    save_results_csv(s2_ing_results, OUTPUT_DIR / "scenario2_ingestion", timestamp, methods)
-    generate_plots(s2_ing_results, OUTPUT_DIR / "scenario2_ingestion", timestamp, methods)
+        for size in INGESTION_SET_SIZES:
+            print(f"Ingestion Size: {size}")
+            n_people = max(1, size // INGEST_PER_PERSON)
+            imgs_per = INGEST_PER_PERSON if size >= INGEST_PER_PERSON else size
+            paths = get_image_paths(n_people, imgs_per)
+            res_pg_idx, res_pg_def, res_qd_idx, res_qd_def, res_ch = [], [], [], [], []
 
-    save_results_csv(s2_srv_results, OUTPUT_DIR / "scenario2_serving", timestamp, methods)
-    generate_plots(s2_srv_results, OUTPUT_DIR / "scenario2_serving", timestamp, methods)
+            for run in range(RUNS_INGESTION):
+                is_last_run = (run == RUNS_INGESTION - 1) and (size == INGESTION_SET_SIZES[-1])
+
+                # PG Indexed
+                conn, pg_pid = connect_and_get_pid()
+                setup_pg_schema(conn)
+                truncate_pg_table(conn)
+                fn = s1_ingest_pg_indexed if scenario_idx == 1 else s2_ingest_pg_indexed
+                elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, paths))
+                res_pg_idx.append(BenchmarkResult(elapsed, stats))
+                conn.close()
+
+                # PG Deferred
+                conn, pg_pid = connect_and_get_pid()
+                setup_pg_schema(conn)
+                truncate_pg_table(conn)
+                fn = s1_ingest_pg_deferred if scenario_idx == 1 else s2_ingest_pg_deferred
+                elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, paths))
+                res_pg_def.append(BenchmarkResult(elapsed, stats))
+                if not is_last_run:
+                    conn.close()
+                else:
+                    pg_persistent_conn = conn
+
+                # Qdrant Indexed
+                qd_client = create_qdrant_client()
+                if scenario_idx == 1:
+                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                                                             lambda: s1_ingest_qdrant(qd_client, paths, embed_client,
+                                                                                      deferred=False))
+                else:
+                    pg_tmp = connect_pg();
+                    setup_pg_schema(pg_tmp)
+                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
+                                                             lambda: s2_ingest_qdrant(pg_tmp, qd_client, paths,
+                                                                                      embed_client, deferred=False))
+                    pg_tmp.close()
+                res_qd_idx.append(BenchmarkResult(elapsed, stats))
+                qd_client.close()
+
+                # Qdrant Deferred
+                qd_client = create_qdrant_client()
+                if scenario_idx == 1:
+                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                                                             lambda: s1_ingest_qdrant(qd_client, paths, embed_client,
+                                                                                      deferred=True))
+                else:
+                    pg_tmp = connect_pg();
+                    setup_pg_schema(pg_tmp)
+                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
+                                                             lambda: s2_ingest_qdrant(pg_tmp, qd_client, paths,
+                                                                                      embed_client, deferred=True))
+                    pg_tmp.close()
+                res_qd_def.append(BenchmarkResult(elapsed, stats))
+                if not is_last_run:
+                    qd_client.close()
+                else:
+                    qd_persistent_client = qd_client
+
+                # Chroma
+                c_client, c_path = create_chroma_client()
+                col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
+                if scenario_idx == 1:
+                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                                                             lambda: s1_ingest_chroma(col, paths, embed_client))
+                else:
+                    pg_tmp = connect_pg();
+                    setup_pg_schema(pg_tmp)
+                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
+                                                             lambda: s2_ingest_chroma(pg_tmp, col, paths, embed_client))
+                    pg_tmp.close()
+                res_ch.append(BenchmarkResult(elapsed, stats))
+                if is_last_run:
+                    final_chroma_path = c_path;
+                    del c_client
+                else:
+                    cleanup_chroma(c_client, c_path)
+
+            print_detailed_header()
+            print_result("PG Indexed", res_pg_idx);
+            print_result("PG Deferred", res_pg_def)
+            print_result("QD Indexed", res_qd_idx);
+            print_result("QD Deferred", res_qd_def);
+            print_result("Chroma", res_ch)
+
+            ing_results.append({
+                'size': size,
+                'pg_indexed': compute_metrics(size, res_pg_idx), 'pg_deferred': compute_metrics(size, res_pg_def),
+                'qd_indexed': compute_metrics(size, res_qd_idx), 'qd_deferred': compute_metrics(size, res_qd_def),
+                'chroma': compute_metrics(size, res_ch)
+            })
+
+        save_results_csv(ing_results, OUTPUT_DIR / f"scenario{scenario_idx}_ingestion", timestamp, methods)
+        generate_plots(ing_results, OUTPUT_DIR / f"scenario{scenario_idx}_ingestion", timestamp, methods)
+
+        # --- Phase 2: Serving ---
+        print("\n--- Phase 2: Serving (against max ingested set) ---")
+        srv_results = []
+        c_persistent_client = chromadb.PersistentClient(path=final_chroma_path)
+        c_persistent_col = c_persistent_client.get_collection("faces")
+
+        for size in SERVING_TEST_SIZES:
+            print(f"Query Batch Size: {size}")
+            n_people_max = INGESTION_SET_SIZES[-1] // INGEST_PER_PERSON
+            n_people = max(1, size // QUERY_PER_PERSON);
+            imgs_per = QUERY_PER_PERSON if size >= QUERY_PER_PERSON else size
+            n_people = min(n_people, n_people_max)
+            queries = get_image_paths(n_people, imgs_per, offset=INGEST_PER_PERSON)[:size]
+
+            m_pg, m_qd, m_ch = [], [], []
+            for _ in range(RUNS_SERVING):
+                # PG (uses PG Deferred persistent data)
+                serve_fn = serve_s1_pg if scenario_idx == 1 else serve_s2_pg
+                elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_persistent_conn),
+                                                         lambda: serve_fn(pg_persistent_conn, queries))
+                m_pg.append(BenchmarkResult(elapsed, stats))
+
+                # Qdrant (uses QD Deferred persistent data)
+                if scenario_idx == 1:
+                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                                                             lambda: serve_s1_qdrant(qd_persistent_client, embed_client,
+                                                                                     queries))
+                else:
+                    pg_tmp = connect_pg()
+                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
+                                                             lambda: serve_s2_qdrant(qd_persistent_client, pg_tmp,
+                                                                                     embed_client, queries))
+                    pg_tmp.close()
+                m_qd.append(BenchmarkResult(elapsed, stats))
+
+                # Chroma
+                if scenario_idx == 1:
+                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                                                             lambda: serve_s1_chroma(c_persistent_col, embed_client,
+                                                                                     queries))
+                else:
+                    pg_tmp = connect_pg()
+                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
+                                                             lambda: serve_s2_chroma(c_persistent_col, pg_tmp,
+                                                                                     embed_client, queries))
+                    pg_tmp.close()
+                m_ch.append(BenchmarkResult(elapsed, stats))
+
+            print_detailed_header()
+            print_result("PG Unified", m_pg);
+            print_result("Qdrant", m_qd);
+            print_result("Chroma", m_ch)
+            srv_results.append(
+                {'size': size, 'pg_unified': compute_metrics(size, m_pg), 'dist_qdrant': compute_metrics(size, m_qd),
+                 'dist_chroma': compute_metrics(size, m_ch)})
+
+        serving_methods = ['pg_unified', 'dist_qdrant', 'dist_chroma']
+        save_results_csv(srv_results, OUTPUT_DIR / f"scenario{scenario_idx}_serving", timestamp, serving_methods)
+        generate_plots(srv_results, OUTPUT_DIR / f"scenario{scenario_idx}_serving", timestamp, serving_methods)
+        pg_persistent_conn.close();
+        qd_persistent_client.close();
+        cleanup_chroma(c_persistent_client, final_chroma_path)
 
 
 if __name__ == "__main__":

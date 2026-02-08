@@ -1,6 +1,5 @@
 import os
 import shutil
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -144,7 +143,9 @@ class ResourceMonitor:
     @staticmethod
     def measure(py_pid: int, pg_pid: int, func: Callable):
         monitor = ResourceMonitor(py_pid, pg_pid)
-        result = func()
+        start_time = time.perf_counter()
+        func()
+        elapsed = time.perf_counter() - start_time
 
         # Gather final stats
         py_peak = monitor._get_py_mem()
@@ -181,7 +182,7 @@ class ResourceMonitor:
             sys_mem_mb=sys_v.used / 1e6,
             sys_cpu=psutil.cpu_percent()
         )
-        return result, stats
+        return elapsed, stats
 
 
 # =============================================================================
@@ -223,8 +224,8 @@ def connect_and_get_pid():
     return conn, pid
 
 
-def setup_pg_database(conn, use_index: bool = True):
-    """Initialize PostgreSQL schema, optionally with HNSW index."""
+def setup_pg_schema(conn):
+    """Initialize PostgreSQL schema."""
     cur = conn.cursor()
     cur.execute("""
                 CREATE EXTENSION IF NOT EXISTS vector;
@@ -237,28 +238,13 @@ def setup_pg_database(conn, use_index: bool = True):
                     embedding vector(384)
                 );
                 """)
-    if use_index:
-        cur.execute("""
-                    CREATE INDEX ON embeddings_test
-                        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);
-                    """)
     conn.commit()
     cur.close()
 
 
-def truncate_pg_table(conn):
-    """Clear PostgreSQL test table."""
+def populate_pg_database(conn, texts: List[str], provider: str):
+    """Insert data using internal generation."""
     cur = conn.cursor()
-    cur.execute("TRUNCATE embeddings_test;")
-    conn.commit()
-    cur.close()
-
-
-def benchmark_pg_internal(conn, texts: List[str], provider: str, model: str) -> float:
-    """Benchmark pg_gembed internal generation."""
-    cur = conn.cursor()
-    start = time.perf_counter()
-
     sql = """
           WITH input_data AS (SELECT %s::text[] AS texts)
           INSERT
@@ -267,19 +253,38 @@ def benchmark_pg_internal(conn, texts: List[str], provider: str, model: str) -> 
           FROM input_data,
                unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
           """
-    cur.execute(sql, (texts, provider, model))
-
+    cur.execute(sql, (texts, provider, EMBED_ANYTHING_MODEL))
     conn.commit()
-    elapsed = time.perf_counter() - start
     cur.close()
-    return elapsed
+
+
+def setup_pg_indexed(conn, texts: List[str], provider: str):
+    """Index exists BEFORE embedding generation."""
+    setup_pg_schema(conn)
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    conn.commit()
+    cur.close()
+    populate_pg_database(conn, texts, provider)
+
+
+def setup_pg_deferred(conn, texts: List[str], provider: str):
+    """Index created AFTER embedding generation."""
+    setup_pg_schema(conn)
+    populate_pg_database(conn, texts, provider)
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    conn.commit()
+    cur.close()
 
 
 # =============================================================================
 # ChromaDB Functions
 # =============================================================================
 
-def create_chroma_client(base_path: str = "./chroma_bench", use_index: bool = True, embed_fn: Callable = None):
+def create_chroma_client(base_path: str = "./chroma_bench", embed_fn: Callable = None):
     """Create a fresh ChromaDB persistent client."""
     db_path = f"{base_path}_{time.time_ns()}"
     if os.path.exists(db_path):
@@ -287,22 +292,13 @@ def create_chroma_client(base_path: str = "./chroma_bench", use_index: bool = Tr
 
     client = chromadb.PersistentClient(path=db_path)
 
-    if use_index:
-        configuration = {
-            "hnsw": {
-                "space": "cosine",
-                "max_neighbors": 16,
-                "ef_construction": 100
-            }
+    configuration = {
+        "hnsw": {
+            "space": "cosine",
+            "max_neighbors": 16,
+            "ef_construction": 100
         }
-    else:
-        configuration = {
-            "hnsw": {
-                "space": "cosine",
-                "max_neighbors": 2,
-                "ef_construction": 0
-            }
-        }
+    }
 
     emb_obj = EmbeddingWrapper(embed_fn)
     collection = client.create_collection("bench", embedding_function=emb_obj, configuration=configuration)
@@ -317,191 +313,96 @@ def cleanup_chroma(client, db_path: str):
         shutil.rmtree(db_path)
 
 
-def benchmark_chroma(collection, texts: List[str], embed_fn: Callable) -> float:
+def benchmark_chroma(collection, texts: List[str], embed_fn: Callable):
     """Benchmark ChromaDB with external embeddings."""
-    start = time.perf_counter()
-
     embeddings = embed_fn(texts)
-
     collection.add(
         ids=[f"id_{j}" for j in range(len(texts))],
         embeddings=embeddings,
         documents=texts
     )
 
-    elapsed = time.perf_counter() - start
-    return elapsed
-
 
 # =============================================================================
 # Qdrant Functions
 # =============================================================================
 
-def create_qdrant_client(use_index: bool = True):
-    """Create a fresh Qdrant client."""
-    client = QdrantClient(url=QDRANT_URL)
-
+def setup_qdrant(client, texts: List[str], embed_fn: Callable, deferred: bool):
+    """Initialize Qdrant and ingest data."""
     if client.collection_exists("bench"):
         client.delete_collection("bench")
 
-    # Configure HNSW index parameters
-    if use_index:
-        hnsw_config = models.HnswConfigDiff(
-            m=16,
-            ef_construct=100,
-        )
-        optimizers_config = models.OptimizersConfigDiff(
-            indexing_threshold=0,
-        )
-    else:
-        # Deactivate HNSW index
-        hnsw_config = models.HnswConfigDiff(
-            m=0,
-        )
-        optimizers_config = models.OptimizersConfigDiff(
-            indexing_threshold=20000,
-        )
-
+    hnsw_config = models.HnswConfigDiff(m=16, ef_construct=100)
     client.create_collection(
         collection_name="bench",
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE, hnsw_config=hnsw_config),
-        optimizers_config=optimizers_config
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE, hnsw_config=hnsw_config)
     )
 
-    return client
+    if deferred:
+        client.update_collection("bench", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
+
+    embeddings = embed_fn(texts)
+    points = [PointStruct(id=j, vector=embeddings[j], payload={"text": texts[j]}) for j in range(len(texts))]
+
+    client.upsert(collection_name="bench", points=points, wait=True)
+
+    if deferred:
+        client.update_collection("bench", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
 
 
 def cleanup_qdrant(client):
-    """Clean up Qdrant client and files."""
+    """Clean up Qdrant client."""
     if client.collection_exists("bench"):
         client.delete_collection(collection_name="bench")
-
     client.close()
     time.sleep(0.1)
-
-
-def benchmark_qdrant(client, texts: List[str], embed_fn: Callable) -> float:
-    """Benchmark Qdrant with external embeddings."""
-    start = time.perf_counter()
-
-    embeddings = embed_fn(texts)
-
-    points = [
-        PointStruct(
-            id=j,
-            vector=embeddings[j],
-            payload={"text": texts[j]}
-        )
-        for j in range(len(texts))
-    ]
-
-    client.upsert(
-        collection_name="bench",
-        points=points,
-        wait=True
-    )
-
-    elapsed = time.perf_counter() - start
-    return elapsed
 
 
 # =============================================================================
 # Benchmark Runner Functions
 # =============================================================================
 
-def run_benchmark_iteration(py_pid: int, pg_pid: int, truncate_fn: Callable,
-                            benchmark_fn: Callable) -> BenchmarkResult:
-    """Run a single benchmark iteration with resource monitoring."""
-    truncate_fn()
-    elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid, benchmark_fn)
-    return BenchmarkResult(time_s=elapsed, stats=stats)
-
-
-def run_multiple_iterations(py_pid: int, pg_pid: int, truncate_fn: Callable,
-                            benchmark_fn: Callable, runs: int) -> List[BenchmarkResult]:
-    """Run multiple benchmark iterations."""
+def run_pg_method(texts: List[str], provider: str, strategy: str, runs: int) -> List[BenchmarkResult]:
+    """Run PG benchmark."""
+    py_pid = os.getpid()
     results = []
     for _ in range(runs):
-        result = run_benchmark_iteration(py_pid, pg_pid, truncate_fn, benchmark_fn)
-        results.append(result)
+        conn, pg_pid = connect_and_get_pid()
+        fn = setup_pg_indexed if strategy == "indexed" else setup_pg_deferred
+        elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, texts, provider))
+        results.append(BenchmarkResult(time_s=elapsed, stats=stats))
+        conn.close()
     return results
 
 
-def run_pg_method(texts: List[str], provider: str, runs: int) -> List[BenchmarkResult]:
-    """Run PG benchmark with fresh connection, warmup, then timed runs."""
-    conn, pg_pid = connect_and_get_pid()
+def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient, runs: int) -> List[BenchmarkResult]:
+    """Run ChromaDB benchmark."""
     py_pid = os.getpid()
-
-    try:
-        warmup_texts = get_review_texts(8, shuffle=False)
-        truncate_pg_table(conn)
-        benchmark_pg_internal(conn, warmup_texts, provider, EMBED_ANYTHING_MODEL)
-
-        results = run_multiple_iterations(
-            py_pid,
-            pg_pid,
-            lambda: truncate_pg_table(conn),
-            lambda: benchmark_pg_internal(conn, texts, provider, EMBED_ANYTHING_MODEL),
-            runs
-        )
-        return results
-    finally:
-        conn.close()
-
-
-def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
-                      runs: int, use_index: bool = True) -> List[BenchmarkResult]:
-    """Run ChromaDB benchmark with fresh client, warmup, then timed runs."""
-    py_pid = os.getpid()
-
-    client, collection, db_path = create_chroma_client(use_index=use_index, embed_fn=embed_client.embed)
-    try:
-        warmup_texts = get_review_texts(8, shuffle=False)
-        benchmark_chroma(collection, warmup_texts, embed_client.embed)
-    finally:
-        cleanup_chroma(client, db_path)
-
     results = []
     for _ in range(runs):
-        client, collection, db_path = create_chroma_client(use_index=use_index, embed_fn=embed_client.embed)
+        client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
         try:
-            elapsed, stats = ResourceMonitor.measure(
-                py_pid,
-                None,
-                lambda: benchmark_chroma(collection, texts, embed_client.embed)
-            )
+            elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                                                     lambda: benchmark_chroma(collection, texts, embed_client.embed))
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
         finally:
             cleanup_chroma(client, db_path)
-
     return results
 
 
-def run_qdrant_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
-                      runs: int, use_index: bool = True) -> List[BenchmarkResult]:
-    """Run Qdrant benchmark with fresh client, warmup, then timed runs."""
+def run_qdrant_method(texts: List[str], embed_client: EmbedAnythingDirectClient, runs: int, deferred: bool) -> List[
+    BenchmarkResult]:
+    """Run Qdrant benchmark."""
     py_pid = os.getpid()
-
-    client = create_qdrant_client(use_index=use_index)
-    try:
-        warmup_texts = get_review_texts(8, shuffle=False)
-        benchmark_qdrant(client, warmup_texts, embed_client.embed)
-    finally:
-        cleanup_qdrant(client)
-
     results = []
     for _ in range(runs):
-        client = create_qdrant_client(use_index=use_index)
+        client = QdrantClient(url=QDRANT_URL)
         try:
-            elapsed, stats = ResourceMonitor.measure(
-                py_pid,
-                None,
-                lambda: benchmark_qdrant(client, texts, embed_client.embed)
-            )
+            elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                                                     lambda: setup_qdrant(client, texts, embed_client.embed, deferred))
             results.append(BenchmarkResult(time_s=elapsed, stats=stats))
         finally:
             cleanup_qdrant(client)
-
     return results
 
 
@@ -510,9 +411,8 @@ def run_qdrant_method(texts: List[str], embed_client: EmbedAnythingDirectClient,
 # =============================================================================
 
 def print_header():
-    """Print benchmark results header with QD (Qdrant) columns."""
+    """Print detailed benchmark results header."""
     lbl_w, time_w, col_w, med_w = 12, 14, 13, 7
-
     print("\nBenchmark Results:", flush=True)
     header = (
             "  " +
@@ -528,70 +428,47 @@ def print_header():
 
 def print_result(label: str, results: List[BenchmarkResult]):
     times = [r.time_s for r in results]
-
-    py_deltas = [r.stats.py_delta_mb for r in results]
-    py_peaks = [r.stats.py_peak_mb for r in results]
+    py_deltas = [r.stats.py_delta_mb for r in results];
+    py_peaks = [r.stats.py_peak_mb for r in results];
     py_cpus = [r.stats.py_cpu for r in results]
-
-    pg_deltas = [r.stats.pg_delta_mb for r in results]
-    pg_peaks = [r.stats.pg_peak_mb for r in results]
+    pg_deltas = [r.stats.pg_delta_mb for r in results];
+    pg_peaks = [r.stats.pg_peak_mb for r in results];
     pg_cpus = [r.stats.pg_cpu for r in results]
-
-    qd_deltas = [r.stats.qd_delta_mb for r in results]
-    qd_peaks = [r.stats.qd_peak_mb for r in results]
+    qd_deltas = [r.stats.qd_delta_mb for r in results];
+    qd_peaks = [r.stats.qd_peak_mb for r in results];
     qd_cpus = [r.stats.qd_cpu for r in results]
-
-    sys_mems = [r.stats.sys_mem_mb for r in results]
+    sys_mems = [r.stats.sys_mem_mb for r in results];
     sys_cpus = [r.stats.sys_cpu for r in results]
 
-    def fmt(vals, p=1):
-        return f"{mean(vals):.{p}f}±{safe_stdev(vals):.{p}f}"
+    def fmt(vals, p=1): return f"{mean(vals):.{p}f}±{safe_stdev(vals):.{p}f}"
 
-    def fmt_med(vals, p=1):
-        return f"{median(vals):.{p}f}±{calc_iqr(vals):.{p}f}"
+    def fmt_med(vals, p=1): return f"{median(vals):.{p}f}±{calc_iqr(vals):.{p}f}"
 
-    # Mean row
-    row_fmt = (
-        "  {label:<12}{med:>7} | {time:>14} | "
-        "{pyd:>13} | {pyp:>13} | {pyc:>13} | "
-        "{pgd:>13} | {pgp:>13} | {pgc:>13} | "
-        "{qdd:>13} | {qdp:>13} | {qdc:>13} | "
-        "{sysm:>13} | {sysc:>13}"
-    )
-
-    print(row_fmt.format(
-        label=label, med='',
-        time=fmt(times, 3),
-        pyd=fmt(py_deltas), pyp=fmt(py_peaks), pyc=fmt(py_cpus),
-        pgd=fmt(pg_deltas), pgp=fmt(pg_peaks), pgc=fmt(pg_cpus),
-        qdd=fmt(qd_deltas), qdp=fmt(qd_peaks), qdc=fmt(qd_cpus),
-        sysm=fmt(sys_mems, 0), sysc=fmt(sys_cpus)
-    ), flush=True)
-
-    # Median row
-    print(row_fmt.format(
-        label=label, med=' (med)',
-        time=fmt_med(times, 3),
-        pyd=fmt_med(py_deltas), pyp=fmt_med(py_peaks), pyc=fmt_med(py_cpus),
-        pgd=fmt_med(pg_deltas), pgp=fmt_med(pg_peaks), pgc=fmt_med(pg_cpus),
-        qdd=fmt_med(qd_deltas), qdp=fmt_med(qd_peaks), qdc=fmt_med(qd_cpus),
-        sysm=fmt_med(sys_mems, 0), sysc=fmt_med(sys_cpus)
-    ), flush=True)
+    row_fmt = "  {label:<12}{med:>7} | {time:>14} | {pyd:>13} | {pyp:>13} | {pyc:>13} | {pgd:>13} | {pgp:>13} | {pgc:>13} | {qdd:>13} | {qdp:>13} | {qdc:>13} | {sysm:>13} | {sysc:>13}"
+    print(
+        row_fmt.format(label=label, med='', time=fmt(times, 3), pyd=fmt(py_deltas), pyp=fmt(py_peaks), pyc=fmt(py_cpus),
+                       pgd=fmt(pg_deltas), pgp=fmt(pg_peaks), pgc=fmt(pg_cpus), qdd=fmt(qd_deltas), qdp=fmt(qd_peaks),
+                       qdc=fmt(qd_cpus), sysm=fmt(sys_mems, 0), sysc=fmt(sys_cpus)), flush=True)
+    print(
+        row_fmt.format(label=label, med=' (med)', time=fmt_med(times, 3), pyd=fmt_med(py_deltas), pyp=fmt_med(py_peaks),
+                       pyc=fmt_med(py_cpus), pgd=fmt_med(pg_deltas), pgp=fmt_med(pg_peaks), pgc=fmt_med(pg_cpus),
+                       qdd=fmt_med(qd_deltas), qdp=fmt_med(qd_peaks), qdc=fmt_med(qd_cpus), sysm=fmt_med(sys_mems, 0),
+                       sysc=fmt_med(sys_cpus)), flush=True)
 
 
 def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
     """Compute mean/std and median/IQR for all metrics from benchmark results."""
     times = [r.time_s for r in results]
-    py_cpu = [r.stats.py_cpu for r in results]
-    py_delta = [r.stats.py_delta_mb for r in results]
+    py_cpu = [r.stats.py_cpu for r in results];
+    py_delta = [r.stats.py_delta_mb for r in results];
     py_peak = [r.stats.py_peak_mb for r in results]
-    pg_cpu = [r.stats.pg_cpu for r in results]
-    pg_delta = [r.stats.pg_delta_mb for r in results]
+    pg_cpu = [r.stats.pg_cpu for r in results];
+    pg_delta = [r.stats.pg_delta_mb for r in results];
     pg_peak = [r.stats.pg_peak_mb for r in results]
-    qd_cpu = [r.stats.qd_cpu for r in results]
-    qd_delta = [r.stats.qd_delta_mb for r in results]
+    qd_cpu = [r.stats.qd_cpu for r in results];
+    qd_delta = [r.stats.qd_delta_mb for r in results];
     qd_peak = [r.stats.qd_peak_mb for r in results]
-    sys_cpu = [r.stats.sys_cpu for r in results]
+    sys_cpu = [r.stats.sys_cpu for r in results];
     sys_mem = [r.stats.sys_mem_mb for r in results]
 
     return {
@@ -599,147 +476,60 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
         'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
         'throughput_median': size / median(times),
         'throughput_iqr': size / median(times) * calc_iqr(times) / median(times) if len(times) >= 4 else 0,
-        'time_s': mean(times),
-        'time_s_std': safe_stdev(times),
-        'time_s_median': median(times),
+        'time_s': mean(times), 'time_s_std': safe_stdev(times), 'time_s_median': median(times),
         'time_s_iqr': calc_iqr(times),
-        'py_cpu': mean(py_cpu),
-        'py_cpu_std': safe_stdev(py_cpu),
-        'py_cpu_median': median(py_cpu),
+        'py_cpu': mean(py_cpu), 'py_cpu_std': safe_stdev(py_cpu), 'py_cpu_median': median(py_cpu),
         'py_cpu_iqr': calc_iqr(py_cpu),
-        'py_mem_delta': mean(py_delta),
-        'py_mem_delta_std': safe_stdev(py_delta),
-        'py_mem_delta_median': median(py_delta),
-        'py_mem_delta_iqr': calc_iqr(py_delta),
-        'py_mem_peak': mean(py_peak),
-        'py_mem_peak_std': safe_stdev(py_peak),
-        'py_mem_peak_median': median(py_peak),
-        'py_mem_peak_iqr': calc_iqr(py_peak),
-        'pg_cpu': mean(pg_cpu),
-        'pg_cpu_std': safe_stdev(pg_cpu),
-        'pg_cpu_median': median(pg_cpu),
-        'pg_cpu_iqr': calc_iqr(pg_cpu),
-        'pg_mem_delta': mean(pg_delta),
-        'pg_mem_delta_std': safe_stdev(pg_delta),
-        'pg_mem_delta_median': median(pg_delta),
-        'pg_mem_delta_iqr': calc_iqr(pg_delta),
-        'pg_mem_peak': mean(pg_peak),
-        'pg_mem_peak_std': safe_stdev(pg_peak),
-        'pg_mem_peak_median': median(pg_peak),
-        'pg_mem_peak_iqr': calc_iqr(pg_peak),
-        'qd_cpu': mean(qd_cpu),
-        'qd_cpu_std': safe_stdev(qd_cpu),
-        'qd_cpu_median': median(qd_cpu),
-        'qd_cpu_iqr': calc_iqr(qd_cpu),
-        'qd_mem_delta': mean(qd_delta),
-        'qd_mem_delta_std': safe_stdev(qd_delta),
-        'qd_mem_delta_median': median(qd_delta),
-        'qd_mem_delta_iqr': calc_iqr(qd_delta),
-        'qd_mem_peak': mean(qd_peak),
-        'qd_mem_peak_std': safe_stdev(qd_peak),
-        'qd_mem_peak_median': median(qd_peak),
-        'qd_mem_peak_iqr': calc_iqr(qd_peak),
-        'sys_cpu': mean(sys_cpu),
-        'sys_cpu_std': safe_stdev(sys_cpu),
-        'sys_cpu_median': median(sys_cpu),
-        'sys_cpu_iqr': calc_iqr(sys_cpu),
+        'py_mem_delta': mean(py_delta), 'py_mem_peak': mean(py_peak), 'pg_cpu': mean(pg_cpu),
+        'pg_mem_delta': mean(pg_delta), 'pg_mem_peak': mean(pg_peak),
+        'qd_cpu': mean(qd_cpu), 'qd_mem_delta': mean(qd_delta), 'qd_mem_peak': mean(qd_peak), 'sys_cpu': mean(sys_cpu),
         'sys_mem': mean(sys_mem),
-        'sys_mem_std': safe_stdev(sys_mem),
-        'sys_mem_median': median(sys_mem),
-        'sys_mem_iqr': calc_iqr(sys_mem),
     }
 
 
-def run_benchmark(use_index: bool):
-    """Run the full benchmark with the specified index configuration."""
-    global OUTPUT_DIR
-
-    mode_name = "with_index" if use_index else "without_index"
-    OUTPUT_DIR = Path(__file__).parent / "output" / mode_name
-
-    print(f"\n{'=' * 105}")
-    print(f"BENCHMARK MODE: {'WITH INDEX' if use_index else 'WITHOUT INDEX'}")
-    print(f"Output directory: {OUTPUT_DIR}")
-    print(f"{'=' * 105}\n")
-
-    if use_index:
-        print("pgvector: HNSW index (m=16, ef_construction=100)")
-        print("ChromaDB: HNSW index (max_neighbors=16, ef_construction=100)")
-        print("Qdrant: HNSW index (m=16, ef_construct=100)")
-    else:
-        print("pgvector: No index")
-        print("ChromaDB: Minimal HNSW index (max_neighbors=2, ef_construction=0)")
-        print("Qdrant: HNSW index disabled (m=0)")
-    print()
-
-    conn, _ = connect_and_get_pid()
-    setup_pg_database(conn, use_index=use_index)
-    conn.close()
-
+def main():
+    print(f"\n{'=' * 105}\nBENCHMARK 2: PG GEMBED VS VECTOR DBS (INDEXED VS DEFERRED)\n{'=' * 105}\n")
     embed_client = EmbedAnythingDirectClient()
-
     print_header()
-
     all_results = []
 
     for size in TEST_SIZES:
         texts = get_review_texts(size, shuffle=False)
         print(f"Size: {size}", flush=True)
 
-        pg_local_results = run_pg_method(texts, "embed_anything", RUNS_PER_SIZE)
-        pg_grpc_results = run_pg_method(texts, "grpc", RUNS_PER_SIZE)
-        chroma_results = run_chroma_method(texts, embed_client, RUNS_PER_SIZE, use_index=use_index)
-        qdrant_results = run_qdrant_method(texts, embed_client, RUNS_PER_SIZE, use_index=use_index)
+        res_pg_local_idx = run_pg_method(texts, "embed_anything", "indexed", RUNS_PER_SIZE)
+        res_pg_local_def = run_pg_method(texts, "embed_anything", "deferred", RUNS_PER_SIZE)
+        res_pg_grpc_idx = run_pg_method(texts, "grpc", "indexed", RUNS_PER_SIZE)
+        res_pg_grpc_def = run_pg_method(texts, "grpc", "deferred", RUNS_PER_SIZE)
+        res_qd_idx = run_qdrant_method(texts, embed_client, RUNS_PER_SIZE, deferred=False)
+        res_qd_def = run_qdrant_method(texts, embed_client, RUNS_PER_SIZE, deferred=True)
+        res_ch = run_chroma_method(texts, embed_client, RUNS_PER_SIZE)
 
-        print_result("PG local", pg_local_results)
-        print_result("PG gRPC", pg_grpc_results)
-        print_result("Chroma", chroma_results)
-        print_result("Qdrant", qdrant_results)
+        print_result("PG Local Indexed", res_pg_local_idx)
+        print_result("PG Local Deferred", res_pg_local_def)
+        print_result("PG gRPC Indexed", res_pg_grpc_idx)
+        print_result("PG gRPC Deferred", res_pg_grpc_def)
+        print_result("QD Indexed", res_qd_idx)
+        print_result("QD Deferred", res_qd_def)
+        print_result("Chroma", res_ch)
         print()
 
         all_results.append({
             'size': size,
-            'pg_local': compute_metrics(size, pg_local_results),
-            'pg_grpc': compute_metrics(size, pg_grpc_results),
-            'chroma': compute_metrics(size, chroma_results),
-            'qdrant': compute_metrics(size, qdrant_results),
+            'pg_local_indexed': compute_metrics(size, res_pg_local_idx),
+            'pg_local_deferred': compute_metrics(size, res_pg_local_def),
+            'pg_grpc_indexed': compute_metrics(size, res_pg_grpc_idx),
+            'pg_grpc_deferred': compute_metrics(size, res_pg_grpc_def),
+            'qd_indexed': compute_metrics(size, res_qd_idx),
+            'qd_deferred': compute_metrics(size, res_qd_def),
+            'chroma': compute_metrics(size, res_ch),
         })
 
-    print("=" * 95)
-
-    avg_pg_local = mean([r['pg_local']['throughput'] for r in all_results])
-    avg_pg_grpc = mean([r['pg_grpc']['throughput'] for r in all_results])
-    avg_chroma = mean([r['chroma']['throughput'] for r in all_results])
-    avg_qdrant = mean([r['qdrant']['throughput'] for r in all_results])
-
-    print("\nAverage Throughput Across All Sizes (texts/sec):")
-    print(f"  PG local:    {avg_pg_local:.2f}")
-    print(f"  PG gRPC:     {avg_pg_grpc:.2f}")
-    print(f"  Chroma:      {avg_chroma:.2f}")
-    print(f"  Qdrant:      {avg_qdrant:.2f}")
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_local', 'pg_grpc', 'chroma', 'qdrant']
-
+    methods = ['pg_local_indexed', 'pg_local_deferred', 'pg_grpc_indexed', 'pg_grpc_deferred', 'qd_indexed',
+               'qd_deferred', 'chroma']
     save_results_csv(all_results, OUTPUT_DIR, timestamp, methods)
     generate_plots(all_results, OUTPUT_DIR, timestamp, methods)
-
-
-def main():
-    """Run benchmarks in both index modes."""
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--with-index":
-            run_benchmark(use_index=True)
-        elif sys.argv[1] == "--without-index":
-            run_benchmark(use_index=False)
-        else:
-            print(f"Unknown argument: {sys.argv[1]}")
-            print("Usage: python benchmark.py [--with-index | --without-index]")
-            print("       Without arguments, runs both modes.")
-            sys.exit(1)
-    else:
-        run_benchmark(use_index=True)
-        run_benchmark(use_index=False)
 
 
 if __name__ == "__main__":

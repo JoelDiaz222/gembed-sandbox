@@ -512,7 +512,7 @@ def scenario2_unified(conn) -> float:
                                                 'Uncategorized'
                                                             ) AS full_text
                                  FROM products p),
-                     embeddings AS (SELECT sentence_id, embedding
+                     embeddings AS (SELECT id, embedding
                                     FROM embed_texts_with_ids(
                                             'embed_anything',
                                             %s,
@@ -522,7 +522,7 @@ def scenario2_unified(conn) -> float:
                 UPDATE products p
                 SET embedding = e.embedding
                 FROM embeddings e
-                WHERE p.product_id = e.sentence_id;
+                WHERE p.product_id = e.id;
                 """, (EMBED_ANYTHING_MODEL,))
 
     conn.commit()
@@ -661,7 +661,7 @@ def scenario1_unified(conn, products: List[dict]) -> float:
                                                 'Uncategorized'
                                                             ) AS full_text
                                  FROM products p),
-                     embeddings AS (SELECT sentence_id, embedding
+                     embeddings AS (SELECT id, embedding
                                     FROM embed_texts_with_ids(
                                             'embed_anything',
                                             %s,
@@ -671,7 +671,7 @@ def scenario1_unified(conn, products: List[dict]) -> float:
                 UPDATE products p
                 SET embedding = e.embedding
                 FROM embeddings e
-                WHERE p.product_id = e.sentence_id;
+                WHERE p.product_id = e.id;
                 """, (EMBED_ANYTHING_MODEL,))
 
     conn.commit()
