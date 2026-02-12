@@ -305,13 +305,21 @@ def setup_pg_schema(conn):
                 CREATE EXTENSION IF NOT EXISTS pg_gembed;
 
                 DROP TABLE IF EXISTS faces;
+                DROP TABLE IF EXISTS persons;
+
+                CREATE TABLE persons
+                (
+                    id   SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE
+                );
+
                 CREATE TABLE faces
                 (
-                    id          SERIAL PRIMARY KEY,
-                    path        TEXT NOT NULL,
-                    person_name TEXT NOT NULL,
-                    image_data  BYTEA,
-                    embedding   vector(512)
+                    id         SERIAL PRIMARY KEY,
+                    person_id  INTEGER REFERENCES persons (id),
+                    path       TEXT NOT NULL,
+                    image_data BYTEA,
+                    embedding  vector(512)
                 );
                 ''')
     conn.commit()
@@ -320,7 +328,7 @@ def setup_pg_schema(conn):
 
 def truncate_pg_table(conn):
     cur = conn.cursor()
-    cur.execute("TRUNCATE faces RESTART IDENTITY")
+    cur.execute("TRUNCATE faces, persons RESTART IDENTITY")
     conn.commit()
     cur.close()
 
@@ -339,16 +347,26 @@ def s1_populate_pg(conn, image_paths):
         with open(p, "rb") as f:
             batch_images.append(f.read())
 
+    # Ensure persons exist
+    unique_names = list(set(batch_names))
+    execute_values(cur, "INSERT INTO persons (name) VALUES %s ON CONFLICT (name) DO NOTHING",
+                   [(n,) for n in unique_names])
+
     sql = '''
-          INSERT INTO faces (path, person_name, embedding)
-          SELECT t.p, t.n, t.e
+          INSERT INTO faces (path, person_id, embedding)
+          SELECT t.p, p.id, t.e
           FROM unnest(%s::text[],
                       %s::text[],
                       embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, e)
+                   JOIN persons p ON t.n = p.name
           '''
     cur.execute(sql, (image_paths, batch_names, MODEL_NAME, batch_images))
     conn.commit()
     cur.close()
+
+
+def s1_ingest_pg(conn, image_paths):
+    s1_populate_pg(conn, image_paths)
 
 
 def s1_ingest_pg_indexed(conn, image_paths):
@@ -413,13 +431,19 @@ def s2_populate_pg(conn, image_paths):
         with open(p, "rb") as f:
             batch_images.append(f.read())
 
+    # Ensure persons exist
+    unique_names = list(set(batch_names))
+    execute_values(cur, "INSERT INTO persons (name) VALUES %s ON CONFLICT (name) DO NOTHING",
+                   [(n,) for n in unique_names])
+
     sql = '''
-          INSERT INTO faces (path, person_name, image_data, embedding)
-          SELECT t.p, t.n, t.i, t.e
+          INSERT INTO faces (path, person_id, image_data, embedding)
+          SELECT t.p, p.id, t.i, t.e
           FROM unnest(%s::text[],
                       %s::text[],
                       %s::bytea[],
                       embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, i, e)
+                   JOIN persons p ON t.n = p.name
           '''
     cur.execute(sql, (image_paths, batch_names, batch_images, MODEL_NAME, batch_images))
     conn.commit()
@@ -449,10 +473,20 @@ def s2_ingest_dist_common(conn, image_paths):
         with open(p, "rb") as f:
             batch_images.append(f.read())
 
+    # Ensure persons exist
+    unique_names = list(set(batch_names))
+    execute_values(cur, "INSERT INTO persons (name) VALUES %s ON CONFLICT (name) DO NOTHING",
+                   [(n,) for n in unique_names])
+
+    # Get name to id mapping
+    cur.execute("SELECT name, id FROM persons WHERE name = ANY(%s)", (unique_names,))
+    name_to_id = dict(cur.fetchall())
+    person_ids = [name_to_id[n] for n in batch_names]
+
     execute_values(
         cur,
-        "INSERT INTO faces (path, person_name, image_data) VALUES %s RETURNING id",
-        list(zip(image_paths, batch_names, batch_images))
+        "INSERT INTO faces (path, person_id, image_data) VALUES %s RETURNING id",
+        list(zip(image_paths, person_ids, batch_images))
     )
     ids = [r[0] for r in cur.fetchall()]
     conn.commit()
@@ -478,9 +512,9 @@ def s2_ingest_qdrant(conn, client, image_paths, embed_client, deferred: bool = F
         PointStruct(
             id=pg_id,
             vector=emb,
-            payload={"path": p, "person_name": get_person_name(p), "pg_id": pg_id}
+            payload={"pg_id": pg_id}
         )
-        for pg_id, emb, p in zip(pg_ids, embeddings, image_paths)
+        for pg_id, emb in zip(pg_ids, embeddings)
     ]
     if points:
         client.upsert("faces", points, wait=True)
@@ -493,8 +527,7 @@ def s2_ingest_chroma(conn, collection, image_paths, embed_client):
     pg_ids = s2_ingest_dist_common(conn, image_paths)
     embeddings = embed_client.embed_files(image_paths)
     ids = [str(pg_id) for pg_id in pg_ids]
-    metas = [{"path": p, "person_name": get_person_name(p), "pg_id": pg_id}
-             for p, pg_id in zip(image_paths, pg_ids)]
+    metas = [{"pg_id": pg_id} for pg_id in pg_ids]
     if embeddings:
         collection.add(ids=ids, embeddings=embeddings, metadatas=metas)
 
