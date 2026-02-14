@@ -1,32 +1,24 @@
 import os
 import shutil
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from statistics import mean, stdev, quantiles
-from typing import Callable, List
+from statistics import mean, median
+from typing import List
 
 import chromadb
-import docker
 import embed_anything
-import psutil
-import psycopg2
-from embed_anything import EmbeddingModel, WhichModel
+from benchmark_utils import (
+    DB_CONFIG, QDRANT_URL, QDRANT_CONTAINER_NAME,
+    BenchmarkResult, ResourceMonitor,
+    safe_stdev, calc_iqr, compute_metrics,
+    connect_pg, get_pg_pid, connect_and_get_pid, warmup_pg_connection,
+)
+from embed_anything import EmbeddingModel
 from plot_utils import save_results_csv, generate_plots
 from psycopg2.extras import execute_values
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
-
-DB_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'dbname': 'joeldiaz',
-    'user': 'joeldiaz',
-}
-
-QDRANT_URL = "http://localhost:6333"
-QDRANT_CONTAINER_NAME = "qdrant"
 
 MODEL_NAME = "openai/clip-vit-base-patch32"
 
@@ -34,7 +26,7 @@ INGEST_PER_PERSON = 64
 QUERY_PER_PERSON = 16
 
 INGESTION_SET_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-SERVING_TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
+SERVING_TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 RUNS_INGESTION = 5
 RUNS_SERVING = 5
@@ -45,150 +37,16 @@ DATA_DIR = Path(__file__).parent.parent / "data" / "CUSTOMER_IMAGES"
 model_cache = {}
 
 
-@dataclass
-class ResourceStats:
-    py_delta_mb: float
-    py_peak_mb: float
-    py_cpu: float
-    pg_delta_mb: float
-    pg_peak_mb: float
-    pg_cpu: float
-    qd_delta_mb: float
-    qd_peak_mb: float
-    qd_cpu: float
-    sys_mem_mb: float
-    sys_cpu: float
-
-
-@dataclass
-class BenchmarkResult:
-    time_s: float
-    stats: ResourceStats
-
-
-def safe_stdev(values: List[float]) -> float:
-    return stdev(values) if len(values) > 1 else 0.0
-
-
-def calc_iqr(values: List[float]) -> float:
-    if len(values) < 4:
-        return 0.0
-    q = quantiles(values, n=4)
-    return q[2] - q[0]
-
-
-# =============================================================================
-# Resource Monitoring
-# =============================================================================
-
-class ResourceMonitor:
-    def __init__(self, py_pid: int, pg_pid: int = None, qd_name: str = QDRANT_CONTAINER_NAME):
-        self.py_process = psutil.Process(py_pid)
-        self.pg_process = psutil.Process(pg_pid) if pg_pid else None
-        self.docker_client = docker.from_env()
-        try:
-            self.container = self.docker_client.containers.get(qd_name)
-        except Exception:
-            self.container = None
-
-        self.py_baseline = self._get_py_mem()
-        self.pg_baseline = self._get_pg_mem()
-        self.qd_baseline_stats = self._get_qd_stats() if self.container else None
-
-        self.py_process.cpu_percent()
-        if self.pg_process: self.pg_process.cpu_percent()
-        time.sleep(0.1)
-
-    def _get_py_mem(self):
-        m = self.py_process.memory_full_info()
-        return m.uss if hasattr(m, 'uss') else m.rss
-
-    def _get_pg_mem(self):
-        if not self.pg_process: return 0
-        try:
-            return self.pg_process.memory_full_info().uss
-        except (psutil.AccessDenied, AttributeError):
-            try:
-                return self.pg_process.memory_info().rss
-            except:
-                return 0
-        except:
-            return 0
-
-    def _get_qd_stats(self):
-        return self.container.stats(stream=False)
-
-    def _calculate_qd_cpu(self, start_stats, end_stats):
-        try:
-            cpu_delta = end_stats['cpu_stats']['cpu_usage']['total_usage'] - start_stats['cpu_stats']['cpu_usage'][
-                'total_usage']
-            system_delta = end_stats['cpu_stats']['system_cpu_usage'] - start_stats['cpu_stats']['system_cpu_usage']
-
-            if system_delta > 0.0 and cpu_delta > 0.0:
-                cpus = end_stats['cpu_stats'].get('online_cpus', psutil.cpu_count())
-                return (cpu_delta / system_delta) * cpus * 100.0
-        except KeyError:
-            pass
-        return 0.0
-
-    @staticmethod
-    def measure(py_pid: int, pg_pid: int, func: Callable):
-        monitor = ResourceMonitor(py_pid, pg_pid)
-        start_time = time.perf_counter()
-        func()
-        elapsed = time.perf_counter() - start_time
-
-        py_peak = monitor._get_py_mem()
-        py_cpu = monitor.py_process.cpu_percent()
-        pg_peak = monitor._get_pg_mem()
-        pg_cpu = monitor.pg_process.cpu_percent() if monitor.pg_process else 0.0
-        qd_delta_mb = 0.0
-        qd_peak_mb = 0.0
-        qd_cpu = 0.0
-
-        if monitor.container:
-            end_qd_stats = monitor._get_qd_stats()
-            if 'usage' in end_qd_stats['memory_stats']:
-                qd_peak_raw = end_qd_stats['memory_stats']['usage']
-            else:
-                qd_peak_raw = end_qd_stats['memory_stats'].get('limit', 0)
-
-            qd_peak_mb = qd_peak_raw / (1024 * 1024)
-            baseline_raw = 0
-            if 'usage' in monitor.qd_baseline_stats['memory_stats']:
-                baseline_raw = monitor.qd_baseline_stats['memory_stats']['usage']
-
-            qd_delta_mb = qd_peak_mb - (baseline_raw / (1024 * 1024))
-            qd_cpu = monitor._calculate_qd_cpu(monitor.qd_baseline_stats, end_qd_stats)
-
-        sys_mem = psutil.virtual_memory()
-        sys_mem_mb = sys_mem.used / (1024 * 1024)
-        sys_cpu = psutil.cpu_percent()
-
-        stats = ResourceStats(
-            py_delta_mb=(py_peak - monitor.py_baseline) / 1e6,
-            py_peak_mb=py_peak / 1e6,
-            py_cpu=py_cpu,
-            pg_delta_mb=(pg_peak - monitor.pg_baseline) / 1e6,
-            pg_peak_mb=pg_peak / 1e6,
-            pg_cpu=pg_cpu,
-            qd_delta_mb=qd_delta_mb,
-            qd_peak_mb=qd_peak_mb,
-            qd_cpu=qd_cpu,
-            sys_mem_mb=sys_mem_mb,
-            sys_cpu=sys_cpu
-        )
-        return elapsed, stats
-
-
 # =============================================================================
 # Client & Helpers
 # =============================================================================
 
 class EmbedAnythingImageClient:
     def embed_files(self, paths: List[str]) -> List[List[float]]:
+        """Generate image embeddings."""
         model = self._get_model()
-        base_temp = Path("temp_bench_imgs_batch")
+        
+        base_temp = Path(f"temp_bench_imgs")
         if base_temp.exists():
             shutil.rmtree(base_temp)
         base_temp.mkdir()
@@ -201,51 +59,22 @@ class EmbedAnythingImageClient:
 
             res = embed_anything.embed_image_directory(str(base_temp), embedder=model)
 
-            embeddings = []
+            all_embeddings = []
             if isinstance(res, list):
                 for item in res:
                     if hasattr(item, 'embedding'):
-                        embeddings.append(item.embedding)
-            return embeddings
-
+                        all_embeddings.append(item.embedding)
         finally:
             if base_temp.exists():
                 shutil.rmtree(base_temp)
+
+        return all_embeddings
 
     @staticmethod
     def _get_model():
         if MODEL_NAME not in model_cache:
             model_cache[MODEL_NAME] = EmbeddingModel.from_pretrained_hf(MODEL_NAME)
         return model_cache[MODEL_NAME]
-
-
-def connect_and_get_pid():
-    conn = psycopg2.connect(**DB_CONFIG)
-    conn.autocommit = False
-    cur = conn.cursor()
-    cur.execute("SELECT pg_backend_pid();")
-    pid = cur.fetchone()[0]
-    cur.close()
-    conn.commit()
-    return conn, pid
-
-
-def connect_pg():
-    conn = psycopg2.connect(**DB_CONFIG)
-    conn.autocommit = False
-    return conn
-
-
-def get_pg_pid(conn):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT pg_backend_pid();")
-        pid = cur.fetchone()[0]
-        cur.close()
-        return pid
-    except:
-        return None
-
 
 def create_chroma_client(base_path: str = "./chroma_bench_uc9"):
     db_path = f"{base_path}_{time.time_ns()}"
@@ -341,6 +170,7 @@ def truncate_pg_table(conn):
 
 def s1_populate_pg(conn, image_paths):
     cur = conn.cursor()
+
     batch_names = [get_person_name(p) for p in image_paths]
     batch_images = []
     for p in image_paths:
@@ -361,6 +191,7 @@ def s1_populate_pg(conn, image_paths):
                    JOIN persons p ON t.n = p.name
           '''
     cur.execute(sql, (image_paths, batch_names, MODEL_NAME, batch_images))
+
     conn.commit()
     cur.close()
 
@@ -425,6 +256,7 @@ def s1_ingest_chroma(collection, image_paths, embed_client):
 
 def s2_populate_pg(conn, image_paths):
     cur = conn.cursor()
+
     batch_names = [get_person_name(p) for p in image_paths]
     batch_images = []
     for p in image_paths:
@@ -446,6 +278,7 @@ def s2_populate_pg(conn, image_paths):
                    JOIN persons p ON t.n = p.name
           '''
     cur.execute(sql, (image_paths, batch_names, batch_images, MODEL_NAME, batch_images))
+
     conn.commit()
     cur.close()
 
@@ -467,6 +300,7 @@ def s2_ingest_pg_deferred(conn, image_paths):
 
 def s2_ingest_dist_common(conn, image_paths):
     cur = conn.cursor()
+    
     batch_names = [get_person_name(p) for p in image_paths]
     batch_images = []
     for p in image_paths:
@@ -483,15 +317,17 @@ def s2_ingest_dist_common(conn, image_paths):
     name_to_id = dict(cur.fetchall())
     person_ids = [name_to_id[n] for n in batch_names]
 
-    execute_values(
+    results = execute_values(
         cur,
         "INSERT INTO faces (path, person_id, image_data) VALUES %s RETURNING id",
-        list(zip(image_paths, person_ids, batch_images))
+        list(zip(image_paths, person_ids, batch_images)),
+        fetch=True
     )
-    ids = [r[0] for r in cur.fetchall()]
+    all_ids = [r[0] for r in results]
+        
     conn.commit()
     cur.close()
-    return ids
+    return all_ids
 
 
 def s2_ingest_qdrant(conn, client, image_paths, embed_client, deferred: bool = False):
@@ -538,8 +374,9 @@ TOP_K = 5
 
 
 def serve_s1_pg(conn, query_paths):
-    images_data = [open(p, "rb").read() for p in query_paths]
     cur = conn.cursor()
+
+    images_data = [open(p, "rb").read() for p in query_paths]
     sql = '''
           WITH queries AS (SELECT i.ord, i.embedding
                            FROM unnest(embed_images('embed_anything', %s, %s::bytea[]))
@@ -556,6 +393,7 @@ def serve_s1_pg(conn, query_paths):
           '''
     cur.execute(sql, (MODEL_NAME, images_data, TOP_K))
     _ = cur.fetchall()
+
     conn.commit()
     cur.close()
 
@@ -577,8 +415,9 @@ def serve_s1_chroma(collection, embed_client, query_paths):
 
 
 def serve_s2_pg(conn, query_paths):
-    images_data = [open(p, "rb").read() for p in query_paths]
     cur = conn.cursor()
+    
+    images_data = [open(p, "rb").read() for p in query_paths]
     sql = '''
           WITH queries AS (SELECT i.ord, i.embedding
                            FROM unnest(embed_images('embed_anything', %s, %s::bytea[]))
@@ -595,8 +434,6 @@ def serve_s2_pg(conn, query_paths):
           '''
     cur.execute(sql, (MODEL_NAME, images_data, TOP_K))
     _ = cur.fetchall()
-    conn.commit()
-    cur.close()
 
 
 def serve_s2_qdrant(client, conn, embed_client, query_paths):
@@ -605,11 +442,12 @@ def serve_s2_qdrant(client, conn, embed_client, query_paths):
         models.QueryRequest(query=emb, limit=TOP_K, with_payload=True)
         for emb in embeddings
     ]
-    if not requests: return
+    if not requests:
+        return
     results = client.query_batch_points(collection_name="faces", requests=requests)
     all_pg_ids = []
-    for batch in results:
-        for point in batch.points:
+    for batch_res in results:
+        for point in batch_res.points:
             pid = point.payload.get('pg_id')
             if pid is not None:
                 all_pg_ids.append(pid)
@@ -624,7 +462,8 @@ def serve_s2_qdrant(client, conn, embed_client, query_paths):
 
 def serve_s2_chroma(collection, conn, embed_client, query_paths):
     embeddings = embed_client.embed_files(query_paths)
-    if not embeddings: return
+    if not embeddings:
+        return
     results = collection.query(query_embeddings=embeddings, n_results=TOP_K)
     all_pg_ids = []
     if results.get('metadatas'):
@@ -641,39 +480,9 @@ def serve_s2_chroma(collection, conn, embed_client, query_paths):
         cur.close()
         conn.commit()
 
-
 # =============================================================================
 # Reporting
 # =============================================================================
-
-def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
-    times = [r.time_s for r in results]
-    py_cpu = [r.stats.py_cpu for r in results]
-    py_delta = [r.stats.py_delta_mb for r in results]
-    py_peak = [r.stats.py_peak_mb for r in results]
-    pg_cpu = [r.stats.pg_cpu for r in results]
-    pg_delta = [r.stats.pg_delta_mb for r in results]
-    pg_peak = [r.stats.pg_peak_mb for r in results]
-    qd_cpu = [r.stats.qd_cpu for r in results]
-    qd_delta = [r.stats.qd_delta_mb for r in results]
-    qd_peak = [r.stats.qd_peak_mb for r in results]
-    sys_cpu = [r.stats.sys_cpu for r in results]
-    sys_mem = [r.stats.sys_mem_mb for r in results]
-
-    return {
-        'throughput': size / mean(times),
-        'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
-        'time_s': mean(times),
-        'py_cpu': mean(py_cpu),
-        'py_mem_peak': mean(py_peak),
-        'pg_cpu': mean(pg_cpu),
-        'pg_mem_peak': mean(pg_peak),
-        'qd_cpu': mean(qd_cpu),
-        'qd_mem_peak': mean(qd_peak),
-        'sys_cpu': mean(sys_cpu),
-        'sys_mem': mean(sys_mem),
-    }
-
 
 def print_detailed_header():
     """Print detailed benchmark results header."""
@@ -739,6 +548,55 @@ def main():
         ing_results = []
         final_chroma_path = None
 
+        # Warm-up Ingestion
+        print(f"Warming up ingestion for Scenario {scenario_idx}...")
+        warmup_paths = get_image_paths(1, 2)
+        if not warmup_paths:
+             print("Warning: No images found for warmup.")
+        else:
+             # PG Warmup
+             conn = connect_pg()
+             fn = s1_ingest_pg_indexed if scenario_idx == 1 else s2_ingest_pg_indexed
+             setup_pg_schema(conn)
+             fn(conn, warmup_paths)
+             truncate_pg_table(conn)
+             conn.close()
+             
+             conn = connect_pg()
+             fn = s1_ingest_pg_deferred if scenario_idx == 1 else s2_ingest_pg_deferred
+             setup_pg_schema(conn)
+             fn(conn, warmup_paths)
+             truncate_pg_table(conn)
+             conn.close()
+
+             # Qdrant Warmup
+             qd_client = create_qdrant_client()
+             if scenario_idx == 1:
+                  s1_ingest_qdrant(qd_client, warmup_paths, embed_client, deferred=False)
+                  s1_ingest_qdrant(qd_client, warmup_paths, embed_client, deferred=True)
+             else:
+                  pg_tmp = connect_pg()
+                  setup_pg_schema(pg_tmp)
+                  s2_ingest_qdrant(pg_tmp, qd_client, warmup_paths, embed_client, deferred=False)
+                  s2_ingest_qdrant(pg_tmp, qd_client, warmup_paths, embed_client, deferred=True)
+                  pg_tmp.close()
+             if qd_client.collection_exists("faces"):
+                  qd_client.delete_collection("faces")
+             qd_client.close()
+             
+             # Chroma Warmup
+             c_client, c_path = create_chroma_client()
+             col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
+             if scenario_idx == 1:
+                  s1_ingest_chroma(col, warmup_paths, embed_client)
+             else:
+                  pg_tmp = connect_pg()
+                  setup_pg_schema(pg_tmp)
+                  s2_ingest_chroma(pg_tmp, col, warmup_paths, embed_client)
+                  pg_tmp.close()
+             cleanup_chroma(c_client, c_path)
+
+
         for size in INGESTION_SET_SIZES:
             print(f"Ingestion Size: {size}")
             n_people = max(1, size // INGEST_PER_PERSON)
@@ -746,59 +604,71 @@ def main():
             paths = get_image_paths(n_people, imgs_per)
             res_pg_idx, res_pg_def, res_qd_idx, res_qd_def, res_ch = [], [], [], [], []
 
+            # Reuse connections for the entire size group to leverage session caching
+            conn_idx, pid_idx = connect_and_get_pid()
+            warmup_pg_connection(conn_idx)
+            conn_def, pid_def = connect_and_get_pid()
+            warmup_pg_connection(conn_def)
+            
+            conn_dist = None
+            pid_dist = None
+            if scenario_idx == 2:
+                conn_dist, pid_dist = connect_and_get_pid()
+                warmup_pg_connection(conn_dist)
+            
+            # Clear Python model cache for this size group
+            model_cache.clear()
+
             for run in range(RUNS_INGESTION):
                 is_last_run = (run == RUNS_INGESTION - 1) and (size == INGESTION_SET_SIZES[-1])
 
                 # PG Indexed
-                conn, pg_pid = connect_and_get_pid()
-                setup_pg_schema(conn)
-                truncate_pg_table(conn)
+                setup_pg_schema(conn_idx)
+                truncate_pg_table(conn_idx)
                 fn = s1_ingest_pg_indexed if scenario_idx == 1 else s2_ingest_pg_indexed
-                elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, paths))
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, pid_idx, lambda: fn(conn_idx, paths))
                 res_pg_idx.append(BenchmarkResult(elapsed, stats))
-                conn.close()
 
                 # PG Deferred
-                conn, pg_pid = connect_and_get_pid()
-                setup_pg_schema(conn)
-                truncate_pg_table(conn)
+                setup_pg_schema(conn_def)
+                truncate_pg_table(conn_def)
                 fn = s1_ingest_pg_deferred if scenario_idx == 1 else s2_ingest_pg_deferred
-                elapsed, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, paths))
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, pid_def, lambda: fn(conn_def, paths))
                 res_pg_def.append(BenchmarkResult(elapsed, stats))
-                if not is_last_run:
-                    conn.close()
-                else:
-                    pg_persistent_conn = conn
+                if is_last_run:
+                    pg_persistent_conn = conn_def
+                    # We don't close conn_def if it's the last run of the last size, 
+                    # as it's needed for the serving phase.
 
                 # Qdrant Indexed
                 qd_client = create_qdrant_client()
                 if scenario_idx == 1:
-                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                              lambda: s1_ingest_qdrant(qd_client, paths, embed_client,
-                                                                                      deferred=False))
+                                                                                      deferred=False),
+                                                             container_name=QDRANT_CONTAINER_NAME)
                 else:
-                    pg_tmp = connect_pg();
-                    setup_pg_schema(pg_tmp)
-                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
-                                                             lambda: s2_ingest_qdrant(pg_tmp, qd_client, paths,
-                                                                                      embed_client, deferred=False))
-                    pg_tmp.close()
+                    setup_pg_schema(conn_dist)
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, pid_dist,
+                                                             lambda: s2_ingest_qdrant(conn_dist, qd_client, paths,
+                                                                                      embed_client, deferred=False),
+                                                             container_name=QDRANT_CONTAINER_NAME)
                 res_qd_idx.append(BenchmarkResult(elapsed, stats))
                 qd_client.close()
 
                 # Qdrant Deferred
                 qd_client = create_qdrant_client()
                 if scenario_idx == 1:
-                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                              lambda: s1_ingest_qdrant(qd_client, paths, embed_client,
-                                                                                      deferred=True))
+                                                                                      deferred=True),
+                                                             container_name=QDRANT_CONTAINER_NAME)
                 else:
-                    pg_tmp = connect_pg();
-                    setup_pg_schema(pg_tmp)
-                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
-                                                             lambda: s2_ingest_qdrant(pg_tmp, qd_client, paths,
-                                                                                      embed_client, deferred=True))
-                    pg_tmp.close()
+                    setup_pg_schema(conn_dist)
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, pid_dist,
+                                                             lambda: s2_ingest_qdrant(conn_dist, qd_client, paths,
+                                                                                      embed_client, deferred=True),
+                                                             container_name=QDRANT_CONTAINER_NAME)
                 res_qd_def.append(BenchmarkResult(elapsed, stats))
                 if not is_last_run:
                     qd_client.close()
@@ -809,20 +679,27 @@ def main():
                 c_client, c_path = create_chroma_client()
                 col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
                 if scenario_idx == 1:
-                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                              lambda: s1_ingest_chroma(col, paths, embed_client))
                 else:
-                    pg_tmp = connect_pg();
-                    setup_pg_schema(pg_tmp)
-                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
-                                                             lambda: s2_ingest_chroma(pg_tmp, col, paths, embed_client))
-                    pg_tmp.close()
+                    setup_pg_schema(conn_dist)
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, pid_dist,
+                                                             lambda: s2_ingest_chroma(conn_dist, col, paths, embed_client))
                 res_ch.append(BenchmarkResult(elapsed, stats))
                 if is_last_run:
                     final_chroma_path = c_path;
                     del c_client
                 else:
                     cleanup_chroma(c_client, c_path)
+
+            # Close indexed connection after runs for this size
+            conn_idx.close()
+            # Close deferred connection ONLY IF it's not needed for the serving phase
+            if size != INGESTION_SET_SIZES[-1]:
+                conn_def.close()
+            
+            if conn_dist:
+                conn_dist.close()
 
             print_detailed_header()
             print_result("PG Indexed", res_pg_idx);
@@ -847,8 +724,37 @@ def main():
         c_persistent_client = chromadb.PersistentClient(path=final_chroma_path)
         c_persistent_col = c_persistent_client.get_collection("faces")
 
+        # Warm-up Serving
+        print(f"Warming up serving for Scenario {scenario_idx}...")
+        warmup_queries = get_image_paths(1, 2, offset=INGEST_PER_PERSON)
+        if not warmup_queries:
+             print("Warning: No query images found for warmup.")
+        else:
+             # PG Serving Warmup
+             serve_fn = serve_s1_pg if scenario_idx == 1 else serve_s2_pg
+             serve_fn(pg_persistent_conn, warmup_queries)
+             
+             # Qdrant Serving Warmup
+             if scenario_idx == 1:
+                  serve_s1_qdrant(qd_persistent_client, embed_client, warmup_queries)
+             else:
+                  pg_tmp = connect_pg()
+                  serve_s2_qdrant(qd_persistent_client, pg_tmp, embed_client, warmup_queries)
+                  pg_tmp.close()
+             
+             # Chroma Serving Warmup
+             if scenario_idx == 1:
+                  serve_s1_chroma(c_persistent_col, embed_client, warmup_queries)
+             else:
+                  pg_tmp = connect_pg()
+                  serve_s2_chroma(c_persistent_col, pg_tmp, embed_client, warmup_queries)
+                  pg_tmp.close()
+
         for size in SERVING_TEST_SIZES:
             print(f"Query Batch Size: {size}")
+            # Clear Python model cache for each serving size group
+            model_cache.clear()
+            
             n_people_max = INGESTION_SET_SIZES[-1] // INGEST_PER_PERSON
             n_people = max(1, size // QUERY_PER_PERSON);
             imgs_per = QUERY_PER_PERSON if size >= QUERY_PER_PERSON else size
@@ -859,31 +765,35 @@ def main():
             for _ in range(RUNS_SERVING):
                 # PG (uses PG Deferred persistent data)
                 serve_fn = serve_s1_pg if scenario_idx == 1 else serve_s2_pg
-                elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_persistent_conn),
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_persistent_conn),
                                                          lambda: serve_fn(pg_persistent_conn, queries))
                 m_pg.append(BenchmarkResult(elapsed, stats))
 
                 # Qdrant (uses QD Deferred persistent data)
                 if scenario_idx == 1:
-                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                              lambda: serve_s1_qdrant(qd_persistent_client, embed_client,
-                                                                                     queries))
+                                                                                     queries),
+                                                             container_name=QDRANT_CONTAINER_NAME)
                 else:
                     pg_tmp = connect_pg()
-                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
+                    warmup_pg_connection(pg_tmp)
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
                                                              lambda: serve_s2_qdrant(qd_persistent_client, pg_tmp,
-                                                                                     embed_client, queries))
+                                                                                     embed_client, queries),
+                                                             container_name=QDRANT_CONTAINER_NAME)
                     pg_tmp.close()
                 m_qd.append(BenchmarkResult(elapsed, stats))
 
                 # Chroma
                 if scenario_idx == 1:
-                    elapsed, stats = ResourceMonitor.measure(py_pid, None,
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                              lambda: serve_s1_chroma(c_persistent_col, embed_client,
                                                                                      queries))
                 else:
                     pg_tmp = connect_pg()
-                    elapsed, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
+                    warmup_pg_connection(pg_tmp)
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, get_pg_pid(pg_tmp),
                                                              lambda: serve_s2_chroma(c_persistent_col, pg_tmp,
                                                                                      embed_client, queries))
                     pg_tmp.close()
