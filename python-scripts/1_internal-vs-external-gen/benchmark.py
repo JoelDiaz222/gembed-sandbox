@@ -21,7 +21,7 @@ from psycopg2.extras import execute_values
 
 # Configuration
 TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-RUNS_PER_SIZE = 5
+RUNS_PER_SIZE = 15
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -34,7 +34,14 @@ class EmbedAnythingGrpcClient:
     """gRPC client for EmbedAnything server."""
 
     def __init__(self, address: str = "localhost:50051"):
-        self.channel = grpc.insecure_channel(address)
+        UNLIMITED = -1
+        options = [
+            ("grpc.max_send_message_length", UNLIMITED),
+            ("grpc.max_receive_message_length", UNLIMITED),
+        ]
+
+        # When creating the channel
+        self.channel = grpc.insecure_channel(address, options=options)
         self.stub = pb2_grpc.EmbedStub(self.channel)
 
     def embed(self, texts: List[str]) -> List[List[float]]:
@@ -186,6 +193,30 @@ def run_method_with_fresh_connection(texts: List[str], benchmark_fn: Callable,
         conn.close()
 
 
+def setup_method_connection(texts: List[str], benchmark_fn: Callable):
+    """Create and warmup a connection for a method, returning connection and PIDs."""
+    conn, pg_pid = connect_and_get_pid()
+    py_pid = os.getpid()
+
+    # Warm up this specific connection
+    warmup_pg_connection(conn)
+
+    # Method-specific warm-up with small data
+    warmup_texts = get_review_texts(8, shuffle=False)
+    truncate_table(conn)
+    benchmark_fn(conn, warmup_texts)
+
+    return conn, py_pid, pg_pid
+
+
+def run_single_iteration(conn, py_pid, pg_pid, texts: List[str],
+                         benchmark_fn: Callable) -> BenchmarkResult:
+    """Run a single benchmark iteration on an existing connection."""
+    truncate_table(conn)
+    return run_benchmark_iteration(conn, py_pid, pg_pid,
+                                   lambda c: benchmark_fn(c, texts))
+
+
 # =============================================================================
 # Output Functions
 # =============================================================================
@@ -275,75 +306,91 @@ def main():
     direct_client = EmbedAnythingDirectClient()
 
     try:
+        # Pre-load all test data
+        test_data = {size: get_review_texts(size, shuffle=False) for size in TEST_SIZES}
+
+        # Define all methods to benchmark
+        def make_methods(direct_client, grpc_client, http_client):
+            return {
+                'pg_local': lambda c, t: benchmark_internal_db_gen(
+                    c, t, "embed_anything", EMBED_ANYTHING_MODEL
+                ),
+                'pg_grpc': lambda c, t: benchmark_internal_db_gen(
+                    c, t, "grpc", EMBED_ANYTHING_MODEL
+                ),
+                'ext_direct': lambda c, t: benchmark_external_client_gen(
+                    c, t, direct_client.embed
+                ),
+                'ext_grpc': lambda c, t: benchmark_external_client_gen(
+                    c, t, grpc_client.embed
+                ),
+                'ext_http': lambda c, t: benchmark_external_client_gen(
+                    c, t, http_client.embed
+                ),
+            }
+
+        methods = make_methods(direct_client, grpc_client, http_client)
+        method_names = list(methods.keys())
+
+        # Initialize results storage
+        results_by_size = {size: {name: [] for name in method_names} for size in TEST_SIZES}
+
+        # Outer loop: runs (cyclic execution across all sizes)
+        for run_idx in range(RUNS_PER_SIZE):
+            print(f"\nRun {run_idx + 1}/{RUNS_PER_SIZE}")
+
+            # Inner loop: sizes
+            for size in TEST_SIZES:
+                texts = test_data[size]
+                print(f"  Size: {size}", flush=True)
+
+                # Setup connections for all methods (with warmup)
+                connections = {}
+                pids = {}
+                try:
+                    for method_name, benchmark_fn in methods.items():
+                        conn, py_pid, pg_pid = setup_method_connection(texts, benchmark_fn)
+                        connections[method_name] = conn
+                        pids[method_name] = (py_pid, pg_pid)
+
+                    # Execute each method once for this size in this run
+                    for method_name, benchmark_fn in methods.items():
+                        conn = connections[method_name]
+                        py_pid, pg_pid = pids[method_name]
+                        result = run_single_iteration(conn, py_pid, pg_pid, texts, benchmark_fn)
+                        results_by_size[size][method_name].append(result)
+
+                finally:
+                    # Close all connections
+                    for conn in connections.values():
+                        conn.close()
+
+        # Print aggregated results and compute metrics
+        print("\n" + "=" * 105)
+        print("AGGREGATED RESULTS")
+        print("=" * 105)
         print_detailed_header()
 
         all_results = []
-
         for size in TEST_SIZES:
-            texts = get_review_texts(size, shuffle=False)
-
             print(f"Size: {size}", flush=True)
+            results = results_by_size[size]
 
-            # Benchmark PG EmbedAnything (fresh connection per method)
-            pg_local_results = run_method_with_fresh_connection(
-                texts,
-                lambda c, t: benchmark_internal_db_gen(
-                    c, t, "embed_anything", EMBED_ANYTHING_MODEL
-                ),
-                RUNS_PER_SIZE
-            )
-
-            # Benchmark PG gRPC (fresh connection per method)
-            pg_grpc_results = run_method_with_fresh_connection(
-                texts,
-                lambda c, t: benchmark_internal_db_gen(
-                    c, t, "grpc", EMBED_ANYTHING_MODEL
-                ),
-                RUNS_PER_SIZE
-            )
-
-            # Benchmark Direct Python (fresh connection per method)
-            ext_direct_results = run_method_with_fresh_connection(
-                texts,
-                lambda c, t: benchmark_external_client_gen(
-                    c, t, direct_client.embed
-                ),
-                RUNS_PER_SIZE
-            )
-
-            # Benchmark External gRPC (fresh connection per method)
-            ext_grpc_results = run_method_with_fresh_connection(
-                texts,
-                lambda c, t: benchmark_external_client_gen(
-                    c, t, grpc_client.embed
-                ),
-                RUNS_PER_SIZE
-            )
-
-            # Benchmark External HTTP (fresh connection per method)
-            ext_http_results = run_method_with_fresh_connection(
-                texts,
-                lambda c, t: benchmark_external_client_gen(
-                    c, t, http_client.embed
-                ),
-                RUNS_PER_SIZE
-            )
-
-            print_result("PG local", pg_local_results)
-            print_result("PG gRPC", pg_grpc_results)
-            print_result("Ext Direct", ext_direct_results)
-            print_result("Ext gRPC", ext_grpc_results)
-            print_result("Ext HTTP", ext_http_results)
+            print_result("PG local", results['pg_local'])
+            print_result("PG gRPC", results['pg_grpc'])
+            print_result("Ext Direct", results['ext_direct'])
+            print_result("Ext gRPC", results['ext_grpc'])
+            print_result("Ext HTTP", results['ext_http'])
             print()
 
             # Store metrics for summary and plots
             all_results.append({
                 'size': size,
-                'pg_local': compute_metrics(size, pg_local_results),
-                'pg_grpc': compute_metrics(size, pg_grpc_results),
-                'ext_direct': compute_metrics(size, ext_direct_results),
-                'ext_grpc': compute_metrics(size, ext_grpc_results),
-                'ext_http': compute_metrics(size, ext_http_results),
+                'pg_local': compute_metrics(size, results['pg_local']),
+                'pg_grpc': compute_metrics(size, results['pg_grpc']),
+                'ext_direct': compute_metrics(size, results['ext_direct']),
+                'ext_grpc': compute_metrics(size, results['ext_grpc']),
+                'ext_http': compute_metrics(size, results['ext_http']),
             })
 
         # Print summary

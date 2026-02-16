@@ -18,7 +18,7 @@ python-scripts/
 │   └── http_server.py                  # HTTP embedding server
 ├── 1_internal-vs-external-gen/         # Benchmark 1: Embedding generation methods
 ├── 2_pg_gembed-vs-vectordbs/           # Benchmark 2: Generation + storage comparison
-└── 3_unified-vs-distributed/           # Benchmark 3: Architecture comparison
+├── 3_mono-store-vs-poly-store/         # Benchmark 3: Architecture comparison
 ```
 
 ## Setup
@@ -94,9 +94,9 @@ Compares both embedding generation location and storage systems:
 PYTHONPATH=.:proto python3.13 2_pg_gembed-vs-vectordbs/benchmark.py
 ```
 
-### Benchmark 3: Unified vs Distributed Architecture
+### Benchmark 3: Mono-Store vs Poly-Store Architecture
 
-**Directory:** `3_unified-vs-distributed/`
+**Directory:** `3_mono-store-vs-poly-store/`
 
 Compares architectural patterns with two scenarios:
 
@@ -114,13 +114,14 @@ Compares architectural patterns with two scenarios:
 
 Each scenario compares:
 
-- **Unified**: All data + embeddings in PostgreSQL with pg_gembed
-- **Distributed**: Metadata in PostgreSQL + embeddings in ChromaDB
-  Both PostgreSQL and ChromaDB use an HNSW index with matching parameters for fair
-  comparison: `m = 16`, `ef_construction = 100`.
+- **Mono-Store (PG)**: All data + embeddings in PostgreSQL with pg_gembed
+- **Poly-Store (PG, Chroma)**: Metadata in PostgreSQL + embeddings in ChromaDB
+- **Poly-Store (PG, Qdrant)**: Metadata in PostgreSQL + embeddings in Qdrant
+  
+  All systems use an HNSW index with matching parameters for fair comparison: `m = 16`, `ef_construction = 100`.
 
 ```bash
-PYTHONPATH=.:proto python3.13 3_unified-vs-distributed/benchmark.py
+PYTHONPATH=.:proto python3.13 3_mono-store-vs-poly-store/benchmark.py
 ```
 
 ## Benchmark Data

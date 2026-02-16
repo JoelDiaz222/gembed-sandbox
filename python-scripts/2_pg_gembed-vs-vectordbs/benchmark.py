@@ -20,8 +20,8 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
 # Configuration
-TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-RUNS_PER_SIZE = 5
+TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048]
+RUNS_PER_SIZE = 15
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -289,43 +289,125 @@ def main():
     print(f"\n{'=' * 105}\nBENCHMARK 2: PG GEMBED VS VECTOR DBS (INDEXED VS DEFERRED)\n{'=' * 105}\n")
     embed_client = EmbedAnythingDirectClient()
     print_header()
+
+    # Pre-load all test data
+    test_data = {size: get_review_texts(size, shuffle=False) for size in TEST_SIZES}
+    warmup_texts = get_review_texts(8, shuffle=False)
+
+    # Define all PG methods
+    method_configs = {
+        'pg_local_indexed': ('embed_anything', 'indexed'),
+        'pg_local_deferred': ('embed_anything', 'deferred'),
+    }
+
+    # Initialize results storage
+    results_by_size = {
+        size: {
+            'pg_local_indexed': [],
+            'pg_local_deferred': [],
+            'qd_indexed': [],
+            'qd_deferred': [],
+            'chroma': [],
+        }
+        for size in TEST_SIZES
+    }
+
+    py_pid = os.getpid()
+
+    # Outer loop: runs (cyclic execution across all sizes)
+    for run_idx in range(RUNS_PER_SIZE):
+        print(f"\nRun {run_idx + 1}/{RUNS_PER_SIZE}")
+
+        # Inner loop: sizes
+        for size in TEST_SIZES:
+            texts = test_data[size]
+            print(f"  Size: {size}", flush=True)
+
+            # Setup and warmup all PG connections for this size
+            pg_connections = {}
+            pg_pids = {}
+            try:
+                for method_name, (provider, strategy) in method_configs.items():
+                    conn, pg_pid = connect_and_get_pid()
+                    warmup_pg_connection(conn, provider)
+                    fn = setup_pg_indexed if strategy == "indexed" else setup_pg_deferred
+                    fn(conn, warmup_texts, provider)
+                    pg_connections[method_name] = (conn, fn, provider)
+                    pg_pids[method_name] = pg_pid
+
+                # Execute all methods once for this size in this run
+                # Run PG methods
+                for method_name, (conn, fn, provider) in pg_connections.items():
+                    pg_pid = pg_pids[method_name]
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, texts, provider))
+                    results_by_size[size][method_name].append(BenchmarkResult(time_s=elapsed, stats=stats))
+
+                # Run Qdrant indexed
+                client = QdrantClient(url=QDRANT_URL)
+                try:
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                                lambda: setup_qdrant(client, texts, embed_client.embed,
+                                                                                     False),
+                                                                container_name=QDRANT_CONTAINER_NAME)
+                    results_by_size[size]['qd_indexed'].append(BenchmarkResult(time_s=elapsed, stats=stats))
+                finally:
+                    cleanup_qdrant(client)
+
+                # Run Qdrant deferred
+                client = QdrantClient(url=QDRANT_URL)
+                try:
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                                lambda: setup_qdrant(client, texts, embed_client.embed,
+                                                                                     True),
+                                                                container_name=QDRANT_CONTAINER_NAME)
+                    results_by_size[size]['qd_deferred'].append(BenchmarkResult(time_s=elapsed, stats=stats))
+                finally:
+                    cleanup_qdrant(client)
+
+                # Run Chroma
+                client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
+                try:
+                    elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                                lambda: benchmark_chroma(collection, texts,
+                                                                                         embed_client.embed))
+                    results_by_size[size]['chroma'].append(BenchmarkResult(time_s=elapsed, stats=stats))
+                finally:
+                    cleanup_chroma(client, db_path)
+
+            finally:
+                # Close all PG connections for this size
+                for conn, _, _ in pg_connections.values():
+                    conn.close()
+
+    # Print aggregated results and compute metrics
+    print("\n" + "=" * 105)
+    print("AGGREGATED RESULTS")
+    print("=" * 105)
+    print_header()
+
     all_results = []
-
     for size in TEST_SIZES:
-        texts = get_review_texts(size, shuffle=False)
         print(f"Size: {size}", flush=True)
+        results = results_by_size[size]
 
-        res_pg_local_idx = run_pg_method(texts, "embed_anything", "indexed", RUNS_PER_SIZE)
-        res_pg_local_def = run_pg_method(texts, "embed_anything", "deferred", RUNS_PER_SIZE)
-        res_pg_grpc_idx = run_pg_method(texts, "grpc", "indexed", RUNS_PER_SIZE)
-        res_pg_grpc_def = run_pg_method(texts, "grpc", "deferred", RUNS_PER_SIZE)
-        res_qd_idx = run_qdrant_method(texts, embed_client, RUNS_PER_SIZE, deferred=False)
-        res_qd_def = run_qdrant_method(texts, embed_client, RUNS_PER_SIZE, deferred=True)
-        res_ch = run_chroma_method(texts, embed_client, RUNS_PER_SIZE)
-
-        print_result("PG Local Indexed", res_pg_local_idx)
-        print_result("PG Local Deferred", res_pg_local_def)
-        print_result("PG gRPC Indexed", res_pg_grpc_idx)
-        print_result("PG gRPC Deferred", res_pg_grpc_def)
-        print_result("QD Indexed", res_qd_idx)
-        print_result("QD Deferred", res_qd_def)
-        print_result("Chroma", res_ch)
+        print_result("PG Local Indexed", results['pg_local_indexed'])
+        print_result("PG Local Deferred", results['pg_local_deferred'])
+        print_result("QD Indexed", results['qd_indexed'])
+        print_result("QD Deferred", results['qd_deferred'])
+        print_result("Chroma", results['chroma'])
         print()
 
         all_results.append({
             'size': size,
-            'pg_local_indexed': compute_metrics(size, res_pg_local_idx),
-            'pg_local_deferred': compute_metrics(size, res_pg_local_def),
-            'pg_grpc_indexed': compute_metrics(size, res_pg_grpc_idx),
-            'pg_grpc_deferred': compute_metrics(size, res_pg_grpc_def),
-            'qd_indexed': compute_metrics(size, res_qd_idx),
-            'qd_deferred': compute_metrics(size, res_qd_def),
-            'chroma': compute_metrics(size, res_ch),
+            'pg_local_indexed': compute_metrics(size, results['pg_local_indexed']),
+            'pg_local_deferred': compute_metrics(size, results['pg_local_deferred']),
+            'qd_indexed': compute_metrics(size, results['qd_indexed']),
+            'qd_deferred': compute_metrics(size, results['qd_deferred']),
+            'chroma': compute_metrics(size, results['chroma']),
         })
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_local_indexed', 'pg_local_deferred', 'pg_grpc_indexed', 'pg_grpc_deferred', 'qd_indexed',
-               'qd_deferred', 'chroma']
+    methods = ['pg_local_indexed', 'pg_local_deferred', 'qd_indexed', 'qd_deferred', 'chroma']
     save_results_csv(all_results, OUTPUT_DIR, timestamp, methods)
     generate_plots(all_results, OUTPUT_DIR, timestamp, methods)
 

@@ -1,11 +1,11 @@
-# Benchmark 3: Unified vs Distributed Architecture
+# Benchmark 3: Mono-Store vs Poly-Store Architecture
 
 ## Purpose
 
 This benchmark compares two architectural approaches for managing embeddings at scale:
 
-1. **Unified Architecture**: All data and embeddings in PostgreSQL with pg_gembed
-2. **Distributed Architecture**: Metadata in PostgreSQL + embeddings in a Vector DB (ChromaDB or Qdrant)
+1. **Mono-Store Architecture**: All data and embeddings in PostgreSQL with pg_gembed
+2. **Poly-Store Architecture**: Metadata in PostgreSQL + embeddings in a Vector DB (ChromaDB or Qdrant)
 
 ## Scenarios
 
@@ -37,11 +37,11 @@ Simulates updating embeddings for existing records:
 
 ## Methods Tested
 
-| Method               | Data Storage | Embedding Storage     | Embedding Generation       |
-|----------------------|--------------|-----------------------|----------------------------|
-| PG Unified           | PostgreSQL   | PostgreSQL (pgvector) | pg_gembed (internal)       |
-| Distributed (Chroma) | PostgreSQL   | ChromaDB              | EmbedAnything (in-process) |
-| Distributed (Qdrant) | PostgreSQL   | Qdrant                | EmbedAnything (in-process) |
+| Method                     | Data Storage | Embedding Storage     | Embedding Generation       |
+|----------------------------|--------------|-----------------------|----------------------------|
+| Mono-Store (PG)            | PostgreSQL   | PostgreSQL (pgvector) | pg_gembed (internal)       |
+| Poly-Store (PG, Chroma)    | PostgreSQL   | ChromaDB              | EmbedAnything (in-process) |
+| Poly-Store (PG, Qdrant)    | PostgreSQL   | Qdrant                | EmbedAnything (in-process) |
 
 ## Prerequisites
 
@@ -63,7 +63,7 @@ Realistic product data with multiple text fields:
 ## Running
 
 ```bash
-PYTHONPATH=.:proto python3.13 3_unified-vs-distributed/benchmark.py
+PYTHONPATH=.:proto python3.13 3_mono-store-vs-poly-store/benchmark.py
 ```
 
 ## Output

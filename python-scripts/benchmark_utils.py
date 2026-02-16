@@ -16,7 +16,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from statistics import mean, stdev, median, quantiles
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import embed_anything
 import psutil
@@ -84,8 +84,24 @@ def calc_iqr(values: List[float]) -> float:
     """Interquartile range (Q3 - Q1), returning 0 for lists with fewer than 4 elements."""
     if len(values) < 4:
         return 0.0
-    q = quantiles(values, n=4)
+    q = quantiles(values, n=4, method='inclusive')
     return q[2] - q[0]
+
+
+def calc_q1(values: List[float]) -> float:
+    """First quartile (Q1), returning median for lists with fewer than 4 elements."""
+    if len(values) < 4:
+        return median(values) if values else 0.0
+    q = quantiles(values, n=4, method='inclusive')
+    return q[0]
+
+
+def calc_q3(values: List[float]) -> float:
+    """Third quartile (Q3), returning median for lists with fewer than 4 elements."""
+    if len(values) < 4:
+        return median(values) if values else 0.0
+    q = quantiles(values, n=4, method='inclusive')
+    return q[2]
 
 
 # =============================================================================
@@ -361,57 +377,83 @@ def compute_metrics(size: int, results: List[BenchmarkResult]) -> dict:
         'throughput_std': size / mean(times) * safe_stdev(times) / mean(times) if len(times) > 1 else 0,
         'throughput_median': size / median(times),
         'throughput_iqr': size / median(times) * calc_iqr(times) / median(times) if len(times) >= 4 else 0,
+        'throughput_q1': size / calc_q3(times) if calc_q3(times) > 0 else 0,  # Q1 throughput uses Q3 time
+        'throughput_q3': size / calc_q1(times) if calc_q1(times) > 0 else 0,  # Q3 throughput uses Q1 time
         # Time
         'time_s': mean(times),
         'time_s_std': safe_stdev(times),
         'time_s_median': median(times),
         'time_s_iqr': calc_iqr(times),
+        'time_s_q1': calc_q1(times),
+        'time_s_q3': calc_q3(times),
         # Python
         'py_cpu': mean(py_cpu),
         'py_cpu_std': safe_stdev(py_cpu),
         'py_cpu_median': median(py_cpu),
         'py_cpu_iqr': calc_iqr(py_cpu),
+        'py_cpu_q1': calc_q1(py_cpu),
+        'py_cpu_q3': calc_q3(py_cpu),
         'py_mem_delta': mean(py_delta),
         'py_mem_delta_std': safe_stdev(py_delta),
         'py_mem_delta_median': median(py_delta),
         'py_mem_delta_iqr': calc_iqr(py_delta),
+        'py_mem_delta_q1': calc_q1(py_delta),
+        'py_mem_delta_q3': calc_q3(py_delta),
         'py_mem_peak': mean(py_peak),
         'py_mem_peak_std': safe_stdev(py_peak),
         'py_mem_peak_median': median(py_peak),
         'py_mem_peak_iqr': calc_iqr(py_peak),
+        'py_mem_peak_q1': calc_q1(py_peak),
+        'py_mem_peak_q3': calc_q3(py_peak),
         # PostgreSQL
         'pg_cpu': mean(pg_cpu),
         'pg_cpu_std': safe_stdev(pg_cpu),
         'pg_cpu_median': median(pg_cpu),
         'pg_cpu_iqr': calc_iqr(pg_cpu),
+        'pg_cpu_q1': calc_q1(pg_cpu),
+        'pg_cpu_q3': calc_q3(pg_cpu),
         'pg_mem_delta': mean(pg_delta),
         'pg_mem_delta_std': safe_stdev(pg_delta),
         'pg_mem_delta_median': median(pg_delta),
         'pg_mem_delta_iqr': calc_iqr(pg_delta),
+        'pg_mem_delta_q1': calc_q1(pg_delta),
+        'pg_mem_delta_q3': calc_q3(pg_delta),
         'pg_mem_peak': mean(pg_peak),
         'pg_mem_peak_std': safe_stdev(pg_peak),
         'pg_mem_peak_median': median(pg_peak),
         'pg_mem_peak_iqr': calc_iqr(pg_peak),
+        'pg_mem_peak_q1': calc_q1(pg_peak),
+        'pg_mem_peak_q3': calc_q3(pg_peak),
         # Container (Qdrant/etc.)
         'qd_cpu': mean(qd_cpu),
         'qd_cpu_std': safe_stdev(qd_cpu),
         'qd_cpu_median': median(qd_cpu),
         'qd_cpu_iqr': calc_iqr(qd_cpu),
+        'qd_cpu_q1': calc_q1(qd_cpu),
+        'qd_cpu_q3': calc_q3(qd_cpu),
         'qd_mem_delta': mean(qd_delta),
         'qd_mem_delta_std': safe_stdev(qd_delta),
         'qd_mem_delta_median': median(qd_delta),
         'qd_mem_delta_iqr': calc_iqr(qd_delta),
+        'qd_mem_delta_q1': calc_q1(qd_delta),
+        'qd_mem_delta_q3': calc_q3(qd_delta),
         'qd_mem_peak': mean(qd_peak),
         'qd_mem_peak_std': safe_stdev(qd_peak),
         'qd_mem_peak_median': median(qd_peak),
         'qd_mem_peak_iqr': calc_iqr(qd_peak),
+        'qd_mem_peak_q1': calc_q1(qd_peak),
+        'qd_mem_peak_q3': calc_q3(qd_peak),
         # System
         'sys_cpu': mean(sys_cpu),
         'sys_cpu_std': safe_stdev(sys_cpu),
         'sys_cpu_median': median(sys_cpu),
         'sys_cpu_iqr': calc_iqr(sys_cpu),
+        'sys_cpu_q1': calc_q1(sys_cpu),
+        'sys_cpu_q3': calc_q3(sys_cpu),
         'sys_mem': mean(sys_mem),
         'sys_mem_std': safe_stdev(sys_mem),
         'sys_mem_median': median(sys_mem),
         'sys_mem_iqr': calc_iqr(sys_mem),
+        'sys_mem_q1': calc_q1(sys_mem),
+        'sys_mem_q3': calc_q3(sys_mem),
     }

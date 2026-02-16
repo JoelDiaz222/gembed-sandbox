@@ -5,7 +5,7 @@ from typing import List
 import matplotlib
 import matplotlib.pyplot as plt
 
-COLOR_PG_MAIN = '#003f5c'  # Navy Blue (Internal/Unified)
+COLOR_PG_MAIN = '#003f5c'  # Navy Blue (Internal/Mono-Store)
 COLOR_PG_ALT = '#444e86'  # Slate (Indexed/Optimized)
 COLOR_VECTOR_QD = '#ff1f5b'  # Crimson (Qdrant)
 COLOR_VECTOR_CH = '#ffa600'  # Amber (Chroma)
@@ -16,8 +16,8 @@ COLOR_REMOTE_HTTP = '#d65db1'  # Light Magenta (HTTP Remote)
 STYLE_MAP = {
     # PostgreSQL / Internal Group
     'pg_local': (COLOR_PG_MAIN, '-', 'o'),
-    'pg_unified': (COLOR_PG_MAIN, '-', 'o'),
-    'unified': (COLOR_PG_MAIN, '-', 'o'),
+    'pg_mono_store': (COLOR_PG_MAIN, '-', 'o'),
+    'mono_store': (COLOR_PG_MAIN, '-', 'o'),
     'internal': (COLOR_PG_MAIN, '-', 'o'),
     'pg': (COLOR_PG_MAIN, '-', 'o'),
 
@@ -26,19 +26,19 @@ STYLE_MAP = {
     'pg_deferred': (COLOR_PG_ALT, '--', 's'),
     'pg_local_indexed': (COLOR_PG_ALT, '-', 's'),
     'pg_local_deferred': (COLOR_PG_ALT, '--', 's'),
-    'pg_uni_indexed': (COLOR_PG_ALT, '-', 's'),
-    'pg_uni_deferred': (COLOR_PG_ALT, '--', 's'),
+    'pg_mono_indexed': (COLOR_PG_ALT, '-', 's'),
+    'pg_mono_deferred': (COLOR_PG_ALT, '--', 's'),
     'pg_grpc_indexed': (COLOR_PG_ALT, '-', 'D'),
     'pg_grpc_deferred': (COLOR_PG_ALT, '--', 'D'),
     'pg_grpc': (COLOR_PG_ALT, ':', 'D'),
 
     # Vector Databases
     'qdrant': (COLOR_VECTOR_QD, '-.', 'D'),
-    'dist_qdrant': (COLOR_VECTOR_QD, '-.', 'D'),
+    'poly_qdrant': (COLOR_VECTOR_QD, '-.', 'D'),
     'qd_indexed': (COLOR_VECTOR_QD, '-.', 'D'),
     'qd_deferred': (COLOR_VECTOR_QD, ':', 'v'),
     'chroma': (COLOR_VECTOR_CH, '-.', '^'),
-    'dist_chroma': (COLOR_VECTOR_CH, '-.', '^'),
+    'poly_chroma': (COLOR_VECTOR_CH, '-.', '^'),
 
     # Application Clients (Direct/In-Process)
     'ext_direct': (COLOR_DIRECT, '--', '*'),
@@ -52,16 +52,16 @@ STYLE_MAP = {
 LABEL_MAP = {
     'pg': 'PostgreSQL',
     'pg_local': 'PG Local (Internal)',
-    'pg_unified': 'PG Unified',
-    'unified': 'PG Unified',
+    'pg_mono_store': 'Mono-Store (PG)',
+    'mono_store': 'Mono-Store (PG)',
     'internal': 'PG Internal',
     'pg_grpc': 'PG gRPC (Internal)',
     'pg_indexed': 'PG (Indexed)',
     'pg_deferred': 'PG (Deferred Index)',
     'pg_local_indexed': 'PG Local (Indexed)',
     'pg_local_deferred': 'PG Local (Deferred)',
-    'pg_uni_indexed': 'PG Unified (Indexed)',
-    'pg_uni_deferred': 'PG Unified (Deferred)',
+    'pg_mono_indexed': 'PG Mono-Store (Indexed)',
+    'pg_mono_deferred': 'PG Mono-Store (Deferred)',
     'pg_grpc_indexed': 'PG gRPC (Indexed)',
     'pg_grpc_deferred': 'PG gRPC (Deferred)',
     'ext_direct': 'Python Direct',
@@ -70,8 +70,8 @@ LABEL_MAP = {
     'ext_http': 'External HTTP',
     'chroma': 'ChromaDB',
     'qdrant': 'Qdrant',
-    'dist_chroma': 'Distributed (ChromaDB)',
-    'dist_qdrant': 'Distributed (Qdrant)',
+    'poly_chroma': 'Poly-Store (PG, ChromaDB)',
+    'poly_qdrant': 'Poly-Store (PG, Qdrant)',
     'qd_indexed': 'Qdrant (Indexed)',
     'qd_deferred': 'Qdrant (Deferred Index)'
 }
@@ -123,7 +123,8 @@ def save_results_csv(all_results: List[dict], output_dir: Path, timestamp: str, 
                 header.append(f"{method}_{metric}")
                 header.append(f"{method}_{metric}_std")
                 header.append(f"{method}_{metric}_median")
-                header.append(f"{method}_{metric}_iqr")
+                header.append(f"{method}_{metric}_q1")
+                header.append(f"{method}_{metric}_q3")
         writer.writerow(header)
 
         for r in all_results:
@@ -134,9 +135,10 @@ def save_results_csv(all_results: List[dict], output_dir: Path, timestamp: str, 
                         row.append(r[method].get(metric, ''))
                         row.append(r[method].get(f"{metric}_std", ''))
                         row.append(r[method].get(f"{metric}_median", ''))
-                        row.append(r[method].get(f"{metric}_iqr", ''))
+                        row.append(r[method].get(f"{metric}_q1", ''))
+                        row.append(r[method].get(f"{metric}_q3", ''))
                 else:
-                    row.extend([''] * (len(metrics) * 4))
+                    row.extend([''] * (len(metrics) * 5))
             writer.writerow(row)
     print(f"\nResults saved to {path}")
 
@@ -156,8 +158,12 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         for method in methods:
             color, ls, marker, label = get_style(method)
             y_vals = [r[method].get(f'{cpu_key}_median', r[method].get(cpu_key, 0)) for r in all_results if method in r]
-            y_errs = [r[method].get(f'{cpu_key}_iqr', r[method].get(f'{cpu_key}_std', 0)) for r in all_results if
-                      method in r]
+            q1_vals = [r[method].get(f'{cpu_key}_q1', r[method].get(f'{cpu_key}_median', 0)) for r in all_results if
+                       method in r]
+            q3_vals = [r[method].get(f'{cpu_key}_q3', r[method].get(f'{cpu_key}_median', 0)) for r in all_results if
+                       method in r]
+            # Asymmetric error bars: lower = median - Q1, upper = Q3 - median
+            y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
             if not any(y_vals): continue
             ax1.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                          linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
@@ -171,8 +177,12 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         for method in methods:
             color, ls, marker, label = get_style(method)
             y_vals = [r[method].get(f'{mem_key}_median', r[method].get(mem_key, 0)) for r in all_results if method in r]
-            y_errs = [r[method].get(f'{mem_key}_iqr', r[method].get(f'{mem_key}_std', 0)) for r in all_results if
-                      method in r]
+            q1_vals = [r[method].get(f'{mem_key}_q1', r[method].get(f'{mem_key}_median', 0)) for r in all_results if
+                       method in r]
+            q3_vals = [r[method].get(f'{mem_key}_q3', r[method].get(f'{mem_key}_median', 0)) for r in all_results if
+                       method in r]
+            # Asymmetric error bars: lower = median - Q1, upper = Q3 - median
+            y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
             if not any(y_vals): continue
             ax2.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                          linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
@@ -197,8 +207,12 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
             color, ls, marker, label = get_style(method)
             y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if
                       method in r]
-            y_errs = [r[method].get('throughput_iqr', r[method].get('throughput_std', 0)) for r in all_results if
-                      method in r]
+            q1_vals = [r[method].get('throughput_q1', r[method].get('throughput_median', 0)) for r in all_results if
+                       method in r]
+            q3_vals = [r[method].get('throughput_q3', r[method].get('throughput_median', 0)) for r in all_results if
+                       method in r]
+            # Asymmetric error bars: lower = median - Q1, upper = Q3 - median
+            y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
             if not any(y_vals): continue
             plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                          linewidth=1.5, capsize=3, markersize=5, alpha=0.9)

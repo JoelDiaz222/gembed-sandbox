@@ -1,3 +1,4 @@
+import gc
 import os
 import shutil
 import time
@@ -19,11 +20,11 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
 # Configuration
-INGESTION_SET_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-RUNS_INGESTION = 5
+INGESTION_SET_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+RUNS_INGESTION = 15
 
-SERVING_TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-RUNS_SERVING = 5
+SERVING_TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+RUNS_SERVING = 15
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -99,19 +100,7 @@ def setup_pg_indexed(conn, ingestion_data):
     conn.commit()
 
 
-def setup_pg_deferred(conn, ingestion_data):
-    """Index created AFTER embedding generation."""
-    setup_pg_schema(conn)
-    populate_pg_database(conn, ingestion_data)
-
-    cur = conn.cursor()
-    cur.execute(
-        "CREATE INDEX ON reviews USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
-    conn.commit()
-    cur.close()
-
-
-def setup_qdrant_common(client, embed_client, ingestion_data, deferred: bool):
+def setup_qdrant_common(client, embed_client, ingestion_data):
     if client.collection_exists("reviews"):
         client.delete_collection("reviews")
 
@@ -126,18 +115,11 @@ def setup_qdrant_common(client, embed_client, ingestion_data, deferred: bool):
         vectors_config=VectorParams(size=384, distance=Distance.COSINE, hnsw_config=hnsw_config)
     )
 
-    if deferred:
-        client.update_collection("reviews", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
-
     texts = [t for t, s in ingestion_data]
     embeddings = embed_client.embed(texts)
     points = [PointStruct(id=j, vector=embeddings[j], payload={"text": t, "spam": s})
               for j, (t, s) in enumerate(ingestion_data)]
     client.upsert("reviews", points, wait=True)
-
-    if deferred:
-        client.update_collection("reviews",
-                                 optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
 
 
 def setup_chroma(client, embed_client, ingestion_data):
@@ -165,7 +147,7 @@ def setup_chroma(client, embed_client, ingestion_data):
 
 def serve_pg(conn, input_texts):
     cur = conn.cursor()
-    
+
     # SQL to get majority vote
     sql = '''
           WITH predictions AS (SELECT i.ord, (count(*) filter (where t.spam) >= 3)::boolean as predicted_spam
@@ -184,7 +166,7 @@ def serve_pg(conn, input_texts):
           '''
     cur.execute(sql, (input_texts, EMBED_ANYTHING_MODEL, input_texts))
     all_predictions = cur.fetchall()
-        
+
     conn.commit()
     cur.close()
     return all_predictions
@@ -330,136 +312,129 @@ def main():
     # Warm-up Ingestion
     print("Warming up ingestion...")
     warmup_data = full_data[:8]
-    
+
     # PG Warmup
     conn = connect_pg()
     setup_pg_indexed(conn, warmup_data)
     conn.close()
-    
-    conn = connect_pg()
-    setup_pg_deferred(conn, warmup_data)
-    conn.close()
-    
+
     # Qdrant Warmup
     qd_client = create_qdrant_client()
-    setup_qdrant_common(qd_client, embed_client, warmup_data, deferred=False)
-    setup_qdrant_common(qd_client, embed_client, warmup_data, deferred=True)
+    setup_qdrant_common(qd_client, embed_client, warmup_data)
     if qd_client.collection_exists("reviews"):
         qd_client.delete_collection("reviews")
     qd_client.close()
-    
+
     # Chroma Warmup
     c_client, c_path = create_chroma_client()
     setup_chroma(c_client, embed_client, warmup_data)
     cleanup_chroma(c_client, c_path)
 
     print_header("Phase 1: Ingestion Benchmark")
-    print_detailed_header()
 
-    for ingestion_size in INGESTION_SET_SIZES:
-        print(f"Test Size: {ingestion_size}")
+    # Initialize results storage
+    results_by_size = {
+        size: {'pg_indexed': [], 'qd_indexed': [], 'chroma': []}
+        for size in INGESTION_SET_SIZES
+    }
 
-        current_ingestion_data = full_data[:ingestion_size]
+    # Outer loop: runs (cyclic execution)
+    for run_idx in range(RUNS_INGESTION):
+        print(f"\n{'=' * 105}")
+        print(f"RUN {run_idx + 1}/{RUNS_INGESTION}")
+        print(f"{'=' * 105}")
 
-        # We need to collect results across runs for each method to compute stats
-        results_pg_indexed = []
-        results_pg_deferred = []
-        results_qd_indexed = []
-        results_qd_deferred = []
-        results_chroma = []
-        
-        # Open connections for this size
-        conn_idx = connect_pg()
-        pid_idx = get_pg_pid(conn_idx)
-        warmup_pg_connection(conn_idx)
-        
-        conn_def = connect_pg()
-        pid_def = get_pg_pid(conn_def)
-        warmup_pg_connection(conn_def)
+        # Inner loop: sizes
+        for ingestion_size in INGESTION_SET_SIZES:
+            print(f"\n  Size: {ingestion_size}", flush=True)
+            current_ingestion_data = full_data[:ingestion_size]
 
-        try:
-            for run_idx in range(RUNS_INGESTION):
+            # Setup connection for this iteration
+            conn_idx = connect_pg()
+            pid_idx = get_pg_pid(conn_idx)
+            warmup_pg_connection(conn_idx)
+
+            try:
                 # Postgres Indexed
                 elapsed, _, stats = ResourceMonitor.measure(py_pid, pid_idx,
-                                                         lambda: setup_pg_indexed(conn_idx, current_ingestion_data))
-                results_pg_indexed.append(BenchmarkResult(elapsed, stats))
-
-                # Postgres Deferred
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, pid_def,
-                                                         lambda: setup_pg_deferred(conn_def, current_ingestion_data))
-                results_pg_deferred.append(BenchmarkResult(elapsed, stats))
+                                                            lambda: setup_pg_indexed(conn_idx, current_ingestion_data))
+                results_by_size[ingestion_size]['pg_indexed'].append(BenchmarkResult(elapsed, stats))
+                print(f"    PG: {elapsed:.2f}s", flush=True)
 
                 # Qdrant Indexed
                 qd_client = create_qdrant_client()
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, None, lambda: setup_qdrant_common(qd_client, embed_client,
-                                                                                                   current_ingestion_data,
-                                                                                                   deferred=False),
-                                                           container_name=QDRANT_CONTAINER_NAME)
-                results_qd_indexed.append(BenchmarkResult(elapsed, stats))
-                qd_client.close()
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                            lambda: setup_qdrant_common(qd_client, embed_client,
+                                                                                        current_ingestion_data),
+                                                            container_name=QDRANT_CONTAINER_NAME)
+                results_by_size[ingestion_size]['qd_indexed'].append(BenchmarkResult(elapsed, stats))
+                print(f"    Qdrant: {elapsed:.2f}s", flush=True)
 
-                # Qdrant Deferred
-                qd_client = create_qdrant_client()
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, None, lambda: setup_qdrant_common(qd_client, embed_client,
-                                                                                                   current_ingestion_data,
-                                                                                                   deferred=True),
-                                                           container_name=QDRANT_CONTAINER_NAME)
-                results_qd_deferred.append(BenchmarkResult(elapsed, stats))
-                qd_client.close()
+                # Check if this is the very last run of the very last size
+                is_last_run = (run_idx == RUNS_INGESTION - 1) and (ingestion_size == INGESTION_SET_SIZES[-1])
+                if not is_last_run:
+                    qd_client.close()
 
                 # Chroma
                 c_client, c_path = create_chroma_client()
                 elapsed, _, stats = ResourceMonitor.measure(py_pid, None, lambda: setup_chroma(c_client, embed_client,
-                                                                                            current_ingestion_data))
-                results_chroma.append(BenchmarkResult(elapsed, stats))
-
-                # Check if this is the very last run of the very last size
-                is_last_run = (run_idx == RUNS_INGESTION - 1) and (ingestion_size == INGESTION_SET_SIZES[-1])
+                                                                                               current_ingestion_data))
+                results_by_size[ingestion_size]['chroma'].append(BenchmarkResult(elapsed, stats))
+                print(f"    Chroma: {elapsed:.2f}s", flush=True)
 
                 if is_last_run:
                     final_chroma_path = c_path
                     del c_client  # Close connection but keep files
-                    print(f"Keeping Chroma DB at {c_path} for Serving Phase.")
+                    print(f"    [Keeping Chroma DB at {c_path} for Serving Phase]")
                 else:
                     cleanup_chroma(c_client, c_path)
-        finally:
-            conn_idx.close()
-            conn_def.close()
+            finally:
+                conn_idx.close()
 
-        # Print results for this size
-        print_result("PG Indexed", results_pg_indexed)
-        print_result("PG Deferred", results_pg_deferred)
-        print_result("QD Indexed", results_qd_indexed)
-        print_result("QD Deferred", results_qd_deferred)
-        print_result("Chroma", results_chroma)
+    # Print aggregated results
+    print(f"\n\n{'=' * 105}")
+    print("INGESTION AGGREGATED RESULTS")
+    print(f"{'=' * 105}")
+    print_detailed_header()
+
+    all_ingestion_metrics = []
+    for ingestion_size in INGESTION_SET_SIZES:
+        print(f"Size: {ingestion_size}", flush=True)
+        results = results_by_size[ingestion_size]
+
+        print_result("PG Indexed", results['pg_indexed'])
+        print_result("QD Indexed", results['qd_indexed'])
+        print_result("Chroma", results['chroma'])
+        print()
 
         # Collect metrics
         all_ingestion_metrics.append({
             'size': ingestion_size,
-            'pg_indexed': compute_metrics(ingestion_size, results_pg_indexed),
-            'pg_deferred': compute_metrics(ingestion_size, results_pg_deferred),
-            'qd_indexed': compute_metrics(ingestion_size, results_qd_indexed),
-            'qd_deferred': compute_metrics(ingestion_size, results_qd_deferred),
-            'chroma': compute_metrics(ingestion_size, results_chroma),
+            'pg_indexed': compute_metrics(ingestion_size, results['pg_indexed']),
+            'qd_indexed': compute_metrics(ingestion_size, results['qd_indexed']),
+            'chroma': compute_metrics(ingestion_size, results['chroma']),
         })
 
     # Save Ingestion Results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ingestion_methods = ['pg_indexed', 'pg_deferred', 'qd_indexed', 'qd_deferred', 'chroma']
+    ingestion_methods = ['pg_indexed', 'qd_indexed', 'chroma']
     ingestion_labels = {
-        'pg_indexed': 'PG Indexed', 'pg_deferred': 'PG Deferred',
-        'qd_indexed': 'Qdrant Indexed', 'qd_deferred': 'Qdrant Deferred',
+        'pg_indexed': 'PG Indexed',
+        'qd_indexed': 'Qdrant Indexed',
         'chroma': 'Chroma'
     }
 
     save_results_csv(all_ingestion_metrics, OUTPUT_DIR / "ingestion", timestamp, ingestion_methods)
     generate_plots(all_ingestion_metrics, OUTPUT_DIR / "ingestion", timestamp, ingestion_methods)
 
+    gc.collect()
+    time.sleep(2)
+
     # Phase 2: Serving
     print_header("Phase 2: Serving Benchmark")
     print("Using DBs populated in the last run of Phase 1...")
 
-    # Qdrant (Data left from Qdrant Deferred)
+    # Qdrant (Data left from last ingestion run)
     qd_client = create_qdrant_client()
 
     # Chroma (Data left at final_chroma_path)
@@ -470,49 +445,69 @@ def main():
         print("Error: No Chroma DB path retained.")
         return
 
-    all_serving_metrics = []
-
-    print_detailed_header()
-
     # Serving Warm-up
-    print("Warming up serving...")
+    print("\nWarming up serving...")
     warmup_inputs = [t for t, l in test_pool[:8]]
     serve_pg(pg_conn, warmup_inputs)
     serve_qdrant(qd_client, embed_client, warmup_inputs)
     serve_chroma(c_collection, embed_client, warmup_inputs)
 
-    for size in SERVING_TEST_SIZES:
-        print(f"Test Size: {size}")
-        test_inputs = [t for t, l in test_pool[:size]]
+    # Initialize results storage
+    results_by_size = {
+        size: {'pg': [], 'qdrant': [], 'chroma': []}
+        for size in SERVING_TEST_SIZES
+    }
 
-        m_pg = []
-        for _ in range(RUNS_SERVING):
+    # Outer loop: runs (cyclic execution)
+    for run_idx in range(RUNS_SERVING):
+        print(f"\n{'=' * 105}")
+        print(f"RUN {run_idx + 1}/{RUNS_SERVING}")
+        print(f"{'=' * 105}")
+
+        # Inner loop: sizes
+        for size in SERVING_TEST_SIZES:
+            print(f"\n  Size: {size}", flush=True)
+            test_inputs = [t for t, l in test_pool[:size]]
+
+            # PostgreSQL
             elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: serve_pg(pg_conn, test_inputs))
-            m_pg.append(BenchmarkResult(elapsed, stats))
+            results_by_size[size]['pg'].append(BenchmarkResult(elapsed, stats))
+            print(f"    PG: {elapsed:.2f}s", flush=True)
 
-        m_qd = []
-        for _ in range(RUNS_SERVING):
+            # Qdrant
             elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                     lambda: serve_qdrant(qd_client, embed_client, test_inputs),
-                                                     container_name=QDRANT_CONTAINER_NAME)
-            m_qd.append(BenchmarkResult(elapsed, stats))
+                                                        lambda: serve_qdrant(qd_client, embed_client, test_inputs),
+                                                        container_name=QDRANT_CONTAINER_NAME)
+            results_by_size[size]['qdrant'].append(BenchmarkResult(elapsed, stats))
+            print(f"    Qdrant: {elapsed:.2f}s", flush=True)
 
-        m_ch = []
-        for _ in range(RUNS_SERVING):
+            # Chroma
             elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                     lambda: serve_chroma(c_collection, embed_client, test_inputs))
-            m_ch.append(BenchmarkResult(elapsed, stats))
+                                                        lambda: serve_chroma(c_collection, embed_client, test_inputs))
+            results_by_size[size]['chroma'].append(BenchmarkResult(elapsed, stats))
+            print(f"    Chroma: {elapsed:.2f}s", flush=True)
 
-        print_result("PostgreSQL", m_pg)
-        print_result("Qdrant", m_qd)
-        print_result("Chroma", m_ch)
+    # Print aggregated results
+    print(f"\n\n{'=' * 105}")
+    print("SERVING AGGREGATED RESULTS")
+    print(f"{'=' * 105}")
+    print_detailed_header()
+
+    all_serving_metrics = []
+    for size in SERVING_TEST_SIZES:
+        print(f"Size: {size}", flush=True)
+        results = results_by_size[size]
+
+        print_result("PostgreSQL", results['pg'])
+        print_result("Qdrant", results['qdrant'])
+        print_result("Chroma", results['chroma'])
         print()
 
         res = {
             'size': size,
-            'pg': compute_metrics(size, m_pg),
-            'qdrant': compute_metrics(size, m_qd),
-            'chroma': compute_metrics(size, m_ch)
+            'pg': compute_metrics(size, results['pg']),
+            'qdrant': compute_metrics(size, results['qdrant']),
+            'chroma': compute_metrics(size, results['chroma'])
         }
         all_serving_metrics.append(res)
 
