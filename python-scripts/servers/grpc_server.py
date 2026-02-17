@@ -2,21 +2,18 @@ import asyncio
 
 import embed_anything
 import grpc
-from embed_anything import EmbeddingModel, WhichModel
-
 import tei_pb2 as pb2
 import tei_pb2_grpc as pb2_grpc
+from embed_anything import EmbeddingModel
 
+UNLIMITED = -1
 model_cache = {}
 
 
 def get_model(model_name: str):
     if model_name not in model_cache:
         print(f"Loading model: {model_name}")
-        model_cache[model_name] = EmbeddingModel.from_pretrained_onnx(
-            WhichModel.Bert,
-            hf_model_id=model_name
-        )
+        model_cache[model_name] = EmbeddingModel.from_pretrained_hf(model_id=model_name)
     return model_cache[model_name]
 
 
@@ -51,7 +48,12 @@ class EmbedService(pb2_grpc.EmbedServicer):
 
 
 async def serve():
-    server = grpc.aio.server()
+    server_options = [
+        ("grpc.max_send_message_length", UNLIMITED),
+        ("grpc.max_receive_message_length", UNLIMITED),
+    ]
+
+    server = grpc.aio.server(options=server_options)
     pb2_grpc.add_EmbedServicer_to_server(EmbedService(), server)
     port = 50051
     server.add_insecure_port(f"[::]:{port}")

@@ -1,7 +1,7 @@
 from typing import List
 
 import embed_anything
-from embed_anything import EmbeddingModel, WhichModel
+from embed_anything import EmbeddingModel
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -13,10 +13,7 @@ model_cache = {}
 def get_model(model_name: str):
     if model_name not in model_cache:
         print(f"Loading model: {model_name}")
-        model_cache[model_name] = EmbeddingModel.from_pretrained_onnx(
-            WhichModel.Bert,
-            hf_model_id=model_name
-        )
+        model_cache[model_name] = EmbeddingModel.from_pretrained_hf(model_id=model_name)
     return model_cache[model_name]
 
 

@@ -21,7 +21,7 @@ from typing import Callable, List, Optional, Tuple
 import embed_anything
 import psutil
 import psycopg2
-from embed_anything import EmbeddingModel, WhichModel
+from embed_anything import EmbeddingModel
 
 # =============================================================================
 # Configuration
@@ -37,7 +37,7 @@ DB_CONFIG = {
 QDRANT_URL = "http://localhost:6333"
 QDRANT_CONTAINER_NAME = "qdrant"
 
-EMBED_ANYTHING_MODEL = "Qdrant/all-MiniLM-L6-v2-onnx"
+EMBED_ANYTHING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 MiB = 1024 * 1024  # Bytes → Mebibytes conversion factor
 
@@ -266,9 +266,7 @@ class EmbedAnythingDirectClient:
     def _get_model(model_name: str):
         """Get or load model from cache."""
         if model_name not in model_cache:
-            model_cache[model_name] = EmbeddingModel.from_pretrained_onnx(
-                WhichModel.Bert, hf_model_id=model_name
-            )
+            model_cache[model_name] = EmbeddingModel.from_pretrained_hf(model_id=model_name)
         return model_cache[model_name]
 
 

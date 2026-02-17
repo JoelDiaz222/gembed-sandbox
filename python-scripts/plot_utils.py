@@ -101,6 +101,7 @@ def configure_latex_style():
 
 
 def save_results_csv(all_results: List[dict], output_dir: Path, timestamp: str, methods: List[str]):
+    """Save aggregated results with statistics (used after all runs are concatenated)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"benchmark_{timestamp}.csv"
 
@@ -141,6 +142,45 @@ def save_results_csv(all_results: List[dict], output_dir: Path, timestamp: str, 
                     row.extend([''] * (len(metrics) * 5))
             writer.writerow(row)
     print(f"\nResults saved to {path}")
+    return str(path)
+
+
+def save_single_run_csv(all_results: List[dict], output_dir: Path, run_id: str, methods: List[str]):
+    """Save a single run's raw results (without aggregation) for later concatenation."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"benchmark_{run_id}_run.csv"
+
+    # Data-driven component detection
+    has_pg = any(m in r and 'pg_cpu' in r[m] for r in all_results for m in methods)
+    has_qd = any(m in r and 'qd_cpu' in r[m] for r in all_results for m in methods)
+
+    metrics = ['throughput', 'time_s', 'py_cpu', 'py_mem_delta', 'py_mem_peak']
+    if has_pg:
+        metrics += ['pg_cpu', 'pg_mem_delta', 'pg_mem_peak']
+    if has_qd:
+        metrics += ['qd_cpu', 'qd_mem_delta', 'qd_mem_peak']
+    metrics += ['sys_cpu', 'sys_mem']
+
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        header = ['size']
+        for method in methods:
+            for metric in metrics:
+                header.append(f"{method}_{metric}")
+        writer.writerow(header)
+
+        for r in all_results:
+            row = [r['size']]
+            for method in methods:
+                if method in r:
+                    for metric in metrics:
+                        row.append(r[method].get(metric, ''))
+                else:
+                    row.extend([''] * len(metrics))
+            writer.writerow(row)
+    
+    print(f"CSV saved to: {path}")
+    return str(path)
 
 
 def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, methods: List[str]):
@@ -235,3 +275,62 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plot_dual('qd_cpu', 'qd_mem_peak', 'Qdrant Container', 'qdrant_resources')
     plot_dual('sys_cpu', 'sys_mem', 'System', 'system_resources')
     print(f"Plots saved to {output_dir} (PDF + PNG)")
+
+
+def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
+    """Generate plots from a concatenated CSV file.
+    
+    This function reads a CSV with multiple runs, aggregates the data,
+    and generates plots.
+    """
+    import pandas as pd
+    import numpy as np
+    from pathlib import Path
+    
+    df = pd.read_csv(csv_file)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Extract method names from columns
+    methods = []
+    for col in df.columns:
+        if col.endswith('_time_s'):
+            method = col.replace('_time_s', '')
+            methods.append(method)
+    
+    if not methods:
+        print(f"No methods found in CSV: {csv_file}")
+        return
+    
+    # Get unique sizes
+    sizes = sorted(df['size'].unique())
+    
+    # Aggregate data for each size and method
+    all_results = []
+    for size in sizes:
+        size_data = df[df['size'] == size]
+        result_entry = {'size': size}
+        
+        for method in methods:
+            method_data = {}
+            
+            # Collect all metrics for this method
+            for col in df.columns:
+                if col.startswith(f'{method}_') and not col.endswith(('_std', '_median', '_q1', '_q3')):
+                    metric_name = col.replace(f'{method}_', '')
+                    values = size_data[col].dropna().values
+                    
+                    if len(values) > 0:
+                        method_data[metric_name] = np.mean(values)
+                        method_data[f'{metric_name}_std'] = np.std(values)
+                        method_data[f'{metric_name}_median'] = np.median(values)
+                        method_data[f'{metric_name}_q1'] = np.percentile(values, 25)
+                        method_data[f'{metric_name}_q3'] = np.percentile(values, 75)
+            
+            result_entry[method] = method_data
+        
+        all_results.append(result_entry)
+    
+    # Generate plots using the existing function
+    generate_plots(all_results, output_dir, timestamp, methods)
+    print(f"Plots generated from CSV: {csv_file}")

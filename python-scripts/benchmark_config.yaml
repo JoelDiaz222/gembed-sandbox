@@ -1,0 +1,63 @@
+benchmarks:
+  1_internal-vs-external-gen:
+    enabled: true
+    script: "1_internal-vs-external-gen/benchmark.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 ]
+
+  2_pg_gembed-vs-vectordbs:
+    enabled: true
+    script: "2_pg_gembed-vs-vectordbs/benchmark.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024, 2048 ]
+
+  3_mono-store-vs-poly-store_scenario1:
+    enabled: true
+    script: "3_mono-store-vs-poly-store/benchmark_scenario1.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024, 2048, 4096 ]
+
+  3_mono-store-vs-poly-store_scenario2:
+    enabled: true
+    script: "3_mono-store-vs-poly-store/benchmark_scenario2.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024, 2048, 4096 ]
+
+  4_tpcx-ai-uc4_ingestion:
+    enabled: true
+    script: "4_tpcx-ai-uc4/benchmark_ingestion.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024, 2048, 4096 ]
+
+  4_tpcx-ai-uc4_serving:
+    enabled: true
+    script: "4_tpcx-ai-uc4/benchmark_serving.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024, 2048, 4096 ]
+    db_size: 4096
+
+  5_tpcx-ai-uc9_scenario1_ingestion:
+    enabled: true
+    script: "5_tpcx-ai-uc9/benchmark_scenario1_ingestion.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024 ]
+
+  5_tpcx-ai-uc9_scenario1_serving:
+    enabled: true
+    script: "5_tpcx-ai-uc9/benchmark_scenario1_serving.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024 ]
+    db_size: 1024
+
+  5_tpcx-ai-uc9_scenario2_ingestion:
+    enabled: true
+    script: "5_tpcx-ai-uc9/benchmark_scenario2_ingestion.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024 ]
+
+  5_tpcx-ai-uc9_scenario2_serving:
+    enabled: true
+    script: "5_tpcx-ai-uc9/benchmark_scenario2_serving.py"
+    runs: 15
+    sizes: [ 16, 32, 64, 128, 256, 512, 1024 ]
+    db_size: 1024

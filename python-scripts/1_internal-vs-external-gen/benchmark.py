@@ -1,3 +1,4 @@
+import argparse
 import os
 from datetime import datetime
 from pathlib import Path
@@ -16,12 +17,8 @@ from benchmark_utils import (
     connect_and_get_pid, warmup_pg_connection,
 )
 from data.loader import get_review_texts
-from plot_utils import save_results_csv, generate_plots
+from plot_utils import save_single_run_csv
 from psycopg2.extras import execute_values
-
-# Configuration
-TEST_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-RUNS_PER_SIZE = 15
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -32,12 +29,12 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 
 class EmbedAnythingGrpcClient:
     """gRPC client for EmbedAnything server."""
+    UNLIMITED = -1
 
     def __init__(self, address: str = "localhost:50051"):
-        UNLIMITED = -1
         options = [
-            ("grpc.max_send_message_length", UNLIMITED),
-            ("grpc.max_receive_message_length", UNLIMITED),
+            ("grpc.max_send_message_length", self.UNLIMITED),
+            ("grpc.max_receive_message_length", self.UNLIMITED),
         ]
 
         # When creating the channel
@@ -295,6 +292,22 @@ def print_result(label: str, results: List[BenchmarkResult]):
 # =============================================================================
 
 def main():
+    """Run benchmark with all sizes once (single run)."""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Benchmark 1: Internal vs External Generation')
+    parser.add_argument('--sizes', type=int, nargs='+', required=True,
+                        help='List of test sizes to benchmark')
+    parser.add_argument('--run-id', type=str, default=None,
+                        help='Run identifier for file naming')
+    args = parser.parse_args()
+
+    test_sizes = args.sizes
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print(f"Starting Benchmark 1: Internal vs External Generation")
+    print(f"Run ID: {run_id}")
+    print(f"Sizes: {test_sizes}")
+
     # Initialize setup connection (just for schema setup)
     conn, _ = connect_and_get_pid()
     setup_database(conn)
@@ -307,7 +320,7 @@ def main():
 
     try:
         # Pre-load all test data
-        test_data = {size: get_review_texts(size, shuffle=False) for size in TEST_SIZES}
+        test_data = {size: get_review_texts(size, shuffle=False) for size in test_sizes}
 
         # Define all methods to benchmark
         def make_methods(direct_client, grpc_client, http_client):
@@ -332,89 +345,64 @@ def main():
         methods = make_methods(direct_client, grpc_client, http_client)
         method_names = list(methods.keys())
 
-        # Initialize results storage
-        results_by_size = {size: {name: [] for name in method_names} for size in TEST_SIZES}
+        # Initialize results storage (single iteration per size)
+        results_by_size = {size: {name: None for name in method_names} for size in test_sizes}
 
-        # Outer loop: runs (cyclic execution across all sizes)
-        for run_idx in range(RUNS_PER_SIZE):
-            print(f"\nRun {run_idx + 1}/{RUNS_PER_SIZE}")
+        # Loop through sizes
+        for size in test_sizes:
+            texts = test_data[size]
+            print(f"\nSize: {size}", flush=True)
 
-            # Inner loop: sizes
-            for size in TEST_SIZES:
-                texts = test_data[size]
-                print(f"  Size: {size}", flush=True)
+            # Setup connections for all methods (with warmup)
+            connections = {}
+            pids = {}
+            try:
+                for method_name, benchmark_fn in methods.items():
+                    conn, py_pid, pg_pid = setup_method_connection(texts, benchmark_fn)
+                    connections[method_name] = conn
+                    pids[method_name] = (py_pid, pg_pid)
 
-                # Setup connections for all methods (with warmup)
-                connections = {}
-                pids = {}
-                try:
-                    for method_name, benchmark_fn in methods.items():
-                        conn, py_pid, pg_pid = setup_method_connection(texts, benchmark_fn)
-                        connections[method_name] = conn
-                        pids[method_name] = (py_pid, pg_pid)
+                # Execute each method once for this size
+                for method_name, benchmark_fn in methods.items():
+                    conn = connections[method_name]
+                    py_pid, pg_pid = pids[method_name]
+                    result = run_single_iteration(conn, py_pid, pg_pid, texts, benchmark_fn)
+                    results_by_size[size][method_name] = result
+                    print(f"  {method_name}: {result.time_s:.2f}s", flush=True)
 
-                    # Execute each method once for this size in this run
-                    for method_name, benchmark_fn in methods.items():
-                        conn = connections[method_name]
-                        py_pid, pg_pid = pids[method_name]
-                        result = run_single_iteration(conn, py_pid, pg_pid, texts, benchmark_fn)
-                        results_by_size[size][method_name].append(result)
+            finally:
+                # Close all connections
+                for conn in connections.values():
+                    conn.close()
 
-                finally:
-                    # Close all connections
-                    for conn in connections.values():
-                        conn.close()
-
-        # Print aggregated results and compute metrics
-        print("\n" + "=" * 105)
-        print("AGGREGATED RESULTS")
-        print("=" * 105)
-        print_detailed_header()
-
+        # Compute metrics for each size
         all_results = []
-        for size in TEST_SIZES:
-            print(f"Size: {size}", flush=True)
+        for size in test_sizes:
             results = results_by_size[size]
+            result_entry = {'size': size}
 
-            print_result("PG local", results['pg_local'])
-            print_result("PG gRPC", results['pg_grpc'])
-            print_result("Ext Direct", results['ext_direct'])
-            print_result("Ext gRPC", results['ext_grpc'])
-            print_result("Ext HTTP", results['ext_http'])
-            print()
+            for method_name in method_names:
+                result = results[method_name]
+                # For single run, just extract the raw metrics from the BenchmarkResult
+                result_entry[method_name] = {
+                    'time_s': result.time_s,
+                    'throughput': size / result.time_s if result.time_s > 0 else 0,
+                    'py_cpu': result.stats.py_cpu,
+                    'py_mem_delta': result.stats.py_delta_mb,
+                    'py_mem_peak': result.stats.py_peak_mb,
+                    'pg_cpu': result.stats.pg_cpu,
+                    'pg_mem_delta': result.stats.pg_delta_mb,
+                    'pg_mem_peak': result.stats.pg_peak_mb,
+                    'sys_cpu': result.stats.sys_cpu,
+                    'sys_mem': result.stats.sys_mem_mb,
+                }
 
-            # Store metrics for summary and plots
-            all_results.append({
-                'size': size,
-                'pg_local': compute_metrics(size, results['pg_local']),
-                'pg_grpc': compute_metrics(size, results['pg_grpc']),
-                'ext_direct': compute_metrics(size, results['ext_direct']),
-                'ext_grpc': compute_metrics(size, results['ext_grpc']),
-                'ext_http': compute_metrics(size, results['ext_http']),
-            })
+            all_results.append(result_entry)
 
-        # Print summary
-        print("=" * 105)
-
-        avg_pg_local = mean([r['pg_local']['throughput'] for r in all_results])
-        avg_pg_grpc = mean([r['pg_grpc']['throughput'] for r in all_results])
-        avg_ext_direct = mean([r['ext_direct']['throughput'] for r in all_results])
-        avg_ext_grpc = mean([r['ext_grpc']['throughput'] for r in all_results])
-        avg_ext_http = mean([r['ext_http']['throughput'] for r in all_results])
-
-        print("\nAverage Throughput Across All Sizes (texts/sec):")
-        print(f"  PG local:          {avg_pg_local:.2f}")
-        print(f"  PG gRPC:           {avg_pg_grpc:.2f}")
-        print(f"  External Direct:   {avg_ext_direct:.2f}")
-        print(f"  External gRPC:     {avg_ext_grpc:.2f}")
-        print(f"  External HTTP:     {avg_ext_http:.2f}")
-
-        # Save results to CSV and generate plots
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        methods = ['pg_local', 'pg_grpc', 'ext_direct', 'ext_grpc', 'ext_http']
-
-        save_results_csv(all_results, OUTPUT_DIR, timestamp, methods)
-        generate_plots(all_results, OUTPUT_DIR, timestamp, methods)
+        # Save results to CSV
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        save_single_run_csv(all_results, OUTPUT_DIR, run_id, method_names)
+        print(f"Run completed!")
 
     finally:
         grpc_client.close()
