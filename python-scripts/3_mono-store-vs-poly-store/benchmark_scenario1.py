@@ -105,7 +105,6 @@ def setup_pg_database(conn):
                     category_name TEXT,
                     PRIMARY KEY (product_id, category_name)
                 );
-                CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);
                 """)
     conn.commit()
     cur.close()
@@ -228,41 +227,42 @@ def scenario1_mono_store(conn, products: List[dict]):
             category_p_indices.append(i + 1)
             category_names.append(c)
     cur.execute("""
-                WITH input_products AS (SELECT name, description, price, stock, full_text, ord
+                WITH input_products AS (SELECT name,
+                                               description,
+                                               price,
+                                               stock,
+                                               full_text,
+                                               ord,
+                                               nextval('products_product_id_seq') as new_id
                                         FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[], %s::text[])
                                                  WITH ORDINALITY AS i(name, description, price, stock, full_text, ord)),
+                     computed_embeddings AS (SELECT id as ord, embedding
+                                             FROM embed_texts_with_ids(
+                                                     'embed_anything', %s,
+                                                     (SELECT array_agg(ord ORDER BY ord) FROM input_products)::int[],
+                                                     (SELECT array_agg(full_text ORDER BY ord) FROM input_products)::text[]
+                                                  )),
                      inserted_products AS (
-                         INSERT INTO products (name, description, price, stock_count)
-                             SELECT name, description, price, stock FROM input_products
-                             RETURNING product_id, name),
-                     product_mapping AS (SELECT p.product_id, i.ord
-                                         FROM inserted_products p
-                                                  JOIN input_products i ON p.name = i.name),
+                         INSERT INTO products (product_id, name, description, price, stock_count, embedding)
+                             SELECT i.new_id, i.name, i.description, i.price, i.stock, e.embedding
+                             FROM input_products i
+                                      JOIN computed_embeddings e ON i.ord = e.ord),
                      inserted_reviews AS (
                          INSERT INTO reviews (product_id, rating, review_text)
-                             SELECT m.product_id, r.rating, r.text
+                             SELECT i.new_id, r.rating, r.text
                              FROM unnest(%s::int[], %s::int[], %s::text[]) AS r(p_idx, rating, text)
-                                      JOIN product_mapping m ON r.p_idx = m.ord),
+                                      JOIN input_products i ON r.p_idx = i.ord),
                      inserted_categories AS (
                          INSERT INTO product_categories (product_id, category_name)
-                             SELECT m.product_id, c.cat_name
+                             SELECT i.new_id, c.cat_name
                              FROM unnest(%s::int[], %s::text[]) AS c(p_idx, cat_name)
-                                      JOIN product_mapping m ON c.p_idx = m.ord),
-                     embeddings AS (SELECT id, embedding
-                                    FROM embed_texts_with_ids(
-                                            'embed_anything', %s,
-                                            (SELECT array_agg(m.product_id ORDER BY i.ord)
-                                             FROM input_products i
-                                                      JOIN product_mapping m ON i.ord = m.ord)::int[],
-                                            (SELECT array_agg(i.full_text ORDER BY i.ord) FROM input_products i)::text[]))
-                UPDATE products p
-                SET embedding = e.embedding
-                FROM embeddings e
-                WHERE p.product_id = e.id;
+                                      JOIN input_products i ON c.p_idx = i.ord)
+                SELECT 1;
                 """, (names, descriptions, prices, stocks, full_texts,
+                      EMBED_ANYTHING_MODEL,
                       review_p_indices, review_ratings, review_texts,
-                      category_p_indices, category_names,
-                      EMBED_ANYTHING_MODEL))
+                      category_p_indices, category_names))
+    cur.execute("CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
     conn.commit()
     cur.close()
 
@@ -303,7 +303,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['mono_store', 'poly_chroma', 'poly_qdrant']
+    methods = ['pg_mono_deferred', 'poly_chroma', 'poly_qdrant']
 
     print(f"\nStarting Benchmark 3 - Scenario 1: Cold Start")
     print(f"Run ID: {run_id}")
@@ -366,8 +366,8 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_mono,
                 lambda: scenario1_mono_store(conn_mono, products))
-            results_by_size[size]['mono_store'] = BenchmarkResult(elapsed, stats)
-            print(f"  mono_store: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
 
             # Poly-Store Chroma
             client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)

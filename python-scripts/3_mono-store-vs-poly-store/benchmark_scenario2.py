@@ -96,7 +96,6 @@ def setup_pg_database(conn):
                     category_name TEXT,
                     PRIMARY KEY (product_id, category_name)
                 );
-                CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);
                 """)
     conn.commit()
     cur.close()
@@ -235,6 +234,7 @@ def scenario2_mono_store(conn):
                 FROM embeddings e
                 WHERE p.product_id = e.id;
                 """, (EMBED_ANYTHING_MODEL,))
+    cur.execute("CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
     conn.commit()
     cur.close()
 
@@ -313,7 +313,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['mono_store', 'poly_chroma', 'poly_qdrant']
+    methods = ['pg_mono_deferred', 'poly_chroma', 'poly_qdrant']
 
     print(f"\nStarting Benchmark 3 - Scenario 2: Pre-existing Data")
     print(f"Run ID: {run_id}")
@@ -363,8 +363,8 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_mono,
                 lambda: scenario2_mono_store(conn_mono))
-            results_by_size[size]['mono_store'] = BenchmarkResult(elapsed, stats)
-            print(f"  mono_store: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
 
             # Poly-Store Chroma
             client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
