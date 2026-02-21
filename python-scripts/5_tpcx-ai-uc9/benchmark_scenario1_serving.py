@@ -17,6 +17,7 @@ from benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME,
     BenchmarkResult, ResourceMonitor,
     connect_and_get_pid, get_pg_pid, warmup_pg_connection,
+    temp_image_dir,
 )
 from embed_anything import EmbeddingModel
 from plot_utils import save_single_run_csv
@@ -42,23 +43,13 @@ model_cache = {}
 class EmbedAnythingImageClient:
     def embed_files(self, paths: List[str]) -> List[List[float]]:
         model = self._get_model()
-        base_temp = Path("temp_bench_imgs")
-        if base_temp.exists():
-            shutil.rmtree(base_temp)
-        base_temp.mkdir()
-        try:
-            for idx, p in enumerate(paths):
-                ext = Path(p).suffix
-                shutil.copy(p, base_temp / f"{idx:06d}{ext}")
+        embeddings = []
+        with temp_image_dir(paths) as base_temp:
             res = embed_anything.embed_image_directory(str(base_temp), embedder=model)
-            embeddings = []
             if isinstance(res, list):
                 for item in res:
                     if hasattr(item, 'embedding'):
                         embeddings.append(item.embedding)
-        finally:
-            if base_temp.exists():
-                shutil.rmtree(base_temp)
         return embeddings
 
     @staticmethod
@@ -126,26 +117,24 @@ def setup_pg_schema(conn):
 def s1_populate_pg(conn, image_paths: List[str]):
     cur = conn.cursor()
     batch_names = [get_person_name(p) for p in image_paths]
-    batch_images = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            batch_images.append(f.read())
     unique_names = list(set(batch_names))
     execute_values(cur, "INSERT INTO persons (name) VALUES %s ON CONFLICT (name) DO NOTHING",
                    [(n,) for n in unique_names])
-    sql = """
-          INSERT INTO faces (path, person_id, embedding)
-          SELECT t.p, p.id, t.e
-          FROM unnest(%s::text[], %s::text[],
-                      embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, e)
-                   JOIN persons p ON t.n = p.name \
-          """
-    cur.execute(sql, (image_paths, batch_names, MODEL_NAME, batch_images))
-    conn.commit()
+
+    with temp_image_dir(image_paths, prefix="temp_pg_ingest_setup") as base_temp:
+        sql = """
+              INSERT INTO faces (path, person_id, embedding)
+              SELECT t.p, p.id, t.e
+              FROM unnest(%s::text[], %s::text[],
+                          embed_image_directory('embed_anything', %s, %s)) AS t(p, n, e)
+                       JOIN persons p ON t.n = p.name
+              """
+        cur.execute(sql, (image_paths, batch_names, MODEL_NAME, str(base_temp.absolute())))
+        conn.commit()
     cur.close()
 
 
-def s1_ingest_pg_indexed(conn, image_paths: List[str]):
+def s1_ingest_pg_unified(conn, image_paths: List[str]):
     cur = conn.cursor()
     cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
                 " WITH (m=16, ef_construction=100);")
@@ -200,25 +189,25 @@ def s1_ingest_chroma(collection, image_paths: List[str], embed_client: EmbedAnyt
 # Serving Functions
 # =============================================================================
 
-def serve_s1_pg(conn, query_paths: List[str]):
+def serve_s1_pg_unified(conn, query_paths: List[str]):
     cur = conn.cursor()
-    images_data = [open(p, "rb").read() for p in query_paths]
-    sql = """
-          WITH queries AS (SELECT i.ord, i.embedding
-                           FROM unnest(embed_images('embed_anything', %s, %s::bytea[]))
-                                    WITH ORDINALITY AS i(embedding, ord))
-          SELECT q.ord, f.path
-          FROM queries q
-                   CROSS JOIN LATERAL (
-              SELECT path
-              FROM faces f
-              ORDER BY f.embedding <-> q.embedding
-              LIMIT %s
-              ) f
-          ORDER BY q.ord; \
-          """
-    cur.execute(sql, (MODEL_NAME, images_data, TOP_K))
-    _ = cur.fetchall()
+    with temp_image_dir(query_paths, "s1_pg_unified_") as base_temp:
+        sql = """
+            WITH query_embeddings AS (
+                SELECT unnest(embed_image_directory('embed_anything', %s, %s)) as embedding
+            )
+            SELECT q.embedding, f.path
+            FROM query_embeddings q,
+            LATERAL (
+                SELECT path
+                FROM faces
+                ORDER BY faces.embedding <-> q.embedding
+                LIMIT %s
+            ) f;
+        """
+        cur.execute(sql, (MODEL_NAME, str(base_temp.absolute()), TOP_K))
+        _ = cur.fetchall()
+
     conn.commit()
     cur.close()
 
@@ -252,7 +241,7 @@ def main():
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     db_size = args.db_size
-    methods = ['pg_mono_store', 'poly_qdrant', 'poly_chroma']
+    methods = ['pg_unified', 'poly_qdrant', 'poly_chroma']
 
     print(f"\nStarting Benchmark 5 UC9 - Scenario 1 Serving")
     print(f"Run ID: {run_id}")
@@ -282,7 +271,7 @@ def main():
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
     model_cache.clear()
-    s1_ingest_pg_indexed(conn_pg, ingest_paths)
+    s1_ingest_pg_unified(conn_pg, ingest_paths)
 
     qd = create_qdrant_client()
     model_cache.clear()
@@ -298,7 +287,7 @@ def main():
     warmup_queries = queries_by_size.get(min(test_sizes), [])[:4]
     if warmup_queries:
         model_cache.clear()
-        serve_s1_pg(conn_pg, warmup_queries)
+        serve_s1_pg_unified(conn_pg, warmup_queries)
         model_cache.clear()
         serve_s1_qdrant(qd, embed_client, warmup_queries)
         model_cache.clear()
@@ -314,9 +303,9 @@ def main():
         model_cache.clear()
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, get_pg_pid(conn_pg),
-            lambda: serve_s1_pg(conn_pg, queries))
-        results_by_size[size]['pg_mono_store'] = BenchmarkResult(elapsed, stats)
-        print(f"  pg_mono_store: {elapsed:.2f}s", flush=True)
+            lambda: serve_s1_pg_unified(conn_pg, queries))
+        results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
+        print(f"  pg_unified: {elapsed:.2f}s", flush=True)
 
         model_cache.clear()
         elapsed, _, stats = ResourceMonitor.measure(

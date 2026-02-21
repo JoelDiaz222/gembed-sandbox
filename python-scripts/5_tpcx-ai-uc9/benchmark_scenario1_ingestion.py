@@ -17,6 +17,7 @@ from benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME,
     BenchmarkResult, ResourceMonitor,
     connect_and_get_pid, warmup_pg_connection,
+    temp_image_dir,
 )
 from embed_anything import EmbeddingModel
 from plot_utils import save_single_run_csv
@@ -41,23 +42,13 @@ model_cache = {}
 class EmbedAnythingImageClient:
     def embed_files(self, paths: List[str]) -> List[List[float]]:
         model = self._get_model()
-        base_temp = Path("temp_bench_imgs")
-        if base_temp.exists():
-            shutil.rmtree(base_temp)
-        base_temp.mkdir()
-        try:
-            for idx, p in enumerate(paths):
-                ext = Path(p).suffix
-                shutil.copy(p, base_temp / f"{idx:06d}{ext}")
+        embeddings = []
+        with temp_image_dir(paths) as base_temp:
             res = embed_anything.embed_image_directory(str(base_temp), embedder=model)
-            embeddings = []
             if isinstance(res, list):
                 for item in res:
                     if hasattr(item, 'embedding'):
                         embeddings.append(item.embedding)
-        finally:
-            if base_temp.exists():
-                shutil.rmtree(base_temp)
         return embeddings
 
     @staticmethod
@@ -132,26 +123,24 @@ def truncate_pg_table(conn):
 def s1_populate_pg(conn, image_paths: List[str]):
     cur = conn.cursor()
     batch_names = [get_person_name(p) for p in image_paths]
-    batch_images = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            batch_images.append(f.read())
     unique_names = list(set(batch_names))
     execute_values(cur, "INSERT INTO persons (name) VALUES %s ON CONFLICT (name) DO NOTHING",
                    [(n,) for n in unique_names])
-    sql = """
-          INSERT INTO faces (path, person_id, embedding)
-          SELECT t.p, p.id, t.e
-          FROM unnest(%s::text[], %s::text[],
-                      embed_images('embed_anything', %s, %s::bytea[])) AS t(p, n, e)
-                   JOIN persons p ON t.n = p.name \
-          """
-    cur.execute(sql, (image_paths, batch_names, MODEL_NAME, batch_images))
-    conn.commit()
+
+    with temp_image_dir(image_paths, prefix="temp_pg_ingest") as base_temp:
+        sql = """
+              INSERT INTO faces (path, person_id, embedding)
+              SELECT t.p, p.id, t.e
+              FROM unnest(%s::text[], %s::text[],
+                          embed_image_directory('embed_anything', %s, %s)) AS t(p, n, e)
+                       JOIN persons p ON t.n = p.name
+              """
+        cur.execute(sql, (image_paths, batch_names, MODEL_NAME, str(base_temp.absolute())))
+        conn.commit()
     cur.close()
 
 
-def s1_ingest_pg_indexed(conn, image_paths: List[str]):
+def s1_ingest_pg_unified(conn, image_paths: List[str]):
     cur = conn.cursor()
     cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
                 " WITH (m=16, ef_construction=100);")
@@ -218,7 +207,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_indexed', 'qd_indexed', 'chroma']
+    methods = ['pg_unified', 'qd_indexed', 'chroma']
 
     print(f"\nStarting Benchmark 5 UC9 - Scenario 1 Ingestion")
     print(f"Run ID: {run_id}")
@@ -242,7 +231,7 @@ def main():
         conn_w, _ = connect_and_get_pid()
         warmup_pg_connection(conn_w)
         setup_pg_schema(conn_w)
-        s1_ingest_pg_indexed(conn_w, warmup_paths)
+        s1_ingest_pg_unified(conn_w, warmup_paths)
         truncate_pg_table(conn_w)
         conn_w.close()
 
@@ -263,54 +252,48 @@ def main():
     for size in test_sizes:
         print(f"\nSize: {size}", flush=True)
         paths = paths_by_size[size]
-        model_cache.clear()
 
+        # PG Unified
         conn, pg_pid = connect_and_get_pid()
         warmup_pg_connection(conn)
         setup_pg_schema(conn)
-
+        model_cache.clear()
         try:
-            # PG Indexed
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
-                lambda: s1_ingest_pg_indexed(conn, paths))
-            results_by_size[size]['pg_indexed'] = BenchmarkResult(elapsed, stats)
-            print(f"  pg_indexed: {elapsed:.2f}s", flush=True)
+                lambda: s1_ingest_pg_unified(conn, paths))
+            results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+        finally:
             conn.close()
 
-            # Qdrant
-            qd = create_qdrant_client()
-            model_cache.clear()
-            try:
-                elapsed, _, stats = ResourceMonitor.measure(
-                    py_pid, None,
-                    lambda: s1_ingest_qdrant(qd, paths, embed_client),
-                    container_name=QDRANT_CONTAINER_NAME)
-                results_by_size[size]['qd_indexed'] = BenchmarkResult(elapsed, stats)
-                print(f"  qd_indexed: {elapsed:.2f}s", flush=True)
-            finally:
-                if qd.collection_exists("faces"):
-                    qd.delete_collection("faces")
-                qd.close()
+        # Qdrant
+        qd = create_qdrant_client()
+        model_cache.clear()
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, None,
+                lambda: s1_ingest_qdrant(qd, paths, embed_client),
+                container_name=QDRANT_CONTAINER_NAME)
+            results_by_size[size]['qd_indexed'] = BenchmarkResult(elapsed, stats)
+            print(f"  qd_indexed: {elapsed:.2f}s", flush=True)
+        finally:
+            if qd.collection_exists("faces"):
+                qd.delete_collection("faces")
+            qd.close()
 
-            # Chroma
-            c_client, c_path = create_chroma_client()
-            col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-            model_cache.clear()
-            try:
-                elapsed, _, stats = ResourceMonitor.measure(
-                    py_pid, None,
-                    lambda: s1_ingest_chroma(col, paths, embed_client))
-                results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
-                print(f"  chroma: {elapsed:.2f}s", flush=True)
-            finally:
-                cleanup_chroma(c_client, c_path)
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            raise
+        # Chroma
+        c_client, c_path = create_chroma_client()
+        col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
+        model_cache.clear()
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, None,
+                lambda: s1_ingest_chroma(col, paths, embed_client))
+            results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
+            print(f"  chroma: {elapsed:.2f}s", flush=True)
+        finally:
+            cleanup_chroma(c_client, c_path)
 
     # Collect metrics
     all_results = []

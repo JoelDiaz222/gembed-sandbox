@@ -11,10 +11,12 @@ All benchmarks should import from this module to ensure:
 - Consistent statistics computation
 """
 
+import contextlib
 import os
 import shutil
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import mean, stdev, median, quantiles
 from typing import Callable, List, Optional, Tuple
 
@@ -331,6 +333,32 @@ def warmup_pg_connection(conn, provider: str = 'embed_anything',
     cur.fetchall()
     conn.commit()
     cur.close()
+
+
+# =============================================================================
+# Image Directory Helpers
+# =============================================================================
+
+@contextlib.contextmanager
+def temp_image_dir(image_paths: List[str], prefix: str = "temp_bench_imgs"):
+    """
+    Context manager that creates a temporary directory and copies images into it.
+    Images are renamed to 000000.ext, 000001.ext, etc. to ensure consistent ordering.
+    Yields the absolute Path to the temporary directory.
+    """
+    # Use a timestamp to avoid collisions if multiple benchmarks run in parallel
+    temp_dir = Path(f"{prefix}_{int(time.time() * 1000)}").absolute()
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True)
+    try:
+        for idx, p in enumerate(image_paths):
+            ext = Path(p).suffix
+            shutil.copy(p, temp_dir / f"{idx:06d}{ext}")
+        yield temp_dir
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
 
 
 # =============================================================================
