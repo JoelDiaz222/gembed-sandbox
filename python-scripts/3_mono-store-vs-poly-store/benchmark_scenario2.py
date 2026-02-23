@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import Callable, List
 
 import chromadb
-from benchmark_utils import (
+from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME, EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
     EmbedAnythingDirectClient, EmbeddingWrapper,
-    connect_and_get_pid, warmup_pg_connection,
+    connect_and_get_pid, warmup_pg_connection, clear_model_cache,
 )
-from plot_utils import save_single_run_csv
+from utils.plot_utils import save_single_run_csv
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
@@ -239,6 +239,49 @@ def scenario2_mono_store(conn):
     cur.close()
 
 
+def scenario2_mono_direct(conn, embed_client):
+    """Fetch text from PG, generate embeddings from app, store in PG."""
+    cur = conn.cursor()
+    cur.execute("""
+                SELECT p.product_id,
+                       p.name || '. ' || p.description ||
+                       '. Price: $' || p.price::text ||
+                       '. Reviews: ' || COALESCE(
+                               (SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
+                                FROM (SELECT review_text, created_at
+                                      FROM reviews
+                                      WHERE product_id = p.product_id
+                                      LIMIT 5) r), 'No reviews') ||
+                       '. Categories: ' || COALESCE(
+                               (SELECT string_agg(category_name, ', ')
+                                FROM product_categories
+                                WHERE product_id = p.product_id), 'Uncategorized') AS full_text
+                FROM products p
+                ORDER BY p.product_id
+                """)
+    rows = cur.fetchall()
+    product_ids, documents = [], []
+    for row in rows:
+        pid, doc = row
+        product_ids.append(pid)
+        documents.append(doc)
+        
+    embeddings = embed_client.embed(documents)
+    
+    # Update embeddings in PG
+    # Use unnest for batch update
+    cur.execute("""
+                UPDATE products p
+                SET embedding = e.embedding
+                FROM unnest(%s::int[], %s::vector[]) AS e(id, embedding)
+                WHERE p.product_id = e.id;
+                """, (product_ids, [list(e) for e in embeddings]))
+    
+    cur.execute("CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
+    conn.commit()
+    cur.close()
+
+
 def scenario2_poly_store_chroma(conn, embed_client, chroma_collection):
     """Fetch data from PG, embed, store in ChromaDB."""
     cur = conn.cursor()
@@ -313,7 +356,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_mono_deferred', 'poly_chroma', 'poly_qdrant']
+    methods = ['pg_mono_deferred', 'mono_direct_deferred', 'poly_chroma', 'poly_qdrant']
 
     print(f"\nStarting Benchmark 3 - Scenario 2: Pre-existing Data")
     print(f"Run ID: {run_id}")
@@ -331,6 +374,9 @@ def main():
     insert_product_data(conn_w, warmup_products)
     scenario2_mono_store(conn_w)
     clear_embeddings(conn_w)
+    scenario2_mono_direct(conn_w, embed_client)
+    clear_embeddings(conn_w)
+    clear_model_cache()
     conn_w.close()
 
     # Pre-generate test data
@@ -358,6 +404,11 @@ def main():
         setup_pg_database(conn_qdrant)
         insert_product_data(conn_qdrant, products)
 
+        conn_direct, pg_pid_direct = connect_and_get_pid()
+        warmup_pg_connection(conn_direct)
+        setup_pg_database(conn_direct)
+        insert_product_data(conn_direct, products)
+
         try:
             # Mono-Store
             elapsed, _, stats = ResourceMonitor.measure(
@@ -365,6 +416,15 @@ def main():
                 lambda: scenario2_mono_store(conn_mono))
             results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+
+            # Mono-Store Direct
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid_direct,
+                lambda: scenario2_mono_direct(conn_direct, embed_client))
+            results_by_size[size]['mono_direct_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_direct_deferred: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
 
             # Poly-Store Chroma
             client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
@@ -374,6 +434,7 @@ def main():
                     lambda: scenario2_poly_store_chroma(conn_chroma, embed_client, col_c))
                 results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
             finally:
                 cleanup_chroma(client_c, path_c)
 
@@ -385,12 +446,14 @@ def main():
                     lambda: scenario2_poly_store_qdrant(conn_qdrant, embed_client, qd))
                 results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
             finally:
                 cleanup_qdrant(qd)
         finally:
             conn_mono.close()
             conn_chroma.close()
             conn_qdrant.close()
+            conn_direct.close()
 
     # Collect metrics
     all_results = []

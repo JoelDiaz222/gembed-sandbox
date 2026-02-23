@@ -13,14 +13,14 @@ from typing import List
 
 import chromadb
 import embed_anything
-from benchmark_utils import (
+from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME,
     BenchmarkResult, ResourceMonitor,
     connect_and_get_pid, warmup_pg_connection,
-    temp_image_dir,
+    temp_image_dir, clear_model_cache,
 )
 from embed_anything import EmbeddingModel
-from plot_utils import save_single_run_csv
+from utils.plot_utils import save_single_run_csv
 from psycopg2.extras import execute_values
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -32,7 +32,6 @@ MODEL_NAME = "openai/clip-vit-base-patch32"
 INGEST_PER_PERSON = 64
 QUERY_PER_PERSON = 16
 
-model_cache = {}
 
 
 # =============================================================================
@@ -41,7 +40,7 @@ model_cache = {}
 
 class EmbedAnythingImageClient:
     def embed_files(self, paths: List[str]) -> List[List[float]]:
-        model = self._get_model()
+        model = EmbeddingModel.from_pretrained_hf(MODEL_NAME)
         embeddings = []
         with temp_image_dir(paths) as base_temp:
             res = embed_anything.embed_image_directory(str(base_temp), embedder=model)
@@ -51,11 +50,6 @@ class EmbedAnythingImageClient:
                         embeddings.append(item.embedding)
         return embeddings
 
-    @staticmethod
-    def _get_model():
-        if MODEL_NAME not in model_cache:
-            model_cache[MODEL_NAME] = EmbeddingModel.from_pretrained_hf(MODEL_NAME)
-        return model_cache[MODEL_NAME]
 
 
 # =============================================================================
@@ -140,6 +134,22 @@ def s1_populate_pg(conn, image_paths: List[str]):
     cur.close()
 
 
+def s1_ingest_pg_direct(conn, image_paths: List[str], embed_client: EmbedAnythingImageClient):
+    """Embed in Python, then insert path + embedding into PG."""
+    setup_pg_schema(conn)
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
+                " WITH (m=16, ef_construction=100);")
+    
+    embeddings = embed_client.embed_files(image_paths)
+    execute_values(cur, 
+        "INSERT INTO faces (path, embedding) VALUES %s",
+        list(zip(image_paths, embeddings))
+    )
+    conn.commit()
+    cur.close()
+
+
 def s1_ingest_pg_unified(conn, image_paths: List[str]):
     cur = conn.cursor()
     cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
@@ -207,7 +217,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_unified', 'qd_indexed', 'chroma']
+    methods = ['pg_unified', 'pg_direct', 'qd_indexed', 'chroma']
 
     print(f"\nStarting Benchmark 5 UC9 - Scenario 1 Ingestion")
     print(f"Run ID: {run_id}")
@@ -233,6 +243,10 @@ def main():
         setup_pg_schema(conn_w)
         s1_ingest_pg_unified(conn_w, warmup_paths)
         truncate_pg_table(conn_w)
+
+        s1_ingest_pg_direct(conn_w, warmup_paths, embed_client)
+        truncate_pg_table(conn_w)
+        clear_model_cache()
         conn_w.close()
 
         qd_w = create_qdrant_client()
@@ -240,11 +254,13 @@ def main():
         if qd_w.collection_exists("faces"):
             qd_w.delete_collection("faces")
         qd_w.close()
+        clear_model_cache()
 
         c_w, c_path_w = create_chroma_client()
         col_w = c_w.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
         s1_ingest_chroma(col_w, warmup_paths, embed_client)
         cleanup_chroma(c_w, c_path_w)
+        clear_model_cache()
 
     # Single run over all sizes
     results_by_size = {size: {m: None for m in methods} for size in test_sizes}
@@ -257,19 +273,27 @@ def main():
         conn, pg_pid = connect_and_get_pid()
         warmup_pg_connection(conn)
         setup_pg_schema(conn)
-        model_cache.clear()
+        clear_model_cache()
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
                 lambda: s1_ingest_pg_unified(conn, paths))
             results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+
+            # PG Direct
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: s1_ingest_pg_direct(conn, paths, embed_client))
+            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
+            clear_model_cache()
         finally:
             conn.close()
 
         # Qdrant
         qd = create_qdrant_client()
-        model_cache.clear()
+        clear_model_cache()
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, None,
@@ -285,7 +309,7 @@ def main():
         # Chroma
         c_client, c_path = create_chroma_client()
         col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-        model_cache.clear()
+        clear_model_cache()
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, None,

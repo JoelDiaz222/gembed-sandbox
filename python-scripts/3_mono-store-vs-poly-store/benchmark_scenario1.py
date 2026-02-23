@@ -12,15 +12,15 @@ from pathlib import Path
 from typing import Callable, List
 
 import chromadb
-from benchmark_utils import (
+from qdrant_client import QdrantClient, models
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME, EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
     EmbedAnythingDirectClient, EmbeddingWrapper,
-    connect_and_get_pid, warmup_pg_connection,
+    connect_and_get_pid, warmup_pg_connection, clear_model_cache,
 )
-from plot_utils import save_single_run_csv
-from qdrant_client import QdrantClient, models
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from utils.plot_utils import save_single_run_csv
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -77,8 +77,10 @@ def build_embedding_context(product: dict) -> str:
 def setup_pg_database(conn):
     cur = conn.cursor()
     cur.execute("""
-                CREATE EXTENSION IF NOT EXISTS vector;
-                CREATE EXTENSION IF NOT EXISTS pg_gembed;
+                CREATE
+                EXTENSION IF NOT EXISTS vector;
+                CREATE
+                EXTENSION IF NOT EXISTS pg_gembed;
                 DROP TABLE IF EXISTS product_categories CASCADE;
                 DROP TABLE IF EXISTS reviews CASCADE;
                 DROP TABLE IF EXISTS products CASCADE;
@@ -138,22 +140,29 @@ def batch_insert_products(cur, products: List[dict]) -> List[int]:
                                         FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[])
                                                  WITH ORDINALITY AS i(name, description, price, stock, ord)),
                      inserted_products AS (
-                         INSERT INTO products (name, description, price, stock_count)
-                             SELECT name, description, price, stock FROM input_products
-                             RETURNING product_id, name),
-                     product_mapping AS (SELECT p.product_id, i.ord
-                                         FROM inserted_products p
-                                                  JOIN input_products i ON p.name = i.name),
-                     inserted_reviews AS (
-                         INSERT INTO reviews (product_id, rating, review_text)
-                             SELECT m.product_id, r.rating, r.text
-                             FROM unnest(%s::int[], %s::int[], %s::text[]) AS r(p_idx, rating, text)
-                                      JOIN product_mapping m ON r.p_idx = m.ord),
-                     inserted_categories AS (
-                         INSERT INTO product_categories (product_id, category_name)
-                             SELECT m.product_id, c.cat_name
-                             FROM unnest(%s::int[], %s::text[]) AS c(p_idx, cat_name)
-                                      JOIN product_mapping m ON c.p_idx = m.ord)
+                INSERT
+                INTO products (name, description, price, stock_count)
+                SELECT name, description, price, stock
+                FROM input_products RETURNING product_id, name),
+                     product_mapping AS (
+                SELECT p.product_id, i.ord
+                FROM inserted_products p
+                    JOIN input_products i
+                ON p.name = i.name),
+                    inserted_reviews AS (
+                INSERT
+                INTO reviews (product_id, rating, review_text)
+                SELECT m.product_id, r.rating, r.text
+                FROM unnest(%s:: int [], %s:: int [], %s::text[]) AS r(p_idx, rating, text)
+                    JOIN product_mapping m
+                ON r.p_idx = m.ord),
+                    inserted_categories AS (
+                INSERT
+                INTO product_categories (product_id, category_name)
+                SELECT m.product_id, c.cat_name
+                FROM unnest(%s:: int [], %s::text[]) AS c (p_idx, cat_name)
+                    JOIN product_mapping m
+                ON c.p_idx = m.ord)
                 SELECT product_id
                 FROM product_mapping
                 ORDER BY ord;
@@ -239,30 +248,101 @@ def scenario1_mono_store(conn, products: List[dict]):
                      computed_embeddings AS (SELECT id as ord, embedding
                                              FROM embed_texts_with_ids(
                                                      'embed_anything', %s,
-                                                     (SELECT array_agg(ord ORDER BY ord) FROM input_products)::int[],
+                                                     (SELECT array_agg(ord ORDER BY ord) FROM input_products):: int [],
                                                      (SELECT array_agg(full_text ORDER BY ord) FROM input_products)::text[]
                                                   )),
                      inserted_products AS (
-                         INSERT INTO products (product_id, name, description, price, stock_count, embedding)
-                             SELECT i.new_id, i.name, i.description, i.price, i.stock, e.embedding
-                             FROM input_products i
-                                      JOIN computed_embeddings e ON i.ord = e.ord),
+                INSERT
+                INTO products (product_id, name, description, price, stock_count, embedding)
+                SELECT i.new_id, i.name, i.description, i.price, i.stock, e.embedding
+                FROM input_products i
+                         JOIN computed_embeddings e ON i.ord = e.ord
+                    ),
                      inserted_reviews AS (
                          INSERT INTO reviews (product_id, rating, review_text)
                              SELECT i.new_id, r.rating, r.text
-                             FROM unnest(%s::int[], %s::int[], %s::text[]) AS r(p_idx, rating, text)
-                                      JOIN input_products i ON r.p_idx = i.ord),
-                     inserted_categories AS (
-                         INSERT INTO product_categories (product_id, category_name)
-                             SELECT i.new_id, c.cat_name
-                             FROM unnest(%s::int[], %s::text[]) AS c(p_idx, cat_name)
-                                      JOIN input_products i ON c.p_idx = i.ord)
+                             FROM unnest(%s:: int []
+                   , %s:: int []
+                   , %s::text[]) AS r(p_idx
+                   , rating
+                   , text)
+                    JOIN input_products i ON r.p_idx = i.ord)
+                   , inserted_categories AS (
+                    INSERT INTO product_categories (product_id
+                   , category_name)
+                    SELECT i.new_id
+                   , c.cat_name
+                    FROM unnest(%s:: int []
+                   , %s::text[]) AS c (p_idx
+                   , cat_name)
+                    JOIN input_products i ON c.p_idx = i.ord)
                 SELECT 1;
                 """, (names, descriptions, prices, stocks, full_texts,
                       EMBED_ANYTHING_MODEL,
                       review_p_indices, review_ratings, review_texts,
                       category_p_indices, category_names))
-    cur.execute("CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
+    cur.execute(
+        "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
+    conn.commit()
+    cur.close()
+
+
+def scenario1_mono_direct(conn, products: List[dict], embed_client):
+    """Insert data into PG, generate embeddings from app data, store in PG."""
+    full_texts = [build_embedding_context(p) for p in products]
+    embeddings = embed_client.embed(full_texts)
+
+    cur = conn.cursor()
+    # Insert products with embeddings
+    # Using a slightly simplified version of the batch insert for multi-table insertion
+    # We first insert products to get IDs, then reviews and categories.
+
+    # Insert products
+    names = [p['name'] for p in products]
+    descriptions = [p['description'] for p in products]
+    prices = [p['price'] for p in products]
+    stocks = [p['stock'] for p in products]
+
+    cur.execute("""
+                WITH input_products AS (SELECT name, description, price, stock, embedding, ord
+                                        FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[], %s::vector[])
+                                                 WITH ORDINALITY AS i(name, description, price, stock, embedding, ord)),
+                     inserted_products AS (
+                INSERT
+                INTO products (name, description, price, stock_count, embedding)
+                SELECT name, description, price, stock, embedding
+                FROM input_products RETURNING product_id, name),
+                     product_mapping AS (
+                SELECT p.product_id, i.ord
+                FROM inserted_products p
+                    JOIN input_products i
+                ON p.name = i.name),
+                    inserted_reviews AS (
+                INSERT
+                INTO reviews (product_id, rating, review_text)
+                SELECT m.product_id, r.rating, r.text
+                FROM unnest(%s:: int [], %s:: int [], %s::text[]) AS r(p_idx, rating, text)
+                    JOIN product_mapping m
+                ON r.p_idx = m.ord),
+                    inserted_categories AS (
+                INSERT
+                INTO product_categories (product_id, category_name)
+                SELECT m.product_id, c.cat_name
+                FROM unnest(%s:: int [], %s::text[]) AS c (p_idx, cat_name)
+                    JOIN product_mapping m
+                ON c.p_idx = m.ord)
+                SELECT 1;
+                """, (names, descriptions, prices, stocks, [list(e) for e in embeddings],
+                      # Review data
+                      [i + 1 for i, p in enumerate(products) for _ in p['reviews']],
+                      [r['rating'] for p in products for r in p['reviews']],
+                      [r['text'] for p in products for r in p['reviews']],
+                      # Category data
+                      [i + 1 for i, p in enumerate(products) for _ in p['categories']],
+                      [c for p in products for c in p['categories']]))
+
+    cur.execute(
+        "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
     conn.commit()
     cur.close()
 
@@ -303,7 +383,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_mono_deferred', 'poly_chroma', 'poly_qdrant']
+    methods = ['pg_mono_deferred', 'mono_direct_deferred', 'poly_chroma', 'poly_qdrant']
 
     print(f"\nStarting Benchmark 3 - Scenario 1: Cold Start")
     print(f"Run ID: {run_id}")
@@ -329,6 +409,7 @@ def main():
     scenario1_poly_store_chroma(conn_wc, warmup_products, embed_client, col_w)
     conn_wc.close()
     cleanup_chroma(client_w, path_w)
+    clear_model_cache()
 
     qd_w = create_qdrant_client()
     conn_wq, _ = connect_and_get_pid()
@@ -337,12 +418,21 @@ def main():
     scenario1_poly_store_qdrant(conn_wq, warmup_products, embed_client, qd_w)
     conn_wq.close()
     cleanup_qdrant(qd_w)
+    clear_model_cache()
 
     # Pre-generate test data
     test_products = {size: generate_products(size) for size in test_sizes}
 
     # Single run over all sizes
     results_by_size = {size: {m: None for m in methods} for size in test_sizes}
+
+    # Warmup for mono_direct
+    conn_wd, _ = connect_and_get_pid()
+    setup_pg_database(conn_wd)
+    truncate_pg_tables(conn_wd)
+    scenario1_mono_direct(conn_wd, warmup_products, embed_client)
+    conn_wd.close()
+    clear_model_cache()
 
     for size in test_sizes:
         print(f"\nSize: {size}", flush=True)
@@ -360,6 +450,10 @@ def main():
         warmup_pg_connection(conn_qdrant)
         setup_pg_database(conn_qdrant)
 
+        conn_direct, pg_pid_direct = connect_and_get_pid()
+        warmup_pg_connection(conn_direct)
+        setup_pg_database(conn_direct)
+
         try:
             # Mono-Store
             truncate_pg_tables(conn_mono)
@@ -368,6 +462,16 @@ def main():
                 lambda: scenario1_mono_store(conn_mono, products))
             results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+
+            # Mono-Store Direct (Internal storage, External generation)
+            truncate_pg_tables(conn_direct)
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid_direct,
+                lambda: scenario1_mono_direct(conn_direct, products, embed_client))
+            results_by_size[size]['mono_direct_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_direct_deferred: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
 
             # Poly-Store Chroma
             client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
@@ -378,6 +482,7 @@ def main():
                     lambda: scenario1_poly_store_chroma(conn_chroma, products, embed_client, col_c))
                 results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
             finally:
                 cleanup_chroma(client_c, path_c)
 
@@ -390,12 +495,14 @@ def main():
                     lambda: scenario1_poly_store_qdrant(conn_qdrant, products, embed_client, qd))
                 results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
             finally:
                 cleanup_qdrant(qd)
         finally:
             conn_mono.close()
             conn_chroma.close()
             conn_qdrant.close()
+            conn_direct.close()
 
     # Collect metrics
     all_results = []

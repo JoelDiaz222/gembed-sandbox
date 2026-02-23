@@ -43,6 +43,9 @@ STYLE_MAP = {
     # Application Clients (Direct/In-Process)
     'ext_direct': (COLOR_DIRECT, '--', '*'),
     'external': (COLOR_DIRECT, '--', '*'),
+    'ext_direct_indexed': (COLOR_DIRECT, '-', '*'),
+    'ext_direct_deferred': (COLOR_DIRECT, '--', '*'),
+    'mono_direct_deferred': (COLOR_DIRECT, '--', 'o'),
 
     # Remote/Network Clients
     'ext_grpc': (COLOR_REMOTE_GRPC, ':', 'P'),  # Purple, Dotted, Plus
@@ -51,27 +54,35 @@ STYLE_MAP = {
 
 LABEL_MAP = {
     'pg': 'PostgreSQL',
-    'pg_local': 'PG Local (Internal)',
-    'pg_mono_store': 'Mono-Store (PG)',
-    'mono_store': 'Mono-Store (PG)',
-    'internal': 'PG Internal',
-    'pg_grpc': 'PG gRPC (Internal)',
-    'pg_indexed': 'PG (Indexed)',
-    'pg_deferred': 'PG (Deferred Index)',
-    'pg_local_indexed': 'PG Local (Indexed)',
-    'pg_local_deferred': 'PG Local (Deferred)',
-    'pg_mono_indexed': 'PG Mono-Store (Indexed)',
-    'pg_mono_deferred': 'PG Mono-Store (Deferred)',
-    'pg_grpc_indexed': 'PG gRPC (Indexed)',
-    'pg_grpc_deferred': 'PG gRPC (Deferred)',
+    'pg_local': 'PG (Local)',
+    'pg_mono_store': 'Mono-Store (PG, Local)',
+    'mono_store': 'Mono-Store (PG, Local)',
+    'internal': 'PG (Local)',
+    'pg_grpc': 'PG (gRPC)',
+    'pg_indexed': 'PG (Local, Indexed)',
+    'pg_deferred': 'PG (Local, Deferred Index)',
+    'pg_local_indexed': 'PG (Local, Indexed)',
+    'pg_local_deferred': 'PG (Local, Deferred Index)',
+    'pg_mono_indexed': 'Mono-Store (PG, Local, Indexed)',
+    'pg_mono_deferred': 'Mono-Store (PG, Local, Deferred Index)',
+    'pg_grpc_indexed': 'PG (gRPC, Indexed)',
+    'pg_grpc_deferred': 'PG (gRPC, Deferred Index)',
     'ext_direct': 'Python Direct',
     'external': 'PG External Client',
+    'ext_direct_indexed': 'Python Direct (Indexed)',
+    'ext_direct_deferred': 'Python Direct (Deferred Index)',
+    'mono_direct_deferred': 'Mono-Store (PG, Python Direct)',
+    'pg_unified': 'PG (Local, Unified)',
+    'pg_direct': 'PG (Python Direct)',
+    'pg_gembed_unified': 'PG (Local, Unified)',
     'ext_grpc': 'External gRPC',
     'ext_http': 'External HTTP',
     'chroma': 'ChromaDB',
     'qdrant': 'Qdrant',
     'poly_chroma': 'Poly-Store (PG, ChromaDB)',
     'poly_qdrant': 'Poly-Store (PG, Qdrant)',
+    'two_step_chroma': 'Poly-Store (PG, ChromaDB)',
+    'two_step_qdrant': 'Poly-Store (PG, Qdrant)',
     'qd_indexed': 'Qdrant (Indexed)',
     'qd_deferred': 'Qdrant (Deferred Index)'
 }
@@ -79,6 +90,16 @@ LABEL_MAP = {
 
 def get_style(method_name: str):
     """Return (color, linestyle, marker, label) for a given method."""
+    import re
+    # Check if a dynamic modifier was appended (e.g., pg_gembed_unified_f0.05)
+    m = re.match(r'(.*)_f([0-9.]+)$', method_name)
+    if m:
+        base_method = m.group(1)
+        frac = m.group(2)
+        style = STYLE_MAP.get(base_method, ('#333333', '-', 'x'))
+        label = LABEL_MAP.get(base_method, base_method) + f" (α={frac})"
+        return style[0], style[1], style[2], label
+
     style = STYLE_MAP.get(method_name, ('#333333', '-', 'x'))
     label = LABEL_MAP.get(method_name, method_name)
     return style[0], style[1], style[2], label
@@ -267,7 +288,57 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.savefig(output_dir / f"throughput_{timestamp}.png", dpi=300, bbox_inches='tight')
         plt.close()
 
+    def plot_normalized_throughput():
+        baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_direct_deferred']
+        baseline_method = None
+        for candidate in baseline_candidates:
+            if candidate in methods:
+                baseline_method = candidate
+                break
+
+        if not baseline_method:
+            return
+            
+        plt.figure(figsize=(8, 6))
+        
+        baseline_y_vals = [r[baseline_method].get('throughput_median', r[baseline_method].get('throughput', 0)) for r in all_results if baseline_method in r]
+        if not any(baseline_y_vals):
+            plt.close()
+            return
+            
+        for method in methods:
+            color, ls, marker, label = get_style(method)
+            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if method in r]
+            
+            if not any(y_vals): continue
+            
+            norm_y_vals = []
+            valid_sizes = []
+            for sz, y, b in zip(sizes, y_vals, baseline_y_vals):
+                if y and b and b > 0:
+                    norm_y_vals.append(y / b)
+                    valid_sizes.append(sz)
+                    
+            if not norm_y_vals: continue
+            
+            plt.plot(valid_sizes, norm_y_vals, marker=marker, linestyle=ls, color=color, label=label, alpha=0.9)
+
+        plt.xscale('log', base=2)
+        plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
+        
+        plt.xlabel('Batch Size (Log Scale)')
+        baseline_label = LABEL_MAP.get(baseline_method, baseline_method)
+        plt.ylabel(f'Relative Throughput (vs {baseline_label})')
+        plt.title(f'Relative Throughput Normalized to {baseline_label}')
+        plt.legend(frameon=True, framealpha=0.9)
+        plt.grid(True, linestyle='--', alpha=0.3)
+        
+        plt.savefig(output_dir / f"normalized_throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
+        plt.savefig(output_dir / f"normalized_throughput_{timestamp}.png", dpi=300, bbox_inches='tight')
+        plt.close()
+
     plot_throughput()
+    plot_normalized_throughput()
     plot_dual('py_cpu', 'py_mem_peak', 'Python Process', 'python_resources')
     if has_pg_data:
         plot_dual('pg_cpu', 'pg_mem_peak', 'PostgreSQL Connection', 'postgres_resources')
@@ -334,3 +405,4 @@ def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
     # Generate plots using the existing function
     generate_plots(all_results, output_dir, timestamp, methods)
     print(f"Plots generated from CSV: {csv_file}")
+

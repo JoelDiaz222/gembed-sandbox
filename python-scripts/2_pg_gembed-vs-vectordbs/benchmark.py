@@ -8,15 +8,15 @@ from statistics import mean, median
 from typing import Callable, List
 
 import chromadb
-from benchmark_utils import (
+from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME, EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
     EmbedAnythingDirectClient, EmbeddingWrapper,
     safe_stdev, calc_iqr, compute_metrics,
-    connect_and_get_pid, warmup_pg_connection, cleanup_chroma,
+    connect_and_get_pid, warmup_pg_connection, cleanup_chroma, clear_model_cache,
 )
 from data.loader import get_review_texts
-from plot_utils import save_single_run_csv
+from utils.plot_utils import save_single_run_csv
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
@@ -76,6 +76,39 @@ def setup_pg_deferred(conn, texts: List[str], provider: str):
     """Index created AFTER embedding generation."""
     setup_pg_schema(conn)
     populate_pg_database(conn, texts, provider)
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    conn.commit()
+    cur.close()
+
+
+def populate_pg_external(conn, texts: List[str], embed_fn: Callable):
+    """Insert data using external (Python-side) generation."""
+    embeddings = embed_fn(texts)
+    cur = conn.cursor()
+    # Use batch insert for fairness
+    sql = "INSERT INTO embeddings_test (text, embedding) VALUES (%s, %s)"
+    cur.executemany(sql, list(zip(texts, embeddings)))
+    conn.commit()
+    cur.close()
+
+
+def setup_pg_ext_indexed(conn, texts: List[str], embed_fn: Callable):
+    """External embedding + Index exists BEFORE generation."""
+    setup_pg_schema(conn)
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+    conn.commit()
+    cur.close()
+    populate_pg_external(conn, texts, embed_fn)
+
+
+def setup_pg_ext_deferred(conn, texts: List[str], embed_fn: Callable):
+    """External embedding + Index created AFTER generation."""
+    setup_pg_schema(conn)
+    populate_pg_external(conn, texts, embed_fn)
     cur = conn.cursor()
     cur.execute(
         "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
@@ -150,86 +183,6 @@ def cleanup_qdrant(client):
         client.delete_collection(collection_name="bench")
     client.close()
     time.sleep(0.1)
-
-
-# =============================================================================
-# Benchmark Runner Functions
-# =============================================================================
-
-def run_pg_method(texts: List[str], provider: str, strategy: str, runs: int) -> List[BenchmarkResult]:
-    """Run PG benchmark with a fresh connection per method/size."""
-    py_pid = os.getpid()
-    conn, pg_pid = connect_and_get_pid()
-
-    try:
-        # Warm up the PG connection (loads pg_gembed, JIT, etc.)
-        warmup_pg_connection(conn, provider)
-
-        # Method-specific warm-up with small data
-        warmup_texts = get_review_texts(8, shuffle=False)
-        fn = setup_pg_indexed if strategy == "indexed" else setup_pg_deferred
-        fn(conn, warmup_texts, provider)
-
-        # Run benchmark iterations
-        results = []
-        for _ in range(runs):
-            elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, texts, provider))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-
-        return results
-    finally:
-        conn.close()
-
-
-def run_chroma_method(texts: List[str], embed_client: EmbedAnythingDirectClient, runs: int) -> List[BenchmarkResult]:
-    """Run ChromaDB benchmark."""
-    py_pid = os.getpid()
-
-    # Warm up
-    warmup_texts = get_review_texts(8, shuffle=False)
-    client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
-    try:
-        benchmark_chroma(collection, warmup_texts, embed_client.embed)
-    finally:
-        cleanup_chroma(client, db_path)
-
-    results = []
-    for _ in range(runs):
-        client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
-        try:
-            elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                        lambda: benchmark_chroma(collection, texts, embed_client.embed))
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        finally:
-            cleanup_chroma(client, db_path)
-    return results
-
-
-def run_qdrant_method(texts: List[str], embed_client: EmbedAnythingDirectClient, runs: int, deferred: bool) -> List[
-    BenchmarkResult]:
-    """Run Qdrant benchmark."""
-    py_pid = os.getpid()
-
-    # Warm up
-    warmup_texts = get_review_texts(8, shuffle=False)
-    client = QdrantClient(url=QDRANT_URL)
-    try:
-        setup_qdrant(client, warmup_texts, embed_client.embed, deferred)
-    finally:
-        cleanup_qdrant(client)
-
-    results = []
-    for _ in range(runs):
-        client = QdrantClient(url=QDRANT_URL)
-        try:
-            elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                        lambda: setup_qdrant(client, texts, embed_client.embed,
-                                                                             deferred),
-                                                        container_name=QDRANT_CONTAINER_NAME)
-            results.append(BenchmarkResult(time_s=elapsed, stats=stats))
-        finally:
-            cleanup_qdrant(client)
-    return results
 
 
 # =============================================================================
@@ -316,6 +269,8 @@ def main():
         size: {
             'pg_local_indexed': None,
             'pg_local_deferred': None,
+            'ext_direct_indexed': None,
+            'ext_direct_deferred': None,
             'qd_indexed': None,
             'qd_deferred': None,
             'chroma': None,
@@ -342,13 +297,37 @@ def main():
                 pg_connections[method_name] = (conn, fn, provider)
                 pg_pids[method_name] = pg_pid
 
-            # Execute all methods once for this size
             # Run PG methods
             for method_name, (conn, fn, provider) in pg_connections.items():
                 pg_pid = pg_pids[method_name]
                 elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, texts, provider))
                 results_by_size[size][method_name] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  {method_name}: {elapsed:.2f}s", flush=True)
+
+            # Run External PG methods (ext_direct)
+            # Indexed
+            conn_ext, pg_pid_ext = connect_and_get_pid()
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
+                                                            lambda: setup_pg_ext_indexed(conn_ext, texts,
+                                                                                       embed_client.embed))
+                results_by_size[size]['ext_direct_indexed'] = BenchmarkResult(time_s=elapsed, stats=stats)
+                print(f"  ext_direct_indexed: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
+            finally:
+                conn_ext.close()
+
+            # Deferred
+            conn_ext, pg_pid_ext = connect_and_get_pid()
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
+                                                            lambda: setup_pg_ext_deferred(conn_ext, texts,
+                                                                                        embed_client.embed))
+                results_by_size[size]['ext_direct_deferred'] = BenchmarkResult(time_s=elapsed, stats=stats)
+                print(f"  ext_direct_deferred: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
+            finally:
+                conn_ext.close()
 
             # Run Qdrant indexed
             client = QdrantClient(url=QDRANT_URL)
@@ -359,6 +338,7 @@ def main():
                                                             container_name=QDRANT_CONTAINER_NAME)
                 results_by_size[size]['qd_indexed'] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  qd_indexed: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
             finally:
                 cleanup_qdrant(client)
 
@@ -371,6 +351,7 @@ def main():
                                                             container_name=QDRANT_CONTAINER_NAME)
                 results_by_size[size]['qd_deferred'] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  qd_deferred: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
             finally:
                 cleanup_qdrant(client)
 
@@ -382,6 +363,7 @@ def main():
                                                                                      embed_client.embed))
                 results_by_size[size]['chroma'] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  chroma: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
             finally:
                 cleanup_chroma(client, db_path)
 
@@ -391,7 +373,7 @@ def main():
                 conn.close()
 
     # Collect metrics for each size
-    methods = ['pg_local_indexed', 'pg_local_deferred', 'qd_indexed', 'qd_deferred', 'chroma']
+    methods = ['pg_local_indexed', 'pg_local_deferred', 'ext_direct_indexed', 'ext_direct_deferred', 'qd_indexed', 'qd_deferred', 'chroma']
     all_results = []
     for size in test_sizes:
         results = results_by_size[size]

@@ -13,14 +13,14 @@ from typing import List
 
 import chromadb
 import embed_anything
-from benchmark_utils import (
+from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME,
     BenchmarkResult, ResourceMonitor,
     connect_and_get_pid, get_pg_pid, warmup_pg_connection,
-    temp_image_dir,
+    temp_image_dir, clear_model_cache,
 )
 from embed_anything import EmbeddingModel
-from plot_utils import save_single_run_csv
+from utils.plot_utils import save_single_run_csv
 from psycopg2.extras import execute_values
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -33,8 +33,6 @@ INGEST_PER_PERSON = 64
 QUERY_PER_PERSON = 16
 TOP_K = 5
 
-model_cache = {}
-
 
 # =============================================================================
 # Image Embedding Client
@@ -42,7 +40,7 @@ model_cache = {}
 
 class EmbedAnythingImageClient:
     def embed_files(self, paths: List[str]) -> List[List[float]]:
-        model = self._get_model()
+        model = EmbeddingModel.from_pretrained_hf(MODEL_NAME)
         embeddings = []
         with temp_image_dir(paths) as base_temp:
             res = embed_anything.embed_image_directory(str(base_temp), embedder=model)
@@ -52,11 +50,6 @@ class EmbedAnythingImageClient:
                         embeddings.append(item.embedding)
         return embeddings
 
-    @staticmethod
-    def _get_model():
-        if MODEL_NAME not in model_cache:
-            model_cache[MODEL_NAME] = EmbeddingModel.from_pretrained_hf(MODEL_NAME)
-        return model_cache[MODEL_NAME]
 
 
 # =============================================================================
@@ -212,6 +205,17 @@ def serve_s1_pg_unified(conn, query_paths: List[str]):
     cur.close()
 
 
+def serve_s1_pg_direct(conn, embed_client, query_paths: List[str]):
+    """Embed in Python, then query PG via standard vector OPs."""
+    embeddings = embed_client.embed_files(query_paths)
+    cur = conn.cursor()
+    for emb in embeddings:
+        cur.execute("SELECT path FROM faces ORDER BY embedding <-> %s LIMIT %s", (emb, TOP_K))
+        _ = cur.fetchall()
+    conn.commit()
+    cur.close()
+
+
 def serve_s1_qdrant(client, embed_client: EmbedAnythingImageClient, query_paths: List[str]):
     embeddings = embed_client.embed_files(query_paths)
     requests = [models.QueryRequest(query=emb, limit=TOP_K, with_payload=True) for emb in embeddings]
@@ -241,14 +245,13 @@ def main():
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     db_size = args.db_size
-    methods = ['pg_unified', 'poly_qdrant', 'poly_chroma']
+    methods = ['pg_unified', 'pg_direct', 'poly_qdrant', 'poly_chroma']
 
     print(f"\nStarting Benchmark 5 UC9 - Scenario 1 Serving")
     print(f"Run ID: {run_id}")
     print(f"DB Size: {db_size}")
     print(f"Query Sizes: {test_sizes}")
     print("Loading model...", flush=True)
-    EmbedAnythingImageClient._get_model()
     embed_client = EmbedAnythingImageClient()
     py_pid = os.getpid()
 
@@ -270,28 +273,30 @@ def main():
     conn_pg, pg_pid = connect_and_get_pid()
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
-    model_cache.clear()
+    clear_model_cache()
     s1_ingest_pg_unified(conn_pg, ingest_paths)
 
     qd = create_qdrant_client()
-    model_cache.clear()
+    clear_model_cache()
     s1_ingest_qdrant(qd, ingest_paths, embed_client)
 
     c_client, c_path = create_chroma_client_for_ingestion()
     c_col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
-    model_cache.clear()
+    clear_model_cache()
     s1_ingest_chroma(c_col, ingest_paths, embed_client)
 
     # Warm-up queries
     print("Warming up queries...")
     warmup_queries = queries_by_size.get(min(test_sizes), [])[:4]
     if warmup_queries:
-        model_cache.clear()
+        clear_model_cache()
         serve_s1_pg_unified(conn_pg, warmup_queries)
-        model_cache.clear()
+        serve_s1_pg_direct(conn_pg, embed_client, warmup_queries)
+        clear_model_cache()
         serve_s1_qdrant(qd, embed_client, warmup_queries)
-        model_cache.clear()
+        clear_model_cache()
         serve_s1_chroma(c_col, embed_client, warmup_queries)
+        clear_model_cache()
 
     # Single run over all sizes
     results_by_size = {size: {m: None for m in methods} for size in test_sizes}
@@ -300,14 +305,21 @@ def main():
         print(f"\nSize: {size}", flush=True)
         queries = queries_by_size[size]
 
-        model_cache.clear()
+        clear_model_cache()
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, get_pg_pid(conn_pg),
             lambda: serve_s1_pg_unified(conn_pg, queries))
         results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
         print(f"  pg_unified: {elapsed:.2f}s", flush=True)
 
-        model_cache.clear()
+        # PG Direct
+        elapsed, _, stats = ResourceMonitor.measure(
+            py_pid, pg_pid,
+            lambda: serve_s1_pg_direct(conn_pg, embed_client, queries))
+        results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+        print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
+
+        clear_model_cache()
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, None,
             lambda: serve_s1_qdrant(qd, embed_client, queries),
@@ -315,7 +327,7 @@ def main():
         results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
         print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
 
-        model_cache.clear()
+        clear_model_cache()
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, None,
             lambda: serve_s1_chroma(c_col, embed_client, queries))

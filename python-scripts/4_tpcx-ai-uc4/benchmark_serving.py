@@ -13,13 +13,13 @@ from pathlib import Path
 from typing import List, Tuple
 
 import chromadb
-from benchmark_utils import (
+from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME, EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
     EmbedAnythingDirectClient, EmbeddingWrapper,
-    connect_and_get_pid, warmup_pg_connection,
+    connect_and_get_pid, warmup_pg_connection, clear_model_cache,
 )
-from plot_utils import save_single_run_csv
+from utils.plot_utils import save_single_run_csv
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
@@ -150,6 +150,25 @@ def serve_pg(conn, input_texts: List[str]):
     return result
 
 
+def serve_pg_direct(conn, embed_client, input_texts: List[str]):
+    embs = embed_client.embed(input_texts)
+    cur = conn.cursor()
+    predictions = []
+    for emb in embs:
+        cur.execute("""
+            SELECT spam
+            FROM reviews
+            ORDER BY embedding <-> %s
+            LIMIT 5
+        """, (emb,))
+        rows = cur.fetchall()
+        spam_votes = sum(1 for r in rows if r[0])
+        predictions.append(spam_votes >= 3)
+    conn.commit()
+    cur.close()
+    return predictions
+
+
 def serve_chroma(collection, embed_client, input_texts: List[str]):
     embs = embed_client.embed(input_texts)
     results = collection.query(query_embeddings=embs, n_results=5, include=["metadatas"])
@@ -187,7 +206,7 @@ def main():
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     db_size = args.db_size
-    methods = ['pg', 'qdrant', 'chroma']
+    methods = ['pg', 'pg_direct', 'qdrant', 'chroma']
 
     print(f"\nStarting Benchmark 4 UC4 - Serving")
     print(f"Run ID: {run_id}")
@@ -224,8 +243,10 @@ def main():
     print("Warming up queries...")
     warmup_texts = [t for t, s in test_pool[:8]]
     serve_pg(conn_pg, warmup_texts)
+    serve_pg_direct(conn_pg, embed_client, warmup_texts)
     serve_qdrant(qd, embed_client, warmup_texts)
     serve_chroma(c_col, embed_client, warmup_texts)
+    clear_model_cache()
 
     # Single run over all sizes
     results_by_size = {size: {m: None for m in methods} for size in test_sizes}
@@ -238,7 +259,14 @@ def main():
             py_pid, pg_pid,
             lambda: serve_pg(conn_pg, input_texts))
         results_by_size[size]['pg'] = BenchmarkResult(elapsed, stats)
-        print(f"  pg: {elapsed:.2f}s", flush=True)
+        print(f"  pg       : {elapsed:.2f}s", flush=True)
+
+        # PG Direct
+        elapsed, _, stats = ResourceMonitor.measure(
+            py_pid, pg_pid,
+            lambda: serve_pg_direct(conn_pg, embed_client, input_texts))
+        results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+        print(f"  pg_direct: {elapsed:.2f}s", flush=True)
 
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, None,
@@ -252,6 +280,7 @@ def main():
             lambda: serve_chroma(c_col, embed_client, input_texts))
         results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
         print(f"  chroma: {elapsed:.2f}s", flush=True)
+        clear_model_cache()
 
     # Cleanup
     conn_pg.close()

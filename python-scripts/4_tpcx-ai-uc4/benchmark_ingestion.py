@@ -13,13 +13,14 @@ from pathlib import Path
 from typing import List, Tuple
 
 import chromadb
-from benchmark_utils import (
+from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME, EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
     EmbedAnythingDirectClient, EmbeddingWrapper,
-    connect_and_get_pid, warmup_pg_connection,
+    connect_and_get_pid, warmup_pg_connection, clear_model_cache,
 )
-from plot_utils import save_single_run_csv
+from utils.plot_utils import save_single_run_csv
+from psycopg2.extras import execute_values
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
@@ -94,6 +95,25 @@ def setup_pg_indexed(conn, ingestion_data: List[Tuple]):
     conn.commit()
 
 
+def setup_pg_direct_indexed(conn, embed_client, ingestion_data: List[Tuple]):
+    """Create HNSW index, embed in Python, then insert."""
+    setup_pg_schema(conn)
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX ON reviews USING hnsw (embedding vector_cosine_ops)"
+                " WITH (m=16, ef_construction=100);")
+    
+    texts = [b[0] for b in ingestion_data]
+    spams = [b[1] for b in ingestion_data]
+    embeddings = embed_client.embed(texts)
+    
+    execute_values(cur, 
+        "INSERT INTO reviews (text, spam, embedding) VALUES %s",
+        list(zip(texts, spams, embeddings))
+    )
+    conn.commit()
+    cur.close()
+
+
 def setup_qdrant_common(client, embed_client, ingestion_data: List[Tuple]):
     if client.collection_exists("reviews"):
         client.delete_collection("reviews")
@@ -133,7 +153,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_indexed', 'qd_indexed', 'chroma']
+    methods = ['pg_indexed', 'pg_direct', 'qd_indexed', 'chroma']
 
     print(f"\nStarting Benchmark 4 UC4 - Ingestion")
     print(f"Run ID: {run_id}")
@@ -163,10 +183,12 @@ def main():
     if qd_w.collection_exists("reviews"):
         qd_w.delete_collection("reviews")
     qd_w.close()
+    clear_model_cache()
 
     c_w, c_path_w = create_chroma_client()
     setup_chroma(c_w, embed_client, warmup_data)
     cleanup_chroma(c_w, c_path_w)
+    clear_model_cache()
 
     # Single run over all sizes
     results_by_size = {size: {m: None for m in methods} for size in test_sizes}
@@ -187,6 +209,17 @@ def main():
             print(f"  pg_indexed: {elapsed:.2f}s", flush=True)
             conn.close()
 
+            # PG Direct
+            conn, pg_pid = connect_and_get_pid()
+            warmup_pg_connection(conn)
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: setup_pg_direct_indexed(conn, embed_client, ingestion_data))
+            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_direct: {elapsed:.2f}s", flush=True)
+            conn.close()
+            clear_model_cache()
+
             # Qdrant
             qd = create_qdrant_client()
             try:
@@ -200,6 +233,7 @@ def main():
                 if qd.collection_exists("reviews"):
                     qd.delete_collection("reviews")
                 qd.close()
+                clear_model_cache()
 
             # Chroma
             c_client, c_path = create_chroma_client()
@@ -209,8 +243,8 @@ def main():
                     lambda: setup_chroma(c_client, embed_client, ingestion_data))
                 results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
                 print(f"  chroma: {elapsed:.2f}s", flush=True)
-            finally:
                 cleanup_chroma(c_client, c_path)
+                clear_model_cache()
         except Exception:
             try:
                 conn.close()

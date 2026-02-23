@@ -9,15 +9,15 @@ import grpc
 import requests
 import tei_pb2 as pb2
 import tei_pb2_grpc as pb2_grpc
-from benchmark_utils import (
+from utils.benchmark_utils import (
     EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
     EmbedAnythingDirectClient,
     safe_stdev, calc_iqr, compute_metrics,
-    connect_and_get_pid, warmup_pg_connection,
+    connect_and_get_pid, warmup_pg_connection, clear_model_cache,
 )
 from data.loader import get_review_texts
-from plot_utils import save_single_run_csv
+from utils.plot_utils import save_single_run_csv
 from psycopg2.extras import execute_values
 
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -154,42 +154,6 @@ def run_benchmark_iteration(conn, py_pid: int, pg_pid: int, benchmark_fn: Callab
     return BenchmarkResult(time_s=elapsed, stats=stats)
 
 
-def run_multiple_iterations(conn, py_pid: int, pg_pid: int, benchmark_fn: Callable,
-                            runs: int) -> List[BenchmarkResult]:
-    """Run multiple benchmark iterations."""
-    results = []
-    for _ in range(runs):
-        result = run_benchmark_iteration(conn, py_pid, pg_pid, benchmark_fn)
-        results.append(result)
-    return results
-
-
-def run_method_with_fresh_connection(texts: List[str], benchmark_fn: Callable,
-                                     runs: int) -> List[BenchmarkResult]:
-    """Create a fresh connection, warm it up, then run all benchmark iterations."""
-    conn, pg_pid = connect_and_get_pid()
-    py_pid = os.getpid()
-
-    try:
-        # Warm up this specific connection (loads pg_gembed, JIT, etc.)
-        warmup_pg_connection(conn)
-
-        # Method-specific warm-up with small data
-        warmup_texts = get_review_texts(8, shuffle=False)
-        truncate_table(conn)
-        benchmark_fn(conn, warmup_texts)
-
-        # Now run the actual benchmark iterations
-        results = run_multiple_iterations(
-            conn, py_pid, pg_pid,
-            lambda c: benchmark_fn(c, texts),
-            runs
-        )
-        return results
-    finally:
-        conn.close()
-
-
 def setup_method_connection(texts: List[str], benchmark_fn: Callable):
     """Create and warmup a connection for a method, returning connection and PIDs."""
     conn, pg_pid = connect_and_get_pid()
@@ -202,6 +166,7 @@ def setup_method_connection(texts: List[str], benchmark_fn: Callable):
     warmup_texts = get_review_texts(8, shuffle=False)
     truncate_table(conn)
     benchmark_fn(conn, warmup_texts)
+    clear_model_cache()
 
     return conn, py_pid, pg_pid
 
@@ -369,6 +334,8 @@ def main():
                     result = run_single_iteration(conn, py_pid, pg_pid, texts, benchmark_fn)
                     results_by_size[size][method_name] = result
                     print(f"  {method_name}: {result.time_s:.2f}s", flush=True)
+                    # Clear model cache after each method to ensure no cross-contamination
+                    clear_model_cache()
 
             finally:
                 # Close all connections

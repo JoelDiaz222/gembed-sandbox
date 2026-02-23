@@ -15,6 +15,7 @@ import contextlib
 import os
 import shutil
 import time
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, stdev, median, quantiles
@@ -32,8 +33,8 @@ from embed_anything import EmbeddingModel
 DB_CONFIG = {
     'host': 'localhost',
     'port': 5432,
-    'dbname': 'joeldiaz',
-    'user': 'joeldiaz',
+    'dbname': 'joel',
+    'user': 'joel',
 }
 
 QDRANT_URL = "http://localhost:6333"
@@ -270,6 +271,15 @@ class EmbedAnythingDirectClient:
         if model_name not in model_cache:
             model_cache[model_name] = EmbeddingModel.from_pretrained_hf(model_id=model_name)
         return model_cache[model_name]
+
+
+def clear_model_cache():
+    """Clear global model cache and force garbage collection."""
+    global model_cache
+    model_cache.clear()
+    gc.collect()
+
+    time.sleep(0.5)
 
 
 class EmbeddingWrapper:

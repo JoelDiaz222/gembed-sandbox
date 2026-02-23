@@ -73,17 +73,32 @@ get_benchmark_db_size() {
     fi
 }
 
+get_benchmark_extra_args() {
+    local name=$1
+    local extra_args=$(yq eval ".benchmarks.\"${name}\".extra_args" "$CONFIG_FILE")
+    if [ "$extra_args" = "null" ]; then
+        echo ""
+    else
+        echo "$extra_args"
+    fi
+}
+
 # Function to run a single benchmark iteration
 run_benchmark_iteration() {
     local script_path=$1
     local sizes=$2
     local db_size=$3
     local run_num=$4
+    local extra_args=$5
     
     local cmd="ulimit -n 8192 && PYTHONPATH=.:proto ${PYTHON_CMD} ${script_path} --sizes ${sizes}"
     
     if [ -n "$db_size" ]; then
         cmd="${cmd} --db-size ${db_size}"
+    fi
+
+    if [ -n "$extra_args" ]; then
+        cmd="${cmd} ${extra_args}"
     fi
     
     log_info "  Run ${run_num}: Executing..."
@@ -153,7 +168,7 @@ generate_plots() {
     ${PYTHON_CMD} -c "
 import sys
 sys.path.insert(0, '${SCRIPT_DIR}')
-from plot_utils import generate_plots_from_csv
+from utils.plot_utils import generate_plots_from_csv
 generate_plots_from_csv('${csv_file}', '${output_dir}', '${timestamp}')
 " || {
         log_error "Failed to generate plots"
@@ -161,6 +176,27 @@ generate_plots_from_csv('${csv_file}', '${output_dir}', '${timestamp}')
     }
     
     log_success "Plots generated in ${output_dir}"
+}
+
+# Function to generate LaTeX tables
+generate_tables() {
+    local csv_file=$1
+    local output_dir=$2
+    local timestamp=$3
+    
+    log_info "Generating LaTeX tables from ${csv_file}"
+    
+    ${PYTHON_CMD} -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}')
+from utils.table_utils import generate_tables_from_csv
+generate_tables_from_csv('${csv_file}', '${output_dir}', '${timestamp}', metrics=['throughput'])
+" || {
+        log_error "Failed to generate tables"
+        return 1
+    }
+    
+    log_success "Tables generated in ${output_dir}"
 }
 
 # Function to run a complete benchmark suite
@@ -182,6 +218,7 @@ run_benchmark_suite() {
     local runs=$(get_benchmark_runs "$name")
     local sizes=$(get_benchmark_sizes "$name")
     local db_size=$(get_benchmark_db_size "$name")
+    local extra_args=$(get_benchmark_extra_args "$name")
     
     local script_path="${SCRIPT_DIR}/${script}"
     
@@ -216,7 +253,7 @@ run_benchmark_suite() {
     # Run benchmark multiple times
     local successful_runs=0
     for ((i=1; i<=runs; i++)); do
-        if run_benchmark_iteration "$script_path" "$sizes" "$db_size" "$i"; then
+        if run_benchmark_iteration "$script_path" "$sizes" "$db_size" "$i" "$extra_args"; then
             ((successful_runs++))
         else
             log_warning "Run ${i} failed, continuing with remaining runs"
@@ -245,6 +282,9 @@ run_benchmark_suite() {
     
     # Generate plots
     generate_plots "$final_csv" "$output_dir" "$timestamp"
+    
+    # Generate tables
+    generate_tables "$final_csv" "$output_dir" "$timestamp"
     
     log_success "Benchmark ${name} completed!"
     echo ""
