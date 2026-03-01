@@ -200,6 +200,7 @@ def create_qdrant_client():
     client.create_collection("products",
                              vectors_config=VectorParams(size=384, distance=Distance.COSINE,
                                                          hnsw_config=hnsw_config))
+    client.update_collection("products", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
     return client
 
 
@@ -347,6 +348,7 @@ def scenario2_poly_store_qdrant(conn, embed_client, qdrant_client):
     points = [PointStruct(id=pid, vector=emb, payload={"text": doc})
               for pid, emb, doc in zip(product_ids, embeddings, documents)]
     qdrant_client.upsert(collection_name="products", points=points, wait=True)
+    qdrant_client.update_collection("products", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
     cur.close()
 
 
@@ -362,7 +364,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_mono_deferred', 'mono_direct_deferred', 'poly_chroma', 'poly_qdrant']
+    methods = ['mono_pg_unified_deferred', 'mono_pg_direct_deferred', 'poly_chroma', 'poly_qdrant_deferred']
 
     print(f"\nStarting Benchmark 3 - Scenario 2: Pre-existing Data")
     print(f"Run ID: {run_id}")
@@ -408,8 +410,8 @@ def main():
                 py_pid, pg_pid_mono,
                 lambda: scenario2_mono_store(conn_mono))
             conn_mono.commit()
-            results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
-            print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['mono_pg_unified_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_pg_unified_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
         finally:
             conn_mono.close()
@@ -426,8 +428,8 @@ def main():
                 py_pid, pg_pid_direct,
                 lambda: scenario2_mono_direct(conn_direct, embed_client))
             conn_direct.commit()
-            results_by_size[size]['mono_direct_deferred'] = BenchmarkResult(elapsed, stats)
-            print(f"  mono_direct_deferred: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['mono_pg_direct_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_pg_direct_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
         finally:
             conn_direct.close()
@@ -466,8 +468,8 @@ def main():
                     py_pid, pg_pid_qdrant,
                     lambda: scenario2_poly_store_qdrant(conn_qdrant, embed_client, qd))
                 conn_qdrant.commit()
-                results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
-                print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
+                results_by_size[size]['poly_qdrant_deferred'] = BenchmarkResult(elapsed, stats)
+                print(f"  poly_qdrant_deferred: {elapsed:.2f}s", flush=True)
                 clear_model_cache()
             finally:
                 cleanup_qdrant(qd)

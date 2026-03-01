@@ -86,22 +86,20 @@ def populate_pg_database(conn, ingestion_data: List[Tuple]):
     cur.close()
 
 
-def setup_pg_indexed(conn, ingestion_data: List[Tuple]):
-    """Create HNSW index BEFORE embedding generation, then insert."""
+def setup_pg_deferred(conn, ingestion_data: List[Tuple]):
+    """Insert data then create HNSW index."""
     setup_pg_schema(conn)
+    populate_pg_database(conn, ingestion_data)
     cur = conn.cursor()
     cur.execute("CREATE INDEX ON reviews USING hnsw (embedding vector_cosine_ops)"
                 " WITH (m=16, ef_construction=100);")
     cur.close()
-    populate_pg_database(conn, ingestion_data)
 
 
-def setup_pg_direct_indexed(conn, embed_client, ingestion_data: List[Tuple]):
-    """Create HNSW index, embed in Python, then insert."""
+def setup_pg_direct_deferred(conn, embed_client, ingestion_data: List[Tuple]):
+    """Embed in Python, insert, then create HNSW index."""
     setup_pg_schema(conn)
     cur = conn.cursor()
-    cur.execute("CREATE INDEX ON reviews USING hnsw (embedding vector_cosine_ops)"
-                " WITH (m=16, ef_construction=100);")
 
     texts = [b[0] for b in ingestion_data]
     spams = [b[1] for b in ingestion_data]
@@ -111,6 +109,8 @@ def setup_pg_direct_indexed(conn, embed_client, ingestion_data: List[Tuple]):
         "INSERT INTO reviews (text, spam, embedding) VALUES %s",
         list(zip(texts, spams, [np.array(e) for e in embeddings]))
     )
+    cur.execute("CREATE INDEX ON reviews USING hnsw (embedding vector_cosine_ops)"
+                " WITH (m=16, ef_construction=100);")
     cur.close()
 
 
@@ -121,11 +121,13 @@ def setup_qdrant_common(client, embed_client, ingestion_data: List[Tuple]):
     client.create_collection(
         "reviews",
         vectors_config=VectorParams(size=384, distance=Distance.COSINE, hnsw_config=hnsw_config))
+    client.update_collection("reviews", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
     texts = [t for t, s in ingestion_data]
     embeddings = embed_client.embed(texts)
     points = [PointStruct(id=j, vector=embeddings[j], payload={"text": t, "spam": s})
               for j, (t, s) in enumerate(ingestion_data)]
     client.upsert("reviews", points, wait=True)
+    client.update_collection("reviews", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
 
 
 def setup_chroma(client, embed_client, ingestion_data: List[Tuple]):
@@ -153,7 +155,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_indexed', 'pg_direct', 'qd_indexed', 'chroma']
+    methods = ['mono_pg_unified_deferred', 'mono_pg_direct_deferred', 'poly_qdrant_deferred', 'poly_chroma']
 
     print(f"\nStarting Benchmark 4 UC4 - Ingestion")
     print(f"Run ID: {run_id}")
@@ -175,7 +177,7 @@ def main():
     warmup_data = full_data[:8]
     conn_w, _ = connect_and_get_pid()
     warmup_pg_connection(conn_w)
-    setup_pg_indexed(conn_w, warmup_data)
+    setup_pg_deferred(conn_w, warmup_data)
     conn_w.close()
 
     qd_w = create_qdrant_client()
@@ -201,13 +203,13 @@ def main():
         warmup_pg_connection(conn)
 
         try:
-            # PG Indexed
+            # PG Unified
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
-                lambda: setup_pg_indexed(conn, ingestion_data))
+                lambda: setup_pg_deferred(conn, ingestion_data))
             conn.commit()
-            results_by_size[size]['pg_indexed'] = BenchmarkResult(elapsed, stats)
-            print(f"  pg_indexed: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['mono_pg_unified_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_pg_unified_deferred: {elapsed:.2f}s", flush=True)
             conn.close()
 
             # PG Direct
@@ -216,10 +218,10 @@ def main():
             warmup_pg_connection(conn)
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
-                lambda: setup_pg_direct_indexed(conn, embed_client, ingestion_data))
+                lambda: setup_pg_direct_deferred(conn, embed_client, ingestion_data))
             conn.commit()
-            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
-            print(f"  pg_direct: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['mono_pg_direct_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_pg_direct_deferred: {elapsed:.2f}s", flush=True)
             conn.close()
             clear_model_cache()
 
@@ -230,8 +232,8 @@ def main():
                     py_pid, None,
                     lambda: setup_qdrant_common(qd, embed_client, ingestion_data),
                     container_name=QDRANT_CONTAINER_NAME)
-                results_by_size[size]['qd_indexed'] = BenchmarkResult(elapsed, stats)
-                print(f"  qd_indexed: {elapsed:.2f}s", flush=True)
+                results_by_size[size]['poly_qdrant_deferred'] = BenchmarkResult(elapsed, stats)
+                print(f"  poly_qdrant_deferred: {elapsed:.2f}s", flush=True)
             finally:
                 if qd.collection_exists("reviews"):
                     qd.delete_collection("reviews")
@@ -244,8 +246,8 @@ def main():
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, None,
                     lambda: setup_chroma(c_client, embed_client, ingestion_data))
-                results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
-                print(f"  chroma: {elapsed:.2f}s", flush=True)
+                results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
+                print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
             finally:
                 cleanup_chroma(c_client, c_path)
                 clear_model_cache()

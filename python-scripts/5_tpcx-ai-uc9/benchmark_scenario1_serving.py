@@ -275,6 +275,7 @@ def main():
     conn_pg.commit()
     clear_model_cache()
     s1_ingest_pg_unified(conn_pg, ingest_paths)
+    conn_pg.commit()
 
     qd = create_qdrant_client()
     clear_model_cache()
@@ -291,11 +292,13 @@ def main():
     if warmup_queries:
         clear_model_cache()
         serve_s1_pg_unified(conn_pg, warmup_queries)
+        clear_model_cache()
         serve_s1_pg_direct(conn_pg, embed_client, warmup_queries)
         clear_model_cache()
         serve_s1_qdrant(qd, embed_client, warmup_queries)
         clear_model_cache()
         serve_s1_chroma(c_col, embed_client, warmup_queries)
+        conn_pg.close()
         clear_model_cache()
 
     # Single run over all sizes
@@ -334,20 +337,20 @@ def main():
         finally:
             conn_pg.close()
 
-        clear_model_cache()
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, None,
             lambda: serve_s1_qdrant(qd, embed_client, queries),
             container_name=QDRANT_CONTAINER_NAME)
         results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
         print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
-
         clear_model_cache()
+
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, None,
             lambda: serve_s1_chroma(c_col, embed_client, queries))
         results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
         print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
+        clear_model_cache()
 
     # Cleanup
     if qd.collection_exists("faces"):

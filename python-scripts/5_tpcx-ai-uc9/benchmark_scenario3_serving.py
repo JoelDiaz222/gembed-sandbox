@@ -283,11 +283,12 @@ def setup_qdrant(client: QdrantClient,
                  customers: list, embeddings: List[List[float]]):
     if client.collection_exists("s3_customers"):
         client.delete_collection("s3_customers")
-    hnsw_cfg = models.HnswConfigDiff(m=16, ef_construct=100)
+    
+    # Deferred indexing: threshold = 0 during ingestion
     client.create_collection(
         "s3_customers",
-        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE,
-                                    hnsw_config=hnsw_cfg),
+        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=0)
     )
     points = [
         PointStruct(
@@ -298,6 +299,11 @@ def setup_qdrant(client: QdrantClient,
         for c, emb in zip(customers, embeddings)
     ]
     client.upsert("s3_customers", points, wait=True)
+    # Reset threshold to enable indexing
+    client.update_collection(
+        "s3_customers",
+        optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000)
+    )
 
 
 def setup_chroma(base_path: str, customers: list, embeddings: List[List[float]]):
@@ -468,7 +474,7 @@ def main():
     n_customers = max(1, db_size // INGEST_PER_PERSON)
     top_k = args.topk
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_gembed_unified', 'pg_direct', 'two_step_qdrant', 'two_step_chroma']
+    methods = ['mono_pg_unified_deferred', 'mono_pg_direct_deferred', 'poly_qdrant_deferred', 'poly_chroma']
 
     print(f"\nBenchmark 5 UC9 – Scenario 3: Customer ID + Purchase History JOIN (Serving)")
     print(f"Run ID  : {run_id}")
@@ -554,46 +560,68 @@ def main():
                 print("  [WARN] Not enough query images available.")
                 continue
 
-            elapsed, _, stats = ResourceMonitor.measure(
-                py_pid, get_pg_pid(conn_pg),
-                lambda: serve_pg_gembed_unified(conn_pg, query_image_paths, top_k))
-            conn_pg.commit()
-            results_by_size[size]['pg_gembed_unified'] = BenchmarkResult(elapsed, stats)
-            print(f"  pg_gembed_unified : {elapsed:.3f}s  "
-                  f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
+            conn_pg, pg_pid = connect_and_get_pid()
+            warmup_pg_connection(conn_pg)
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(
+                    py_pid, pg_pid,
+                    lambda: serve_pg_gembed_unified(conn_pg, query_image_paths, top_k))
+                conn_pg.commit()
+                results_by_size[size]['mono_pg_unified_deferred'] = BenchmarkResult(elapsed, stats)
+                print(f"  mono_pg_unified_deferred : {elapsed:.3f}s  "
+                      f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
+                clear_model_cache()
+            finally:
+                conn_pg.close()
 
-            elapsed, _, stats = ResourceMonitor.measure(
-                py_pid, get_pg_pid(conn_pg),
-                lambda: serve_pg_direct(conn_pg, embed_client, query_image_paths, top_k))
-            conn_pg.commit()
-            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
-            print(f"  pg_direct         : {elapsed:.3f}s  "
-                  f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
-            clear_model_cache()
+            conn_pg, pg_pid = connect_and_get_pid()
+            warmup_pg_connection(conn_pg)
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(
+                    py_pid, pg_pid,
+                    lambda: serve_pg_direct(conn_pg, embed_client, query_image_paths, top_k))
+                conn_pg.commit()
+                results_by_size[size]['mono_pg_direct_deferred'] = BenchmarkResult(elapsed, stats)
+                print(f"  mono_pg_direct_deferred  : {elapsed:.3f}s  "
+                      f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
+                clear_model_cache()
+            finally:
+                conn_pg.close()
 
-            elapsed, _, stats = ResourceMonitor.measure(
-                py_pid, get_pg_pid(conn_pg),
-                lambda: serve_two_step_qdrant(conn_pg, qd_client, embed_client,
-                                              query_image_paths, top_k),
-                container_name=QDRANT_CONTAINER_NAME)
-            conn_pg.commit()
-            results_by_size[size]['two_step_qdrant'] = BenchmarkResult(elapsed, stats)
-            print(f"  two_step_qdrant   : {elapsed:.3f}s  "
-                  f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
-            clear_model_cache()
+            conn_pg, pg_pid = connect_and_get_pid()
+            warmup_pg_connection(conn_pg)
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(
+                    py_pid, pg_pid,
+                    lambda: serve_two_step_qdrant(conn_pg, qd_client, embed_client,
+                                                  query_image_paths, top_k),
+                    container_name=QDRANT_CONTAINER_NAME)
+                conn_pg.commit()
+                results_by_size[size]['poly_qdrant_deferred'] = BenchmarkResult(elapsed, stats)
+                print(f"  poly_qdrant_deferred    : {elapsed:.3f}s  "
+                      f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
+                clear_model_cache()
+            finally:
+                conn_pg.close()
 
-            elapsed, _, stats = ResourceMonitor.measure(
-                py_pid, get_pg_pid(conn_pg),
-                lambda: serve_two_step_chroma(conn_pg, ch_col, embed_client,
-                                              query_image_paths, top_k))
-            conn_pg.commit()
-            results_by_size[size]['two_step_chroma'] = BenchmarkResult(elapsed, stats)
-            print(f"  two_step_chroma   : {elapsed:.3f}s  "
-                  f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
-            clear_model_cache()
+            conn_pg, pg_pid = connect_and_get_pid()
+            warmup_pg_connection(conn_pg)
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(
+                    py_pid, pg_pid,
+                    lambda: serve_two_step_chroma(conn_pg, ch_col, embed_client,
+                                                  query_image_paths, top_k))
+                conn_pg.commit()
+                results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
+                print(f"  poly_chroma       : {elapsed:.3f}s  "
+                      f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
+                clear_model_cache()
+            finally:
+                conn_pg.close()
 
     finally:
-        conn_pg.close()
+        # Don't close conn_pg here since it's closed in the per-method blocks
+        pass
         if qd_client.collection_exists("s3_customers"):
             qd_client.delete_collection("s3_customers")
         qd_client.close()

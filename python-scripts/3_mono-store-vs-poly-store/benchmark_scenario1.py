@@ -202,6 +202,7 @@ def create_qdrant_client():
     client.create_collection("products",
                              vectors_config=VectorParams(size=384, distance=Distance.COSINE,
                                                          hnsw_config=hnsw_config))
+    client.update_collection("products", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
     return client
 
 
@@ -247,10 +248,10 @@ def scenario1_mono_store(conn, products: List[dict]):
                                                  WITH ORDINALITY AS i(name, description, price, stock, full_text, ord)),
                      computed_embeddings AS (SELECT id as ord, embedding
                                              FROM embed_texts_with_ids(
-                                                     'embed_anything', %s,
-                                                     (SELECT array_agg(ord ORDER BY ord) FROM input_products):: int [],
-                                                     (SELECT array_agg(full_text ORDER BY ord) FROM input_products)::text[]
-                                                  )),
+                                                      'embed_anything', %s,
+                                                      (SELECT array_agg(ord ORDER BY ord) FROM input_products):: int [],
+                                                      (SELECT array_agg(full_text ORDER BY ord) FROM input_products)::text[]
+                                                   )),
                      inserted_products AS (
                 INSERT
                 INTO products (product_id, name, description, price, stock_count, embedding)
@@ -262,19 +263,19 @@ def scenario1_mono_store(conn, products: List[dict]):
                          INSERT INTO reviews (product_id, rating, review_text)
                              SELECT i.new_id, r.rating, r.text
                              FROM unnest(%s:: int []
-                   , %s:: int []
-                   , %s::text[]) AS r(p_idx
-                   , rating
-                   , text)
+                    , %s:: int []
+                    , %s::text[]) AS r(p_idx
+                    , rating
+                    , text)
                     JOIN input_products i ON r.p_idx = i.ord)
-                   , inserted_categories AS (
+                    , inserted_categories AS (
                     INSERT INTO product_categories (product_id
-                   , category_name)
+                    , category_name)
                     SELECT i.new_id
-                   , c.cat_name
+                    , c.cat_name
                     FROM unnest(%s:: int []
-                   , %s::text[]) AS c (p_idx
-                   , cat_name)
+                    , %s::text[]) AS c (p_idx
+                    , cat_name)
                     JOIN input_products i ON c.p_idx = i.ord)
                 SELECT 1;
                 """, (names, descriptions, prices, stocks, full_texts,
@@ -368,6 +369,7 @@ def scenario1_poly_store_qdrant(conn, products: List[dict], embed_client, qdrant
     points = [PointStruct(id=pid, vector=emb, payload={"text": doc})
               for pid, emb, doc in zip(product_ids, embeddings, documents)]
     qdrant_client.upsert(collection_name="products", points=points, wait=True)
+    qdrant_client.update_collection("products", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
     cur.close()
 
 
@@ -383,7 +385,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_mono_deferred', 'mono_direct_deferred', 'poly_chroma', 'poly_qdrant']
+    methods = ['mono_pg_unified_deferred', 'mono_pg_direct_deferred', 'poly_chroma', 'poly_qdrant_deferred']
 
     print(f"\nStarting Benchmark 3 - Scenario 1: Cold Start")
     print(f"Run ID: {run_id}")
@@ -450,8 +452,8 @@ def main():
                 py_pid, pg_pid_mono,
                 lambda: scenario1_mono_store(conn_mono, products))
             conn_mono.commit()
-            results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
-            print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['mono_pg_unified_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_pg_unified_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
         finally:
             conn_mono.close()
@@ -468,8 +470,8 @@ def main():
                 py_pid, pg_pid_direct,
                 lambda: scenario1_mono_direct(conn_direct, products, embed_client))
             conn_direct.commit()
-            results_by_size[size]['mono_direct_deferred'] = BenchmarkResult(elapsed, stats)
-            print(f"  mono_direct_deferred: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['mono_pg_direct_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_pg_direct_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
         finally:
             conn_direct.close()
@@ -508,8 +510,8 @@ def main():
                     py_pid, pg_pid_qdrant,
                     lambda: scenario1_poly_store_qdrant(conn_qdrant, products, embed_client, qd))
                 conn_qdrant.commit()
-                results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
-                print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
+                results_by_size[size]['poly_qdrant_deferred'] = BenchmarkResult(elapsed, stats)
+                print(f"  poly_qdrant_deferred: {elapsed:.2f}s", flush=True)
                 clear_model_cache()
             finally:
                 cleanup_qdrant(qd)

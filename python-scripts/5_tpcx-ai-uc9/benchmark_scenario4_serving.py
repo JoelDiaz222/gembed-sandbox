@@ -21,7 +21,7 @@ from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME,
     BenchmarkResult, ResourceMonitor,
     connect_and_get_pid, get_pg_pid, warmup_pg_connection,
-    cleanup_chroma, temp_image_dir,
+    cleanup_chroma, temp_image_dir, clear_model_cache,
 )
 from utils.plot_utils import save_single_run_csv
 
@@ -258,11 +258,12 @@ def populate_pg(conn, products: list, customers: list, purchases: list,
 def setup_qdrant(client: QdrantClient, customers: list, embeddings: List[List[float]]):
     if client.collection_exists("s4_customers"):
         client.delete_collection("s4_customers")
-    hnsw_cfg = models.HnswConfigDiff(m=16, ef_construct=100)
+    
+    # Deferred indexing: threshold = 0 during ingestion
     client.create_collection(
         "s4_customers",
-        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE,
-                                    hnsw_config=hnsw_cfg),
+        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=0)
     )
     points = [
         PointStruct(
@@ -273,6 +274,11 @@ def setup_qdrant(client: QdrantClient, customers: list, embeddings: List[List[fl
         for c, emb in zip(customers, embeddings)
     ]
     client.upsert("s4_customers", points, wait=True)
+    # Reset threshold to enable indexing
+    client.update_collection(
+        "s4_customers",
+        optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000)
+    )
 
 
 def setup_chroma(base_path: str, customers: list, embeddings: List[List[float]]):
@@ -413,7 +419,7 @@ def main():
     top_k = args.topk
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    base_methods = ['pg_gembed_unified', 'qdrant_native', 'chroma_native']
+    base_methods = ['mono_pg_unified_deferred', 'poly_qdrant_deferred', 'poly_chroma']
     methods = [f"{m}_f{f}" for m in base_methods for f in fracs]
 
     print(f"\nBenchmark 5 UC9 – Scenario 4: Customer ID + Hybrid Product Filter")
@@ -474,7 +480,9 @@ def main():
     register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
+    conn_pg.commit()
     populate_pg(conn_pg, products, customers, purchases, customer_embeddings)
+    conn_pg.commit()
 
     # ── Qdrant setup ─────────────────────────────────────────────────────
     qd_client = QdrantClient(url=QDRANT_URL)
@@ -487,11 +495,18 @@ def main():
     # ── Warm-up (smallest frac) ──────────────────────────────────────────
     wlo, whi, _ = frac_ranges[fracs[0]]
     warmup_q = all_query_paths[:2]
+    clear_model_cache()
     serve_pg_gembed_unified(conn_pg, warmup_q, TARGET_CATEGORY, wlo, whi, top_k)
+    clear_model_cache()
     serve_qdrant_native(conn_pg, qd_client, embed_client, warmup_q,
                         TARGET_CATEGORY, wlo, whi, top_k)
+    clear_model_cache()
     serve_chroma_native(conn_pg, ch_col, embed_client, warmup_q,
                         TARGET_CATEGORY, wlo, whi, top_k)
+    conn_pg.commit()
+    clear_model_cache()
+
+    results_by_size = {s: {m: None for m in methods} for s in test_sizes}
 
     try:
         # ── Benchmark loop over Batch Sizes ──────────────────────────────────
@@ -517,11 +532,11 @@ def main():
                 warmup_pg_connection(conn_pg)
                 try:
                     elapsed, _, stats = ResourceMonitor.measure(
-                        py_pid, get_pg_pid(conn_pg),
+                        py_pid, pg_pid,
                         lambda lo=price_lo, hi=price_hi: serve_pg_gembed_unified(
                             conn_pg, query_image_paths, TARGET_CATEGORY, lo, hi, top_k))
                     conn_pg.commit()
-                    entry[f'pg_gembed_unified_f{frac}'] = {
+                    entry[f'mono_pg_unified_deferred_f{frac}'] = {
                         'time_s': elapsed,
                         'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
                         'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
@@ -532,7 +547,7 @@ def main():
                         'qd_mem_peak': stats.qd_peak_mb,
                         'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
                     }
-                    print(f"      pg_gembed_unified : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                    print(f"      mono_pg_unified_deferred : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
                     clear_model_cache()
                 finally:
                     conn_pg.close()
@@ -540,16 +555,15 @@ def main():
                 # Qdrant Native
                 conn_pg, pg_pid = connect_and_get_pid()
                 warmup_pg_connection(conn_pg)
-                qd_client = create_qdrant_client()
                 try:
                     elapsed, _, stats = ResourceMonitor.measure(
-                        py_pid, None,
+                        py_pid, pg_pid,
                         lambda lo=price_lo, hi=price_hi: serve_qdrant_native(
                             conn_pg, qd_client, embed_client, query_image_paths,
                             TARGET_CATEGORY, lo, hi, top_k),
                         container_name=QDRANT_CONTAINER_NAME)
                     conn_pg.commit()
-                    entry[f'qdrant_native_f{frac}'] = {
+                    entry[f'poly_qdrant_deferred_f{frac}'] = {
                         'time_s': elapsed,
                         'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
                         'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
@@ -560,25 +574,22 @@ def main():
                         'qd_mem_peak': stats.qd_peak_mb,
                         'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
                     }
-                    print(f"      qdrant_native     : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                    print(f"      poly_qdrant_deferred     : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
                     clear_model_cache()
                 finally:
                     conn_pg.close()
-                    qd_client.close()
 
                 # Chroma Native
                 conn_pg, pg_pid = connect_and_get_pid()
                 warmup_pg_connection(conn_pg)
-                ch_client, ch_path = create_chroma_client()
                 try:
-                    ch_col = ch_client.get_collection("s4_customers")
                     elapsed, _, stats = ResourceMonitor.measure(
-                        py_pid, None,
+                        py_pid, pg_pid,
                         lambda lo=price_lo, hi=price_hi: serve_chroma_native(
                             conn_pg, ch_col, embed_client, query_image_paths,
                             TARGET_CATEGORY, lo, hi, top_k))
                     conn_pg.commit()
-                    entry[f'chroma_native_f{frac}'] = {
+                    entry[f'poly_chroma_f{frac}'] = {
                         'time_s': elapsed,
                         'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
                         'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
@@ -589,16 +600,19 @@ def main():
                         'qd_mem_peak': stats.qd_peak_mb,
                         'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
                     }
-                    print(f"      chroma_native     : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                    print(f"      poly_chroma              : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
                     clear_model_cache()
                 finally:
                     conn_pg.close()
-                    cleanup_chroma(ch_client, ch_path)
 
             all_results.append(entry)
 
     finally:
-        pass
+        conn_pg.close()
+        if qd_client.collection_exists("s4_customers"):
+            qd_client.delete_collection("s4_customers")
+        qd_client.close()
+        cleanup_chroma(ch_client, ch_path)
 
     # ── Save results ──────────────────────────────────────────────────────────
     output_dir = OUTPUT_DIR / "scenario4_serving"

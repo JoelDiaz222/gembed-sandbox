@@ -1,6 +1,7 @@
-import pandas as pd
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
 
 # Adapted from plot_utils.py for more concise table headers.
 LABEL_MAP = {
@@ -13,7 +14,7 @@ LABEL_MAP = {
     'ext_http': 'Ext. HTTP',
     'chroma': 'ChromaDB',
     'qdrant': 'Qdrant',
-    
+
     # Benchmark 2
     'pg_local_indexed': 'PG Local Indexed',
     'pg_local_deferred': 'PG Local Deferred',
@@ -21,11 +22,14 @@ LABEL_MAP = {
     'pg_grpc_deferred': 'PG gRPC Deferred',
     'qd_indexed': 'QD Indexed',
     'qd_deferred': 'QD Deferred',
-    
+
     # Benchmark 3
     'unified': 'Unified',
     'poly_chroma': 'Dist. Chroma',
     'poly_qdrant': 'Dist. Qdrant',
+    'poly_qdrant_deferred': 'Dist. Qdrant (Deferred)',
+    'mono_pg_unified_deferred': 'Mono-Store (Unified)',
+    'mono_pg_direct_deferred': 'Mono-Store (Direct)',
 
     # Benchmark 4
     'pg_indexed': 'PG Indexed',
@@ -36,13 +40,14 @@ LABEL_MAP = {
 }
 
 
-def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, metrics: list = ['throughput'], baseline_candidates: list = None):
+def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, metrics: list = ['throughput'],
+                             baseline_candidates: list = None):
     """
     Generate LaTeX tables (standard metrics and speedups) from a benchmark CSV file in a single pass.
     """
     if baseline_candidates is None:
-        baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_direct_deferred']
-        
+        baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_pg_direct_deferred']
+
     try:
         df = pd.read_csv(csv_file)
     except FileNotFoundError:
@@ -76,12 +81,12 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
     for metric in metrics:
         table_data = []
         speedup_data = []
-        
+
         for size in sizes:
             row = {'Input Size': size}
             speedup_row = {'Input Size': size}
             size_df = df[df['size'] == size]
-            
+
             # Pre-calculate baseline median if this is throughput
             baseline_median = None
             if metric == 'throughput' and baseline_method:
@@ -90,7 +95,7 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
                     b_vals = size_df[metric_col].dropna()
                     if not b_vals.empty:
                         baseline_median = np.median(b_vals)
-            
+
             for method in methods:
                 metric_col = f'{method}_{metric}'
                 if metric_col in size_df.columns:
@@ -102,7 +107,7 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
                         iqr = q3 - q1
                         # Format to one decimal place for consistency
                         row[method] = f"{median:.1f} ({iqr:.1f})"
-                        
+
                         if metric == 'throughput' and baseline_median and baseline_median > 0:
                             speedup_row[method] = median / baseline_median
                         else:
@@ -113,7 +118,7 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
                 else:
                     row[method] = "-"
                     speedup_row[method] = None
-                    
+
             table_data.append(row)
             if metric == 'throughput' and baseline_method:
                 speedup_data.append(speedup_row)
@@ -133,28 +138,28 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
                     try:
                         median = float(val.split(' ')[0])
                         if (metric == 'throughput' and median > max_median) or \
-                           (metric != 'throughput' and median < max_median):
+                                (metric != 'throughput' and median < max_median):
                             max_median = median
                             max_method = method
                     except (ValueError, IndexError):
-                        continue # Ignore malformed entries
-            
+                        continue  # Ignore malformed entries
+
             if max_method:
                 row_data[max_method] = f"\\textbf{{{row_data[max_method]}}}"
 
         # Create LaTeX table string
         header_labels = [LABEL_MAP.get(m, m.replace('_', ' ').title()) for m in methods]
-        
+
         latex_string = f"% Auto-generated from {Path(csv_file).name}\n"
         latex_string += "\\begin{tabular}{l" + "c" * len(methods) + "}\n"
         latex_string += "\\toprule\n"
         latex_string += "\\textbf{Input Size} & " + " & ".join([f"\\textbf{{{l}}}" for l in header_labels]) + " \\\\\n"
         latex_string += "\\midrule\n"
-        
+
         for row_data in table_data:
             row_values = [str(row_data['Input Size'])] + [row_data.get(method, "-") for method in methods]
             latex_string += " & ".join(row_values) + " \\\\\n"
-            
+
         latex_string += "\\bottomrule\n"
         latex_string += "\\end{tabular}\n"
 
@@ -162,24 +167,25 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
         table_filepath = output_path / table_filename
         with open(table_filepath, 'w') as f:
             f.write(latex_string)
-        
+
         print(f"LaTeX table saved to {table_filepath}")
 
         # --- Generate Speedup Table ---
         if metric == 'throughput' and baseline_method and speedup_data:
             display_methods = [m for m in methods if m != baseline_method]
             sp_header_labels = [LABEL_MAP.get(m, m.replace('_', ' ').title()) for m in display_methods]
-            
+
             sp_latex = f"% Speedup relative to {LABEL_MAP.get(baseline_method, baseline_method)} \n"
             sp_latex += "\\begin{tabular}{l" + "c" * len(display_methods) + "}\n"
             sp_latex += "\\toprule\n"
-            sp_latex += "\\textbf{Input Size} & " + " & ".join([f"\\textbf{{{l}}}" for l in sp_header_labels]) + " \\\\\n"
+            sp_latex += "\\textbf{Input Size} & " + " & ".join(
+                [f"\\textbf{{{l}}}" for l in sp_header_labels]) + " \\\\\n"
             sp_latex += "\\midrule\n"
-            
+
             for row_data in speedup_data:
                 max_speedup_candidates = [row_data.get(m, 0) or 0 for m in display_methods]
                 max_speedup = max(max_speedup_candidates) if max_speedup_candidates else 0
-                
+
                 row_values = [str(row_data['Input Size'])]
                 for method in display_methods:
                     val = row_data.get(method)
@@ -191,9 +197,9 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
                             row_values.append(formatted_val)
                     else:
                         row_values.append("-")
-                
+
                 sp_latex += " & ".join(row_values) + " \\\\\n"
-                
+
             sp_latex += "\\bottomrule\n"
             sp_latex += "\\end{tabular}\n"
 
@@ -201,6 +207,5 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
             sp_filepath = output_path / sp_filename
             with open(sp_filepath, 'w') as f:
                 f.write(sp_latex)
-                
-            print(f"Speedup table saved to {sp_filepath}")
 
+            print(f"Speedup table saved to {sp_filepath}")

@@ -324,23 +324,28 @@ def main():
     conn_pg.commit()
     clear_model_cache()
     s2_ingest_pg_unified(conn_pg, ingest_paths)
+    conn_pg.commit()
 
     print("Setting up Qdrant poly-store DB...")
     conn_pg2, pg_pid2 = connect_and_get_pid()
     warmup_pg_connection(conn_pg2)
     setup_pg_schema(conn_pg2)
+    conn_pg2.commit()
     qd = create_qdrant_client()
     clear_model_cache()
     s2_ingest_qdrant(conn_pg2, qd, ingest_paths, embed_client)
+    conn_pg2.commit()
 
     print("Setting up Chroma poly-store DB...")
     conn_pg3, pg_pid3 = connect_and_get_pid()
     warmup_pg_connection(conn_pg3)
     setup_pg_schema(conn_pg3)
+    conn_pg3.commit()
     c_client, c_path = create_chroma_client()
     c_col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
     clear_model_cache()
     s2_ingest_chroma(conn_pg3, c_col, ingest_paths, embed_client)
+    conn_pg3.commit()
 
     # Warm-up queries
     print("Warming up queries...")
@@ -348,12 +353,16 @@ def main():
     if warmup_queries:
         clear_model_cache()
         serve_s2_pg_unified(conn_pg, warmup_queries)
+        clear_model_cache()
         serve_s2_pg_direct(conn_pg, embed_client, warmup_queries)
+        clear_model_cache()
+        serve_s2_qdrant(qd, conn_pg2, embed_client, warmup_queries)
+        clear_model_cache()
+        serve_s2_chroma(c_col, conn_pg3, embed_client, warmup_queries)
         conn_pg.close()
         conn_pg2.close()
         conn_pg3.close()
-        qd.close()
-        cleanup_chroma(c_client, c_path)
+        clear_model_cache()
 
     # Single run over all sizes
     results_by_size = {size: {m: None for m in methods} for size in test_sizes}
@@ -394,7 +403,6 @@ def main():
         # Poly-Store Qdrant
         conn_pg2, pg_pid2 = connect_and_get_pid()
         warmup_pg_connection(conn_pg2)
-        qd = create_qdrant_client()
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid2,
@@ -406,14 +414,11 @@ def main():
             clear_model_cache()
         finally:
             conn_pg2.close()
-            qd.close()
 
         # Poly-Store Chroma
         conn_pg3, pg_pid3 = connect_and_get_pid()
         warmup_pg_connection(conn_pg3)
-        c_client, c_path = create_chroma_client()
         try:
-            c_col = c_client.get_collection("faces")
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid3,
                 lambda: serve_s2_chroma(c_col, conn_pg3, embed_client, queries))
@@ -423,8 +428,12 @@ def main():
             clear_model_cache()
         finally:
             conn_pg3.close()
-            cleanup_chroma(c_client, c_path)
 
+    # Cleanup Vector DBs
+    if qd.collection_exists("faces"):
+        qd.delete_collection("faces")
+    qd.close()
+    cleanup_chroma(c_client, c_path)
 
     # Collect metrics
     all_results = []

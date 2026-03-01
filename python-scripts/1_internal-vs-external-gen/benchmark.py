@@ -177,7 +177,7 @@ def run_single_iteration(conn, py_pid, pg_pid, texts: List[str],
     """Run a single benchmark iteration on an existing connection."""
     truncate_table(conn)
     res = run_benchmark_iteration(conn, py_pid, pg_pid,
-                                   lambda c: benchmark_fn(c, texts))
+                                  lambda c: benchmark_fn(c, texts))
     conn.commit()
     return res
 
@@ -334,7 +334,6 @@ def main():
                     result = run_single_iteration(conn, py_pid, pg_pid, texts, benchmark_fn)
                     results_by_size[size][method_name] = result
                     print(f"  {method_name}: {result.time_s:.2f}s", flush=True)
-                    # Clear model cache after each method to ensure no cross-contamination
                     clear_model_cache()
                 finally:
                     conn.close()

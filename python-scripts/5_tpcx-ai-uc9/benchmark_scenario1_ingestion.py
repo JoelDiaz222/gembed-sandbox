@@ -133,27 +133,27 @@ def s1_populate_pg(conn, image_paths: List[str]):
     cur.close()
 
 
-def s1_ingest_pg_direct(conn, image_paths: List[str], embed_client: EmbedAnythingImageClient):
-    """Embed in Python, then insert path + embedding into PG."""
+def s1_ingest_pg_direct_deferred(conn, image_paths: List[str], embed_client: EmbedAnythingImageClient):
+    """Embed in Python, insert, then create index in PG."""
     setup_pg_schema(conn)
     cur = conn.cursor()
-    cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
-                " WITH (m=16, ef_construction=100);")
 
     embeddings = embed_client.embed_files(image_paths)
     execute_values(cur,
                    "INSERT INTO faces (path, embedding) VALUES %s",
                    list(zip(image_paths, [np.array(e) for e in embeddings]))
                    )
-    cur.close()
-
-
-def s1_ingest_pg_unified(conn, image_paths: List[str]):
-    cur = conn.cursor()
     cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
                 " WITH (m=16, ef_construction=100);")
     cur.close()
+
+
+def s1_ingest_pg_unified_deferred(conn, image_paths: List[str]):
+    cur = conn.cursor()
     s1_populate_pg(conn, image_paths)
+    cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
+                " WITH (m=16, ef_construction=100);")
+    cur.close()
 
 
 # =============================================================================
@@ -186,6 +186,8 @@ def s1_ingest_qdrant(client, image_paths: List[str], embed_client: EmbedAnything
     client.create_collection("faces",
                              vectors_config=VectorParams(size=512, distance=Distance.COSINE,
                                                          hnsw_config=hnsw_config))
+    client.update_collection("faces", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
+
     embeddings = embed_client.embed_files(image_paths)
     points = [
         PointStruct(id=idx, vector=emb, payload={"path": p, "person_name": get_person_name(p)})
@@ -193,6 +195,8 @@ def s1_ingest_qdrant(client, image_paths: List[str], embed_client: EmbedAnything
     ]
     if points:
         client.upsert("faces", points, wait=True)
+
+    client.update_collection("faces", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
 
 
 def s1_ingest_chroma(collection, image_paths: List[str], embed_client: EmbedAnythingImageClient):
@@ -215,7 +219,7 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['pg_unified', 'pg_direct', 'qd_indexed', 'chroma']
+    methods = ['mono_pg_unified_deferred', 'mono_pg_direct_deferred', 'poly_qdrant_deferred', 'poly_chroma']
 
     print(f"\nStarting Benchmark 5 UC9 - Scenario 1 Ingestion")
     print(f"Run ID: {run_id}")
@@ -275,30 +279,30 @@ def main():
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
-                lambda: s1_ingest_pg_unified(conn, paths))
-            results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
+                lambda: s1_ingest_pg_unified_deferred(conn, paths))
+            results_by_size[size]['mono_pg_unified_deferred'] = BenchmarkResult(elapsed, stats)
             conn.commit()
-            print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+            print(f"  mono_pg_unified_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
         finally:
             conn.close()
 
-        # PG Direct
-        conn, pg_pid = connect_and_get_pid()
-        register_vector(conn)
-        warmup_pg_connection(conn)
-        setup_pg_schema(conn)
-        conn.commit()
-        try:
-            elapsed, _, stats = ResourceMonitor.measure(
-                py_pid, pg_pid,
-                lambda: s1_ingest_pg_direct(conn, paths, embed_client))
-            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+            # PG Direct
+            conn, pg_pid = connect_and_get_pid()
+            register_vector(conn)
+            warmup_pg_connection(conn)
+            setup_pg_schema(conn)
             conn.commit()
-            print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
-            clear_model_cache()
-        finally:
-            conn.close()
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(
+                    py_pid, pg_pid,
+                    lambda: s1_ingest_pg_direct_deferred(conn, paths, embed_client))
+                results_by_size[size]['mono_pg_direct_deferred'] = BenchmarkResult(elapsed, stats)
+                conn.commit()
+                print(f"  mono_pg_direct_deferred:  {elapsed:.2f}s", flush=True)
+                clear_model_cache()
+            finally:
+                conn.close()
 
         # Qdrant
         qd = create_qdrant_client()
@@ -308,8 +312,8 @@ def main():
                 py_pid, None,
                 lambda: s1_ingest_qdrant(qd, paths, embed_client),
                 container_name=QDRANT_CONTAINER_NAME)
-            results_by_size[size]['qd_indexed'] = BenchmarkResult(elapsed, stats)
-            print(f"  qd_indexed: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['poly_qdrant_deferred'] = BenchmarkResult(elapsed, stats)
+            print(f"  poly_qdrant_deferred: {elapsed:.2f}s", flush=True)
         finally:
             if qd.collection_exists("faces"):
                 qd.delete_collection("faces")
@@ -323,8 +327,8 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, None,
                 lambda: s1_ingest_chroma(col, paths, embed_client))
-            results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
-            print(f"  chroma: {elapsed:.2f}s", flush=True)
+            results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
+            print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
         finally:
             cleanup_chroma(c_client, c_path)
 

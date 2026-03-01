@@ -2,7 +2,6 @@ import csv
 from pathlib import Path
 from typing import List
 
-import matplotlib
 import matplotlib.pyplot as plt
 
 COLOR_PG_MAIN = '#003f5c'  # Navy Blue (Internal/Mono-Store)
@@ -45,7 +44,9 @@ STYLE_MAP = {
     'external': (COLOR_DIRECT, '--', '*'),
     'ext_direct_indexed': (COLOR_DIRECT, '-', '*'),
     'ext_direct_deferred': (COLOR_DIRECT, '--', '*'),
-    'mono_direct_deferred': (COLOR_DIRECT, '--', 'o'),
+    'mono_pg_direct_deferred': (COLOR_DIRECT, '--', 'o'),
+    'mono_pg_unified_deferred': (COLOR_PG_ALT, '--', 's'),
+    'poly_qdrant_deferred': (COLOR_VECTOR_QD, ':', 'D'),
 
     # Remote/Network Clients
     'ext_grpc': (COLOR_REMOTE_GRPC, ':', 'P'),  # Purple, Dotted, Plus
@@ -71,7 +72,6 @@ LABEL_MAP = {
     'external': 'PG External Client',
     'ext_direct_indexed': 'Python Direct (Indexed)',
     'ext_direct_deferred': 'Python Direct (Deferred Index)',
-    'mono_direct_deferred': 'Mono-Store (PG, Python Direct)',
     'pg_unified': 'PG (Local, Unified)',
     'pg_direct': 'PG (Python Direct)',
     'pg_gembed_unified': 'PG (Local, Unified)',
@@ -84,7 +84,10 @@ LABEL_MAP = {
     'two_step_chroma': 'Poly-Store (PG, ChromaDB)',
     'two_step_qdrant': 'Poly-Store (PG, Qdrant)',
     'qd_indexed': 'Qdrant (Indexed)',
-    'qd_deferred': 'Qdrant (Deferred Index)'
+    'qd_deferred': 'Qdrant (Deferred Index)',
+    'mono_pg_unified_deferred': 'Mono-Store (PG, Local, Unified, Deferred Index)',
+    'mono_pg_direct_deferred': 'Mono-Store (PG, Python Direct, Deferred Index)',
+    'poly_qdrant_deferred': 'Poly-Store (PG, Qdrant, Deferred Index)'
 }
 
 
@@ -199,7 +202,7 @@ def save_single_run_csv(all_results: List[dict], output_dir: Path, run_id: str, 
                 else:
                     row.extend([''] * len(metrics))
             writer.writerow(row)
-    
+
     print(f"CSV saved to: {path}")
     return str(path)
 
@@ -289,7 +292,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.close()
 
     def plot_normalized_throughput():
-        baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_direct_deferred']
+        baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_pg_direct_deferred']
         baseline_method = None
         for candidate in baseline_candidates:
             if candidate in methods:
@@ -298,41 +301,43 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         if not baseline_method:
             return
-            
+
         plt.figure(figsize=(8, 6))
-        
-        baseline_y_vals = [r[baseline_method].get('throughput_median', r[baseline_method].get('throughput', 0)) for r in all_results if baseline_method in r]
+
+        baseline_y_vals = [r[baseline_method].get('throughput_median', r[baseline_method].get('throughput', 0)) for r in
+                           all_results if baseline_method in r]
         if not any(baseline_y_vals):
             plt.close()
             return
-            
+
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if method in r]
-            
+            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if
+                      method in r]
+
             if not any(y_vals): continue
-            
+
             norm_y_vals = []
             valid_sizes = []
             for sz, y, b in zip(sizes, y_vals, baseline_y_vals):
                 if y and b and b > 0:
                     norm_y_vals.append(y / b)
                     valid_sizes.append(sz)
-                    
+
             if not norm_y_vals: continue
-            
+
             plt.plot(valid_sizes, norm_y_vals, marker=marker, linestyle=ls, color=color, label=label, alpha=0.9)
 
         plt.xscale('log', base=2)
         plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
-        
+
         plt.xlabel('Batch Size (Log Scale)')
         baseline_label = LABEL_MAP.get(baseline_method, baseline_method)
         plt.ylabel(f'Relative Throughput (vs {baseline_label})')
         plt.title(f'Relative Throughput Normalized to {baseline_label}')
         plt.legend(frameon=True, framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.3)
-        
+
         plt.savefig(output_dir / f"normalized_throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
         plt.savefig(output_dir / f"normalized_throughput_{timestamp}.png", dpi=300, bbox_inches='tight')
         plt.close()
@@ -357,52 +362,51 @@ def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
     import pandas as pd
     import numpy as np
     from pathlib import Path
-    
+
     df = pd.read_csv(csv_file)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Extract method names from columns
     methods = []
     for col in df.columns:
         if col.endswith('_time_s'):
             method = col.replace('_time_s', '')
             methods.append(method)
-    
+
     if not methods:
         print(f"No methods found in CSV: {csv_file}")
         return
-    
+
     # Get unique sizes
     sizes = sorted(df['size'].unique())
-    
+
     # Aggregate data for each size and method
     all_results = []
     for size in sizes:
         size_data = df[df['size'] == size]
         result_entry = {'size': size}
-        
+
         for method in methods:
             method_data = {}
-            
+
             # Collect all metrics for this method
             for col in df.columns:
                 if col.startswith(f'{method}_') and not col.endswith(('_std', '_median', '_q1', '_q3')):
                     metric_name = col.replace(f'{method}_', '')
                     values = size_data[col].dropna().values
-                    
+
                     if len(values) > 0:
                         method_data[metric_name] = np.mean(values)
                         method_data[f'{metric_name}_std'] = np.std(values)
                         method_data[f'{metric_name}_median'] = np.median(values)
                         method_data[f'{metric_name}_q1'] = np.percentile(values, 25)
                         method_data[f'{metric_name}_q3'] = np.percentile(values, 75)
-            
+
             result_entry[method] = method_data
-        
+
         all_results.append(result_entry)
-    
+
     # Generate plots using the existing function
     generate_plots(all_results, output_dir, timestamp, methods)
     print(f"Plots generated from CSV: {csv_file}")
-
