@@ -305,21 +305,34 @@ def main():
         print(f"\nSize: {size}", flush=True)
         queries = queries_by_size[size]
 
-        clear_model_cache()
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, get_pg_pid(conn_pg),
-            lambda: serve_s1_pg_unified(conn_pg, queries))
-        results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
-        conn_pg.commit()
-        print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+        # PG Unified
+        conn_pg, pg_pid = connect_and_get_pid()
+        warmup_pg_connection(conn_pg)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, get_pg_pid(conn_pg),
+                lambda: serve_s1_pg_unified(conn_pg, queries))
+            conn_pg.commit()
+            results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg.close()
 
         # PG Direct
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, pg_pid,
-            lambda: serve_s1_pg_direct(conn_pg, embed_client, queries))
-        results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
-        conn_pg.commit()
-        print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
+        conn_pg, pg_pid = connect_and_get_pid()
+        register_vector(conn_pg)
+        warmup_pg_connection(conn_pg)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: serve_s1_pg_direct(conn_pg, embed_client, queries))
+            conn_pg.commit()
+            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg.close()
 
         clear_model_cache()
         elapsed, _, stats = ResourceMonitor.measure(
@@ -337,7 +350,6 @@ def main():
         print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
 
     # Cleanup
-    conn_pg.close()
     if qd.collection_exists("faces"):
         qd.delete_collection("faces")
     qd.close()

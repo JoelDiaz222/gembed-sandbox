@@ -252,41 +252,62 @@ def main():
         print(f"\nSize: {size}", flush=True)
         input_texts = [t for t, s in test_pool[:size]]
 
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, pg_pid,
-            lambda: serve_pg(conn_pg, input_texts))
-        conn_pg.commit()
-        results_by_size[size]['pg'] = BenchmarkResult(elapsed, stats)
-        print(f"  pg       : {elapsed:.2f}s", flush=True)
+        # PG Unified (Internal gen)
+        conn_pg, pg_pid = connect_and_get_pid()
+        warmup_pg_connection(conn_pg)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: serve_pg(conn_pg, input_texts))
+            conn_pg.commit()
+            results_by_size[size]['pg'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg       : {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg.close()
 
-        # PG Direct
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, pg_pid,
-            lambda: serve_pg_direct(conn_pg, embed_client, input_texts))
-        conn_pg.commit()
-        results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
-        print(f"  pg_direct: {elapsed:.2f}s", flush=True)
+        # PG Direct (External gen)
+        conn_pg, pg_pid = connect_and_get_pid()
+        register_vector(conn_pg)
+        warmup_pg_connection(conn_pg)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: serve_pg_direct(conn_pg, embed_client, input_texts))
+            conn_pg.commit()
+            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_direct: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg.close()
 
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, None,
-            lambda: serve_qdrant(qd, embed_client, input_texts),
-            container_name=QDRANT_CONTAINER_NAME)
-        results_by_size[size]['qdrant'] = BenchmarkResult(elapsed, stats)
-        print(f"  qdrant: {elapsed:.2f}s", flush=True)
+        # Qdrant
+        qd = create_qdrant_client()
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, None,
+                lambda: serve_qdrant(qd, embed_client, input_texts),
+                container_name=QDRANT_CONTAINER_NAME)
+            results_by_size[size]['qdrant'] = BenchmarkResult(elapsed, stats)
+            print(f"  qdrant: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            if qd.collection_exists("reviews"):
+                qd.delete_collection("reviews")
+            qd.close()
 
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, None,
-            lambda: serve_chroma(c_col, embed_client, input_texts))
-        results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
-        print(f"  chroma: {elapsed:.2f}s", flush=True)
-        clear_model_cache()
-
-    # Cleanup
-    conn_pg.close()
-    if qd.collection_exists("reviews"):
-        qd.delete_collection("reviews")
-    qd.close()
-    cleanup_chroma(c_client, c_path)
+        # Chroma
+        c_client, c_path = create_chroma_client()
+        try:
+            c_col = c_client.get_collection("reviews")
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, None,
+                lambda: serve_chroma(c_col, embed_client, input_texts))
+            results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
+            print(f"  chroma: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            cleanup_chroma(c_client, c_path)
 
     # Collect metrics
     all_results = []

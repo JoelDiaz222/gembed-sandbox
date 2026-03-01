@@ -349,10 +349,11 @@ def main():
         clear_model_cache()
         serve_s2_pg_unified(conn_pg, warmup_queries)
         serve_s2_pg_direct(conn_pg, embed_client, warmup_queries)
-        clear_model_cache()
-        serve_s2_qdrant(qd, conn_pg2, embed_client, warmup_queries)
-        clear_model_cache()
-        serve_s2_chroma(c_col, conn_pg3, embed_client, warmup_queries)
+        conn_pg.close()
+        conn_pg2.close()
+        conn_pg3.close()
+        qd.close()
+        cleanup_chroma(c_client, c_path)
 
     # Single run over all sizes
     results_by_size = {size: {m: None for m in methods} for size in test_sizes}
@@ -361,47 +362,69 @@ def main():
         print(f"\nSize: {size}", flush=True)
         queries = queries_by_size[size]
 
-        clear_model_cache()
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, pg_pid,
-            lambda: serve_s2_pg_unified(conn_pg, queries))
-        conn_pg.commit()
-        results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
-        print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+        # PG Unified
+        conn_pg, pg_pid = connect_and_get_pid()
+        warmup_pg_connection(conn_pg)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, get_pg_pid(conn_pg),
+                lambda: serve_s2_pg_unified(conn_pg, queries))
+            conn_pg.commit()
+            results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg.close()
 
         # PG Direct
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, pg_pid,
-            lambda: serve_s2_pg_direct(conn_pg, embed_client, queries))
-        conn_pg.commit()
-        results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
-        print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
+        conn_pg, pg_pid = connect_and_get_pid()
+        register_vector(conn_pg)
+        warmup_pg_connection(conn_pg)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid,
+                lambda: serve_s2_pg_direct(conn_pg, embed_client, queries))
+            conn_pg.commit()
+            results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+            print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg.close()
 
-        clear_model_cache()
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, pg_pid2,
-            lambda: serve_s2_qdrant(qd, conn_pg2, embed_client, queries),
-            container_name=QDRANT_CONTAINER_NAME)
-        conn_pg2.commit()
-        results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
-        print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
+        # Poly-Store Qdrant
+        conn_pg2, pg_pid2 = connect_and_get_pid()
+        warmup_pg_connection(conn_pg2)
+        qd = create_qdrant_client()
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid2,
+                lambda: serve_s2_qdrant(qd, conn_pg2, embed_client, queries),
+                container_name=QDRANT_CONTAINER_NAME)
+            conn_pg2.commit()
+            results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
+            print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg2.close()
+            qd.close()
 
-        clear_model_cache()
-        elapsed, _, stats = ResourceMonitor.measure(
-            py_pid, pg_pid3,
-            lambda: serve_s2_chroma(c_col, conn_pg3, embed_client, queries))
-        conn_pg3.commit()
-        results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
-        print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
+        # Poly-Store Chroma
+        conn_pg3, pg_pid3 = connect_and_get_pid()
+        warmup_pg_connection(conn_pg3)
+        c_client, c_path = create_chroma_client()
+        try:
+            c_col = c_client.get_collection("faces")
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid3,
+                lambda: serve_s2_chroma(c_col, conn_pg3, embed_client, queries))
+            conn_pg3.commit()
+            results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
+            print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_pg3.close()
+            cleanup_chroma(c_client, c_path)
 
-    # Cleanup
-    conn_pg.close()
-    conn_pg2.close()
-    conn_pg3.close()
-    if qd.collection_exists("faces"):
-        qd.delete_collection("faces")
-    qd.close()
-    cleanup_chroma(c_client, c_path)
 
     # Collect metrics
     all_results = []

@@ -512,71 +512,93 @@ def main():
                 print(f"\n    {'─' * 40}", flush=True)
                 print(f"    α = {frac} ({n_eligible} eligible products)", flush=True)
 
-                elapsed, _, stats = ResourceMonitor.measure(
-                    py_pid, get_pg_pid(conn_pg),
-                    lambda lo=price_lo, hi=price_hi: serve_pg_gembed_unified(
-                        conn_pg, query_image_paths, TARGET_CATEGORY, lo, hi, top_k))
-                conn_pg.commit()
-                entry[f'pg_gembed_unified_f{frac}'] = {
-                    'time_s': elapsed,
-                    'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
-                    'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
-                    'py_mem_peak': stats.py_peak_mb,
-                    'pg_cpu': stats.pg_cpu, 'pg_mem_delta': stats.pg_delta_mb,
-                    'pg_mem_peak': stats.pg_peak_mb,
-                    'qd_cpu': stats.qd_cpu, 'qd_mem_delta': stats.qd_delta_mb,
-                    'qd_mem_peak': stats.qd_peak_mb,
-                    'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
-                }
-                print(f"      pg_gembed_unified : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                # PG Gembed Unified
+                conn_pg, pg_pid = connect_and_get_pid()
+                warmup_pg_connection(conn_pg)
+                try:
+                    elapsed, _, stats = ResourceMonitor.measure(
+                        py_pid, get_pg_pid(conn_pg),
+                        lambda lo=price_lo, hi=price_hi: serve_pg_gembed_unified(
+                            conn_pg, query_image_paths, TARGET_CATEGORY, lo, hi, top_k))
+                    conn_pg.commit()
+                    entry[f'pg_gembed_unified_f{frac}'] = {
+                        'time_s': elapsed,
+                        'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
+                        'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
+                        'py_mem_peak': stats.py_peak_mb,
+                        'pg_cpu': stats.pg_cpu, 'pg_mem_delta': stats.pg_delta_mb,
+                        'pg_mem_peak': stats.pg_peak_mb,
+                        'qd_cpu': stats.qd_cpu, 'qd_mem_delta': stats.qd_delta_mb,
+                        'qd_mem_peak': stats.qd_peak_mb,
+                        'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
+                    }
+                    print(f"      pg_gembed_unified : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                    clear_model_cache()
+                finally:
+                    conn_pg.close()
 
-                elapsed, _, stats = ResourceMonitor.measure(
-                    py_pid, None,
-                    lambda lo=price_lo, hi=price_hi: serve_qdrant_native(
-                        conn_pg, qd_client, embed_client, query_image_paths,
-                        TARGET_CATEGORY, lo, hi, top_k),
-                    container_name=QDRANT_CONTAINER_NAME)
-                conn_pg.commit()
-                entry[f'qdrant_native_f{frac}'] = {
-                    'time_s': elapsed,
-                    'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
-                    'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
-                    'py_mem_peak': stats.py_peak_mb,
-                    'pg_cpu': stats.pg_cpu, 'pg_mem_delta': stats.pg_delta_mb,
-                    'pg_mem_peak': stats.pg_peak_mb,
-                    'qd_cpu': stats.qd_cpu, 'qd_mem_delta': stats.qd_delta_mb,
-                    'qd_mem_peak': stats.qd_peak_mb,
-                    'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
-                }
-                print(f"      qdrant_native     : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                # Qdrant Native
+                conn_pg, pg_pid = connect_and_get_pid()
+                warmup_pg_connection(conn_pg)
+                qd_client = create_qdrant_client()
+                try:
+                    elapsed, _, stats = ResourceMonitor.measure(
+                        py_pid, None,
+                        lambda lo=price_lo, hi=price_hi: serve_qdrant_native(
+                            conn_pg, qd_client, embed_client, query_image_paths,
+                            TARGET_CATEGORY, lo, hi, top_k),
+                        container_name=QDRANT_CONTAINER_NAME)
+                    conn_pg.commit()
+                    entry[f'qdrant_native_f{frac}'] = {
+                        'time_s': elapsed,
+                        'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
+                        'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
+                        'py_mem_peak': stats.py_peak_mb,
+                        'pg_cpu': stats.pg_cpu, 'pg_mem_delta': stats.pg_delta_mb,
+                        'pg_mem_peak': stats.pg_peak_mb,
+                        'qd_cpu': stats.qd_cpu, 'qd_mem_delta': stats.qd_delta_mb,
+                        'qd_mem_peak': stats.qd_peak_mb,
+                        'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
+                    }
+                    print(f"      qdrant_native     : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                    clear_model_cache()
+                finally:
+                    conn_pg.close()
+                    qd_client.close()
 
-                elapsed, _, stats = ResourceMonitor.measure(
-                    py_pid, None,
-                    lambda lo=price_lo, hi=price_hi: serve_chroma_native(
-                        conn_pg, ch_col, embed_client, query_image_paths,
-                        TARGET_CATEGORY, lo, hi, top_k))
-                conn_pg.commit()
-                entry[f'chroma_native_f{frac}'] = {
-                    'time_s': elapsed,
-                    'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
-                    'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
-                    'py_mem_peak': stats.py_peak_mb,
-                    'pg_cpu': stats.pg_cpu, 'pg_mem_delta': stats.pg_delta_mb,
-                    'pg_mem_peak': stats.pg_peak_mb,
-                    'qd_cpu': stats.qd_cpu, 'qd_mem_delta': stats.qd_delta_mb,
-                    'qd_mem_peak': stats.qd_peak_mb,
-                    'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
-                }
-                print(f"      chroma_native     : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                # Chroma Native
+                conn_pg, pg_pid = connect_and_get_pid()
+                warmup_pg_connection(conn_pg)
+                ch_client, ch_path = create_chroma_client()
+                try:
+                    ch_col = ch_client.get_collection("s4_customers")
+                    elapsed, _, stats = ResourceMonitor.measure(
+                        py_pid, None,
+                        lambda lo=price_lo, hi=price_hi: serve_chroma_native(
+                            conn_pg, ch_col, embed_client, query_image_paths,
+                            TARGET_CATEGORY, lo, hi, top_k))
+                    conn_pg.commit()
+                    entry[f'chroma_native_f{frac}'] = {
+                        'time_s': elapsed,
+                        'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
+                        'py_cpu': stats.py_cpu, 'py_mem_delta': stats.py_delta_mb,
+                        'py_mem_peak': stats.py_peak_mb,
+                        'pg_cpu': stats.pg_cpu, 'pg_mem_delta': stats.pg_delta_mb,
+                        'pg_mem_peak': stats.pg_peak_mb,
+                        'qd_cpu': stats.qd_cpu, 'qd_mem_delta': stats.qd_delta_mb,
+                        'qd_mem_peak': stats.qd_peak_mb,
+                        'sys_cpu': stats.sys_cpu, 'sys_mem': stats.sys_mem_mb,
+                    }
+                    print(f"      chroma_native     : {elapsed:.3f}s  ({n_eff_queries / elapsed:.1f} q/s)")
+                    clear_model_cache()
+                finally:
+                    conn_pg.close()
+                    cleanup_chroma(ch_client, ch_path)
 
             all_results.append(entry)
 
     finally:
-        conn_pg.close()
-        if qd_client.collection_exists("s4_customers"):
-            qd_client.delete_collection("s4_customers")
-        qd_client.close()
-        cleanup_chroma(ch_client, ch_path)
+        pass
 
     # ── Save results ──────────────────────────────────────────────────────────
     output_dir = OUTPUT_DIR / "scenario4_serving"

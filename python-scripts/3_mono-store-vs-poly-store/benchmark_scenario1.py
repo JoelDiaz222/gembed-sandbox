@@ -439,30 +439,13 @@ def main():
         print(f"\nSize: {size}", flush=True)
         products = test_products[size]
 
+        # Mono-Store
         conn_mono, pg_pid_mono = connect_and_get_pid()
         warmup_pg_connection(conn_mono)
         setup_pg_database(conn_mono)
+        truncate_pg_tables(conn_mono)
         conn_mono.commit()
-
-        conn_chroma, pg_pid_chroma = connect_and_get_pid()
-        warmup_pg_connection(conn_chroma)
-        setup_pg_database(conn_chroma)
-        conn_chroma.commit()
-
-        conn_qdrant, pg_pid_qdrant = connect_and_get_pid()
-        warmup_pg_connection(conn_qdrant)
-        setup_pg_database(conn_qdrant)
-        conn_qdrant.commit()
-
-        conn_direct, pg_pid_direct = connect_and_get_pid()
-        register_vector(conn_direct)
-        warmup_pg_connection(conn_direct)
-        setup_pg_database(conn_direct)
-        conn_direct.commit()
-
         try:
-            # Mono-Store
-            truncate_pg_tables(conn_mono)
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_mono,
                 lambda: scenario1_mono_store(conn_mono, products))
@@ -470,9 +453,17 @@ def main():
             results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
+        finally:
+            conn_mono.close()
 
-            # Mono-Store Direct (Internal storage, External generation)
-            truncate_pg_tables(conn_direct)
+        # Mono-Store Direct (Internal storage, External generation)
+        conn_direct, pg_pid_direct = connect_and_get_pid()
+        register_vector(conn_direct)
+        warmup_pg_connection(conn_direct)
+        setup_pg_database(conn_direct)
+        truncate_pg_tables(conn_direct)
+        conn_direct.commit()
+        try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_direct,
                 lambda: scenario1_mono_direct(conn_direct, products, embed_client))
@@ -480,11 +471,18 @@ def main():
             results_by_size[size]['mono_direct_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  mono_direct_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
+        finally:
+            conn_direct.close()
 
-            # Poly-Store Chroma
+        # Poly-Store Chroma
+        conn_chroma, pg_pid_chroma = connect_and_get_pid()
+        warmup_pg_connection(conn_chroma)
+        setup_pg_database(conn_chroma)
+        truncate_pg_tables(conn_chroma)
+        conn_chroma.commit()
+        try:
             client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
             try:
-                truncate_pg_tables(conn_chroma)
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid_chroma,
                     lambda: scenario1_poly_store_chroma(conn_chroma, products, embed_client, col_c))
@@ -494,11 +492,18 @@ def main():
                 clear_model_cache()
             finally:
                 cleanup_chroma(client_c, path_c)
+        finally:
+            conn_chroma.close()
 
-            # Poly-Store Qdrant
+        # Poly-Store Qdrant
+        conn_qdrant, pg_pid_qdrant = connect_and_get_pid()
+        warmup_pg_connection(conn_qdrant)
+        setup_pg_database(conn_qdrant)
+        truncate_pg_tables(conn_qdrant)
+        conn_qdrant.commit()
+        try:
             qd = create_qdrant_client()
             try:
-                truncate_pg_tables(conn_qdrant)
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid_qdrant,
                     lambda: scenario1_poly_store_qdrant(conn_qdrant, products, embed_client, qd))
@@ -509,10 +514,7 @@ def main():
             finally:
                 cleanup_qdrant(qd)
         finally:
-            conn_mono.close()
-            conn_chroma.close()
             conn_qdrant.close()
-            conn_direct.close()
 
     # Collect metrics
     all_results = []

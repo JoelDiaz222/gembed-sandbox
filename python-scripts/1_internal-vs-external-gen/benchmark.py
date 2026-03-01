@@ -326,29 +326,17 @@ def main():
             texts = test_data[size]
             print(f"\nSize: {size}", flush=True)
 
-            # Setup connections for all methods (with warmup)
-            connections = {}
-            pids = {}
-            try:
-                for method_name, benchmark_fn in methods.items():
-                    is_ext = method_name in EXTERNAL_METHODS
-                    conn, py_pid, pg_pid = setup_method_connection(texts, benchmark_fn, is_external=is_ext)
-                    connections[method_name] = conn
-                    pids[method_name] = (py_pid, pg_pid)
-
-                # Execute each method once for this size
-                for method_name, benchmark_fn in methods.items():
-                    conn = connections[method_name]
-                    py_pid, pg_pid = pids[method_name]
+            # Loop through each method individually
+            for method_name, benchmark_fn in methods.items():
+                is_ext = method_name in EXTERNAL_METHODS
+                conn, py_pid, pg_pid = setup_method_connection(texts, benchmark_fn, is_external=is_ext)
+                try:
                     result = run_single_iteration(conn, py_pid, pg_pid, texts, benchmark_fn)
                     results_by_size[size][method_name] = result
                     print(f"  {method_name}: {result.time_s:.2f}s", flush=True)
                     # Clear model cache after each method to ensure no cross-contamination
                     clear_model_cache()
-
-            finally:
-                # Close all connections
-                for conn in connections.values():
+                finally:
                     conn.close()
 
         # Compute metrics for each size

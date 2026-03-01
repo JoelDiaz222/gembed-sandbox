@@ -288,94 +288,87 @@ def main():
         texts = test_data[size]
         print(f"\nSize: {size}", flush=True)
 
-        # Setup and warmup all PG connections for this size
-        pg_connections = {}
-        pg_pids = {}
-        try:
-            for method_name, (provider, strategy) in method_configs.items():
-                conn, pg_pid = connect_and_get_pid()
-                warmup_pg_connection(conn, provider)
-                fn = setup_pg_indexed if strategy == "indexed" else setup_pg_deferred
-                fn(conn, warmup_texts, provider)
-                pg_connections[method_name] = (conn, fn, provider)
-                pg_pids[method_name] = pg_pid
-
-            # Run PG methods
-            for method_name, (conn, fn, provider) in pg_connections.items():
-                pg_pid = pg_pids[method_name]
+        # Run PG local methods individually to clear GPU memory between runs
+        for method_name, (provider, strategy) in method_configs.items():
+            conn, pg_pid = connect_and_get_pid()
+            warmup_pg_connection(conn, provider)
+            fn = setup_pg_indexed if strategy == "indexed" else setup_pg_deferred
+            # Warmup setup (not measured)
+            fn(conn, warmup_texts, provider)
+            try:
                 elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, texts, provider))
                 results_by_size[size][method_name] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  {method_name}: {elapsed:.2f}s", flush=True)
-
-            # Run External PG methods (ext_direct) — register_vector on these connections
-            # Indexed
-            conn_ext, pg_pid_ext = connect_and_get_pid()
-            register_vector(conn_ext)
-            try:
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
-                                                            lambda: setup_pg_ext_indexed(conn_ext, texts,
-                                                                                         embed_client.embed))
-                results_by_size[size]['ext_direct_indexed'] = BenchmarkResult(time_s=elapsed, stats=stats)
-                print(f"  ext_direct_indexed: {elapsed:.2f}s", flush=True)
                 clear_model_cache()
             finally:
-                conn_ext.close()
-
-            # Deferred
-            conn_ext, pg_pid_ext = connect_and_get_pid()
-            register_vector(conn_ext)
-            try:
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
-                                                            lambda: setup_pg_ext_deferred(conn_ext, texts,
-                                                                                          embed_client.embed))
-                results_by_size[size]['ext_direct_deferred'] = BenchmarkResult(time_s=elapsed, stats=stats)
-                print(f"  ext_direct_deferred: {elapsed:.2f}s", flush=True)
-                clear_model_cache()
-            finally:
-                conn_ext.close()
-
-            # Run Qdrant indexed
-            client = QdrantClient(url=QDRANT_URL)
-            try:
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                            lambda: setup_qdrant(client, texts, embed_client.embed,
-                                                                                 False),
-                                                            container_name=QDRANT_CONTAINER_NAME)
-                results_by_size[size]['qd_indexed'] = BenchmarkResult(time_s=elapsed, stats=stats)
-                print(f"  qd_indexed: {elapsed:.2f}s", flush=True)
-                clear_model_cache()
-            finally:
-                cleanup_qdrant(client)
-
-            # Run Qdrant deferred
-            client = QdrantClient(url=QDRANT_URL)
-            try:
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                            lambda: setup_qdrant(client, texts, embed_client.embed,
-                                                                                 True),
-                                                            container_name=QDRANT_CONTAINER_NAME)
-                results_by_size[size]['qd_deferred'] = BenchmarkResult(time_s=elapsed, stats=stats)
-                print(f"  qd_deferred: {elapsed:.2f}s", flush=True)
-                clear_model_cache()
-            finally:
-                cleanup_qdrant(client)
-
-            # Run Chroma
-            client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
-            try:
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                            lambda: benchmark_chroma(collection, texts,
-                                                                                     embed_client.embed))
-                results_by_size[size]['chroma'] = BenchmarkResult(time_s=elapsed, stats=stats)
-                print(f"  chroma: {elapsed:.2f}s", flush=True)
-                clear_model_cache()
-            finally:
-                cleanup_chroma(client, db_path)
-
-        finally:
-            # Close all PG connections for this size
-            for conn, _, _ in pg_connections.values():
                 conn.close()
+
+        # Run External PG methods (ext_direct) — register_vector on these connections
+        # Indexed
+        conn_ext, pg_pid_ext = connect_and_get_pid()
+        register_vector(conn_ext)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
+                                                        lambda: setup_pg_ext_indexed(conn_ext, texts,
+                                                                                     embed_client.embed))
+            results_by_size[size]['ext_direct_indexed'] = BenchmarkResult(time_s=elapsed, stats=stats)
+            print(f"  ext_direct_indexed: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_ext.close()
+
+        # Deferred
+        conn_ext, pg_pid_ext = connect_and_get_pid()
+        register_vector(conn_ext)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
+                                                        lambda: setup_pg_ext_deferred(conn_ext, texts,
+                                                                                      embed_client.embed))
+            results_by_size[size]['ext_direct_deferred'] = BenchmarkResult(time_s=elapsed, stats=stats)
+            print(f"  ext_direct_deferred: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_ext.close()
+
+        # Run Qdrant indexed
+        client = QdrantClient(url=QDRANT_URL)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                        lambda: setup_qdrant(client, texts, embed_client.embed,
+                                                                             False),
+                                                        container_name=QDRANT_CONTAINER_NAME)
+            results_by_size[size]['qd_indexed'] = BenchmarkResult(time_s=elapsed, stats=stats)
+            print(f"  qd_indexed: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            cleanup_qdrant(client)
+
+        # Run Qdrant deferred
+        client = QdrantClient(url=QDRANT_URL)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                        lambda: setup_qdrant(client, texts, embed_client.embed,
+                                                                             True),
+                                                        container_name=QDRANT_CONTAINER_NAME)
+            results_by_size[size]['qd_deferred'] = BenchmarkResult(time_s=elapsed, stats=stats)
+            print(f"  qd_deferred: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            cleanup_qdrant(client)
+
+        # Run Chroma
+        client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                        lambda: benchmark_chroma(collection, texts,
+                                                                                 embed_client.embed))
+            results_by_size[size]['chroma'] = BenchmarkResult(time_s=elapsed, stats=stats)
+            print(f"  chroma: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            cleanup_chroma(client, db_path)
+
+        pass
 
     # Collect metrics for each size
     methods = ['pg_local_indexed', 'pg_local_deferred', 'ext_direct_indexed', 'ext_direct_deferred', 'qd_indexed',

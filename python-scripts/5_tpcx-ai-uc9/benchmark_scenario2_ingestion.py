@@ -320,11 +320,9 @@ def main():
 
         # PG Unified (mono-store: blobs + embeddings in PG, In-DB embedding)
         conn, pg_pid = connect_and_get_pid()
-        register_vector(conn)
         warmup_pg_connection(conn)
         setup_pg_schema(conn)
         conn.commit()
-        clear_model_cache()
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
@@ -332,8 +330,17 @@ def main():
             results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
             conn.commit()
             print(f"  pg_unified: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn.close()
 
-            # PG Direct
+        # PG Direct
+        conn, pg_pid = connect_and_get_pid()
+        register_vector(conn)
+        warmup_pg_connection(conn)
+        setup_pg_schema(conn)
+        conn.commit()
+        try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
                 lambda: s2_ingest_pg_direct(conn, paths, embed_client))
