@@ -11,6 +11,7 @@ import chromadb
 import embed_anything
 import numpy as np
 from embed_anything import EmbeddingModel
+from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
@@ -229,7 +230,7 @@ def populate_pg(conn, products: list, customers: list, purchases: list,
     cur = conn.cursor()
     execute_values(cur,
                    "INSERT INTO s4_customers (customer_id, name, tier, embedding) VALUES %s",
-                   [(c['customer_id'], c['name'], c['tier'], emb)
+                   [(c['customer_id'], c['name'], c['tier'], np.array(emb))
                     for c, emb in zip(customers, customer_embeddings)])
     execute_values(cur,
                    "INSERT INTO s4_products (product_id, name, category, price, stock_count) VALUES %s",
@@ -312,7 +313,7 @@ def serve_pg_gembed_unified(conn, query_image_paths: List[str],
                          LATERAL (
                              SELECT c.customer_id
                              FROM s4_customers c
-                             ORDER BY c.embedding < - > q.embedding
+                             ORDER BY c.embedding <-> q.embedding
                                  LIMIT %s ) matched_c
             JOIN s4_purchases pu
                     ON pu.customer_id = matched_c.customer_id
@@ -399,7 +400,7 @@ def main():
     parser.add_argument('--sizes', type=int, nargs='+', required=True,
                         help='Query batch sizes to test')
     parser.add_argument('--db-size', type=int, required=True,
-                        help='Customer-DB size to benchmark (number of customers)')
+                        help='Number of images in the DB (n_customers = db_size // INGEST_PER_PERSON)')
     parser.add_argument('--fracs', type=float, nargs='+',
                         default=[0.05, 0.10, 0.20, 0.40, 0.60, 0.80],
                         help='Filter fractions α to test')
@@ -410,6 +411,7 @@ def main():
 
     test_sizes = args.sizes
     db_size = args.db_size
+    n_customers = max(1, db_size // INGEST_PER_PERSON)
     fracs = sorted(args.fracs)
     top_k = args.topk
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -420,7 +422,7 @@ def main():
     print(f"\nBenchmark 5 UC9 – Scenario 4: Customer ID + Hybrid Product Filter")
     print(f"Run ID         : {run_id}")
     print(f"Batch sizes    : {test_sizes}")
-    print(f"DB size        : {db_size} customers")
+    print(f"DB size        : {db_size} images → {n_customers} customers")
     print(f"Filter fracs α : {fracs}  TopK: {top_k}")
     print(f"Category filter: {TARGET_CATEGORY}")
     print(f"Ingest  : {INGEST_PER_PERSON} imgs/customer → mean embedding")
@@ -432,22 +434,22 @@ def main():
 
     all_results = []  # collected across all (db_size × frac) combinations
 
-    if db_size > len(customer_dirs):
+    if n_customers > len(customer_dirs):
         print(f"  [WARN] Only {len(customer_dirs)} customer dirs available; "
-              f"cycling to fill {db_size}.")
+              f"cycling to fill {n_customers}.")
 
     # ── Image paths ───────────────────────────────────────────────────────
-    ingest_paths_per_customer = get_ingest_paths(db_size)
+    ingest_paths_per_customer = get_ingest_paths(n_customers)
     all_ingest_paths = [p for paths in ingest_paths_per_customer for p in paths]
-    all_query_paths = get_query_paths(db_size)
+    all_query_paths = get_query_paths(n_customers)
 
     # ── Embed customer profiles (mean per customer) ───────────────────────
-    print(f"  Embedding {db_size} × {INGEST_PER_PERSON} = "
+    print(f"  Embedding {n_customers} × {INGEST_PER_PERSON} = "
           f"{len(all_ingest_paths)} customer images …", flush=True)
     all_ingest_vecs = embed_client.embed_files(all_ingest_paths)
 
     customer_embeddings: List[List[float]] = []
-    for i in range(db_size):
+    for i in range(n_customers):
         start = i * INGEST_PER_PERSON
         vecs = all_ingest_vecs[start:start + INGEST_PER_PERSON]
         mean_vec = np.mean(vecs, axis=0).tolist() if vecs else [0.0] * EMBEDDING_DIM
@@ -455,7 +457,7 @@ def main():
 
     # ── Generate relational data ──────────────────────────────────────────
     products, customers, purchases = generate_data(
-        db_size, customer_dirs[:db_size])
+        n_customers, customer_dirs[:n_customers])
 
     cat_products = [p for p in products if p['category'] == TARGET_CATEGORY]
     n_cat = len(cat_products)
@@ -472,6 +474,7 @@ def main():
 
     # ── PG setup ─────────────────────────────────────────────────────────
     conn_pg, pg_pid = connect_and_get_pid()
+    register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
     populate_pg(conn_pg, products, customers, purchases, customer_embeddings)

@@ -13,6 +13,8 @@ from typing import List
 
 import chromadb
 import embed_anything
+import numpy as np
+from pgvector.psycopg2 import register_vector
 from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME,
     BenchmarkResult, ResourceMonitor,
@@ -105,10 +107,6 @@ def setup_pg_schema(conn):
 def s2_populate_pg(conn, image_paths: List[str]):
     cur = conn.cursor()
     batch_names = [get_person_name(p) for p in image_paths]
-    batch_images = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            batch_images.append(f.read())
 
     with temp_image_dir(image_paths, prefix="temp_pg_ingest_s2_setup") as base_temp:
         unique_names = list(set(batch_names))
@@ -117,12 +115,12 @@ def s2_populate_pg(conn, image_paths: List[str]):
 
         sql = """
               INSERT INTO faces (path, person_id, image_data, embedding)
-              SELECT t.p, p.id, t.i, t.e
-              FROM unnest(%s::text[], %s::text[], %s::bytea[],
-                          embed_image_directory('embed_anything', %s, %s)) AS t(p, n, i, e)
+              SELECT t.p, p.id, pg_read_binary_file(t.p)::bytea, t.e
+              FROM unnest(%s::text[], %s::text[],
+                          embed_image_directory('embed_anything', %s, %s)) AS t(p, n, e)
                        JOIN persons p ON t.n = p.name
               """
-        cur.execute(sql, (image_paths, batch_names, batch_images, MODEL_NAME, str(base_temp.absolute())))
+        cur.execute(sql, (image_paths, batch_names, MODEL_NAME, str(base_temp.absolute())))
         conn.commit()
     cur.close()
 
@@ -136,13 +134,11 @@ def s2_ingest_pg_unified(conn, image_paths: List[str]):
 
 
 def s2_ingest_dist_common(conn, image_paths: List[str]) -> List[int]:
-    """Insert path + blob into PG (no embedding), return face IDs."""
+    """Insert path + blob into PG (no embedding), return face IDs.
+    Blob data is read server-side via pg_read_binary_file.
+    """
     cur = conn.cursor()
     batch_names = [get_person_name(p) for p in image_paths]
-    batch_images = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            batch_images.append(f.read())
     unique_names = list(set(batch_names))
     execute_values(cur, "INSERT INTO persons (name) VALUES %s ON CONFLICT (name) DO NOTHING",
                    [(n,) for n in unique_names])
@@ -151,8 +147,10 @@ def s2_ingest_dist_common(conn, image_paths: List[str]) -> List[int]:
     person_ids = [name_to_id[n] for n in batch_names]
     results = execute_values(
         cur,
-        "INSERT INTO faces (path, person_id, image_data) VALUES %s RETURNING id",
-        list(zip(image_paths, person_ids, batch_images)),
+        """INSERT INTO faces (path, person_id, image_data)
+           SELECT p, pid, pg_read_binary_file(p)::bytea
+           FROM (VALUES %s) AS t(p, pid) RETURNING id""",
+        list(zip(image_paths, person_ids)),
         fetch=True)
     all_ids = [r[0] for r in results]
     conn.commit()
@@ -239,7 +237,7 @@ def serve_s2_pg_direct(conn, embed_client, query_paths: List[str]):
     embeddings = embed_client.embed_files(query_paths)
     cur = conn.cursor()
     for emb in embeddings:
-        cur.execute("SELECT image_data FROM faces ORDER BY embedding <-> %s LIMIT %s", (emb, TOP_K))
+        cur.execute("SELECT image_data FROM faces ORDER BY embedding <-> %s LIMIT %s", (np.array(emb), TOP_K))
         _ = cur.fetchall()
     conn.commit()
     cur.close()
@@ -308,7 +306,6 @@ def main():
     print(f"DB Size: {db_size}")
     print(f"Query Sizes: {test_sizes}")
     print("Loading model...", flush=True)
-    EmbedAnythingImageClient._get_model()
     embed_client = EmbedAnythingImageClient()
     py_pid = os.getpid()
 
@@ -328,9 +325,10 @@ def main():
 
     print("Setting up PG unified DB...")
     conn_pg, pg_pid = connect_and_get_pid()
+    register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
-    model_cache.clear()
+    clear_model_cache()
     s2_ingest_pg_unified(conn_pg, ingest_paths)
 
     print("Setting up Qdrant poly-store DB...")

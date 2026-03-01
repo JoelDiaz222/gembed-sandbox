@@ -13,6 +13,8 @@ from typing import List
 
 import chromadb
 import embed_anything
+import numpy as np
+from pgvector.psycopg2 import register_vector
 from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME,
     BenchmarkResult, ResourceMonitor,
@@ -210,7 +212,7 @@ def serve_s1_pg_direct(conn, embed_client, query_paths: List[str]):
     embeddings = embed_client.embed_files(query_paths)
     cur = conn.cursor()
     for emb in embeddings:
-        cur.execute("SELECT path FROM faces ORDER BY embedding <-> %s LIMIT %s", (emb, TOP_K))
+        cur.execute("SELECT path FROM faces ORDER BY embedding <-> %s LIMIT %s", (np.array(emb), TOP_K))
         _ = cur.fetchall()
     conn.commit()
     cur.close()
@@ -271,6 +273,7 @@ def main():
 
     print("Setting up DBs...")
     conn_pg, pg_pid = connect_and_get_pid()
+    register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
     clear_model_cache()

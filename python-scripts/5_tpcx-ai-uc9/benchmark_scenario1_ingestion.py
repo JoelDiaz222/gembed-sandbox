@@ -225,7 +225,6 @@ def main():
     print(f"Run ID: {run_id}")
     print(f"Sizes: {test_sizes}")
     print("Loading model...", flush=True)
-    EmbedAnythingImageClient._get_model()
     embed_client = EmbedAnythingImageClient()
     py_pid = os.getpid()
 

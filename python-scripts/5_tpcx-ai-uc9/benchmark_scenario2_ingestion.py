@@ -123,10 +123,6 @@ def truncate_pg_table(conn):
 def s2_populate_pg(conn, image_paths: List[str]):
     cur = conn.cursor()
     batch_names = [get_person_name(p) for p in image_paths]
-    batch_images = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            batch_images.append(f.read())
 
     with temp_image_dir(image_paths, prefix="temp_pg_ingest_s2") as base_temp:
         unique_names = list(set(batch_names))
@@ -135,12 +131,12 @@ def s2_populate_pg(conn, image_paths: List[str]):
 
         sql = """
               INSERT INTO faces (path, person_id, image_data, embedding)
-              SELECT t.p, p.id, t.i, t.e
-              FROM unnest(%s::text[], %s::text[], %s::bytea[],
-                          embed_image_directory('embed_anything', %s, %s)) AS t(p, n, i, e)
+              SELECT t.p, p.id, pg_read_binary_file(t.p)::bytea, t.e
+              FROM unnest(%s::text[], %s::text[],
+                          embed_image_directory('embed_anything', %s, %s)) AS t(p, n, e)
                        JOIN persons p ON t.n = p.name
               """
-        cur.execute(sql, (image_paths, batch_names, batch_images, MODEL_NAME, str(base_temp.absolute())))
+        cur.execute(sql, (image_paths, batch_names, MODEL_NAME, str(base_temp.absolute())))
         conn.commit()
     cur.close()
 
@@ -154,18 +150,16 @@ def s2_ingest_pg_unified(conn, image_paths: List[str]):
 
 
 def s2_ingest_pg_direct(conn, image_paths: List[str], embed_client: EmbedAnythingImageClient):
-    """Embed in Python, then insert path + blob + embedding into PG."""
+    """Embed in Python, then insert path + blob + embedding into PG.
+    Blob data is read server-side via pg_read_binary_file to avoid sending
+    image bytes over the client connection.
+    """
     setup_pg_schema(conn)
     cur = conn.cursor()
     cur.execute("CREATE INDEX ON faces USING hnsw (embedding vector_cosine_ops)"
                 " WITH (m=16, ef_construction=100);")
 
     batch_names = [get_person_name(p) for p in image_paths]
-    batch_images = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            batch_images.append(f.read())
-
     embeddings = embed_client.embed_files(image_paths)
 
     unique_names = list(set(batch_names))
@@ -176,21 +170,21 @@ def s2_ingest_pg_direct(conn, image_paths: List[str], embed_client: EmbedAnythin
     person_ids = [name_to_id[n] for n in batch_names]
 
     execute_values(cur,
-                   "INSERT INTO faces (path, person_id, image_data, embedding) VALUES %s",
-                   list(zip(image_paths, person_ids, batch_images, [np.array(e) for e in embeddings]))
+                   """INSERT INTO faces (path, person_id, image_data, embedding)
+                      SELECT p, pid, pg_read_binary_file(p)::bytea, emb::vector
+                      FROM (VALUES %s) AS t(p, pid, emb)""",
+                   list(zip(image_paths, person_ids, [np.array(e) for e in embeddings]))
                    )
     conn.commit()
     cur.close()
 
 
 def s2_ingest_dist_common(conn, image_paths: List[str]) -> List[int]:
-    """Insert path + blob into PG (no embedding), return face IDs."""
+    """Insert path + blob into PG (no embedding), return face IDs.
+    Blob data is read server-side via pg_read_binary_file.
+    """
     cur = conn.cursor()
     batch_names = [get_person_name(p) for p in image_paths]
-    batch_images = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            batch_images.append(f.read())
     unique_names = list(set(batch_names))
     execute_values(cur, "INSERT INTO persons (name) VALUES %s ON CONFLICT (name) DO NOTHING",
                    [(n,) for n in unique_names])
@@ -199,8 +193,10 @@ def s2_ingest_dist_common(conn, image_paths: List[str]) -> List[int]:
     person_ids = [name_to_id[n] for n in batch_names]
     results = execute_values(
         cur,
-        "INSERT INTO faces (path, person_id, image_data) VALUES %s RETURNING id",
-        list(zip(image_paths, person_ids, batch_images)),
+        """INSERT INTO faces (path, person_id, image_data)
+           SELECT p, pid, pg_read_binary_file(p)::bytea
+           FROM (VALUES %s) AS t(p, pid) RETURNING id""",
+        list(zip(image_paths, person_ids)),
         fetch=True)
     all_ids = [r[0] for r in results]
     conn.commit()
@@ -273,7 +269,6 @@ def main():
     print(f"Run ID: {run_id}")
     print(f"Sizes: {test_sizes}")
     print("Loading model...", flush=True)
-    EmbedAnythingImageClient._get_model()
     embed_client = EmbedAnythingImageClient()
     py_pid = os.getpid()
 

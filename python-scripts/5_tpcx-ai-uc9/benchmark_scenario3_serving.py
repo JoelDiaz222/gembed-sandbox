@@ -11,6 +11,7 @@ import chromadb
 import embed_anything
 import numpy as np
 from embed_anything import EmbeddingModel
+from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
@@ -241,7 +242,7 @@ def populate_pg(conn,
     # customers with face/appearance embeddings
     execute_values(cur,
                    "INSERT INTO s3_customers (customer_id, name, tier, embedding) VALUES %s",
-                   [(c['customer_id'], c['name'], c['tier'], emb)
+                   [(c['customer_id'], c['name'], c['tier'], np.array(emb))
                     for c, emb in zip(customers, customer_embeddings)])
 
     # products (catalog only, no embeddings)
@@ -336,7 +337,7 @@ def serve_pg_gembed_unified(conn, query_image_paths: List[str], top_k: int):
                          LATERAL (
                              SELECT c.customer_id
                              FROM s3_customers c
-                             ORDER BY c.embedding < - > q.embedding
+                             ORDER BY c.embedding <-> q.embedding
                                  LIMIT %s ) matched_c
             JOIN s3_purchases pu
                     ON pu.customer_id = matched_c.customer_id
@@ -363,7 +364,7 @@ def serve_pg_direct(conn, embed_client: EmbedAnythingImageClient,
                    JOIN LATERAL (
               SELECT customer_id
               FROM s3_customers
-              ORDER BY embedding < - > i.embedding
+              ORDER BY embedding <-> i.embedding
                   LIMIT %s ) cu
           ON true
               JOIN s3_purchases pu ON pu.customer_id = cu.customer_id
@@ -375,7 +376,7 @@ def serve_pg_direct(conn, embed_client: EmbedAnythingImageClient,
               ); \
           """
     for emb in embeddings:
-        cur.execute(sql, ([emb], top_k))
+        cur.execute(sql, ([np.array(emb)], top_k))
         _ = cur.fetchall()
     conn.commit()
     cur.close()
@@ -460,7 +461,7 @@ def main():
     parser.add_argument('--sizes', type=int, nargs='+', required=True,
                         help='Query batch sizes to test')
     parser.add_argument('--db-size', type=int, required=True,
-                        help='Customer-DB size to benchmark (number of customers)')
+                        help='Number of images in the DB (n_customers = db_size // INGEST_PER_PERSON)')
     parser.add_argument('--topk', type=int, default=TOP_K,
                         help='Number of nearest-neighbour customers to match (default: 5)')
     parser.add_argument('--run-id', type=str, default=None)
@@ -468,6 +469,7 @@ def main():
 
     test_sizes = args.sizes
     db_size = args.db_size
+    n_customers = max(1, db_size // INGEST_PER_PERSON)
     top_k = args.topk
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     methods = ['pg_gembed_unified', 'pg_direct', 'two_step_qdrant', 'two_step_chroma']
@@ -475,7 +477,7 @@ def main():
     print(f"\nBenchmark 5 UC9 – Scenario 3: Customer ID + Purchase History JOIN (Serving)")
     print(f"Run ID  : {run_id}")
     print(f"Batch sizes : {test_sizes}")
-    print(f"DB Size : {db_size} customers  TopK: {top_k}")
+    print(f"DB Size : {db_size} images → {n_customers} customers  TopK: {top_k}")
     print(f"Ingest  : {INGEST_PER_PERSON} imgs/customer → mean embedding")
     print(f"Query   : {QUERY_PER_PERSON} imgs/customer reserved for serving")
 
@@ -483,21 +485,21 @@ def main():
     embed_client = EmbedAnythingImageClient()
     py_pid = os.getpid()
 
-    if db_size > len(customer_dirs):
+    if n_customers > len(customer_dirs):
         print(f"  [WARN] Only {len(customer_dirs)} customer dirs available; "
-              f"cycling to fill {db_size}.")
+              f"cycling to fill {n_customers}.")
 
     # ── Embed customer profiles (mean per customer) ───────────────────────
-    ingest_paths_per_customer = get_ingest_paths(db_size)
+    ingest_paths_per_customer = get_ingest_paths(n_customers)
     all_ingest_paths = [p for paths in ingest_paths_per_customer for p in paths]
-    all_query_paths = get_query_paths(db_size)
+    all_query_paths = get_query_paths(n_customers)
 
-    print(f"  Embedding {db_size} × {INGEST_PER_PERSON} = "
+    print(f"  Embedding {n_customers} × {INGEST_PER_PERSON} = "
           f"{len(all_ingest_paths)} customer images …", flush=True)
     all_ingest_vecs = embed_client.embed_files(all_ingest_paths)
 
     customer_embeddings: List[List[float]] = []
-    for i in range(db_size):
+    for i in range(n_customers):
         start = i * INGEST_PER_PERSON
         vecs = all_ingest_vecs[start:start + INGEST_PER_PERSON]
         mean_vec = np.mean(vecs, axis=0).tolist() if vecs else [0.0] * EMBEDDING_DIM
@@ -505,7 +507,7 @@ def main():
 
     # ── Generate relational data ──────────────────────────────────────────
     products, customers, purchases, reviews = generate_data(
-        db_size, customer_dirs[:db_size])
+        n_customers, customer_dirs[:n_customers])
 
     eligible = {r['product_id'] for r in reviews if r['rating'] >= 4} & \
                {pu['product_id'] for pu in purchases}
@@ -515,6 +517,7 @@ def main():
 
     # ── PG setup ─────────────────────────────────────────────────────────
     conn_pg, pg_pid = connect_and_get_pid()
+    register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
     populate_pg(conn_pg, products, customers, purchases, reviews, customer_embeddings)
