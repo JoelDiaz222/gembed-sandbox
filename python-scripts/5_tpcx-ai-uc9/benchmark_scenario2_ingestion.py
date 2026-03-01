@@ -13,7 +13,9 @@ from typing import List
 
 import chromadb
 import embed_anything
+import numpy as np
 from embed_anything import EmbeddingModel
+from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -175,7 +177,7 @@ def s2_ingest_pg_direct(conn, image_paths: List[str], embed_client: EmbedAnythin
 
     execute_values(cur,
                    "INSERT INTO faces (path, person_id, image_data, embedding) VALUES %s",
-                   list(zip(image_paths, person_ids, batch_images, embeddings))
+                   list(zip(image_paths, person_ids, batch_images, [np.array(e) for e in embeddings]))
                    )
     conn.commit()
     cur.close()
@@ -287,6 +289,7 @@ def main():
     warmup_paths = get_image_paths(1, 2)
     if warmup_paths:
         conn_w, _ = connect_and_get_pid()
+        register_vector(conn_w)
         warmup_pg_connection(conn_w)
         setup_pg_schema(conn_w)
         s2_ingest_pg_unified(conn_w, warmup_paths)
@@ -326,6 +329,7 @@ def main():
 
         # PG Unified (mono-store: blobs + embeddings in PG, In-DB embedding)
         conn, pg_pid = connect_and_get_pid()
+        register_vector(conn)
         warmup_pg_connection(conn)
         setup_pg_schema(conn)
         clear_model_cache()

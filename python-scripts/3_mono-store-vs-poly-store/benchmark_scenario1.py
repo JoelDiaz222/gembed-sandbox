@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Callable, List
 
 import chromadb
+import numpy as np
+from pgvector.psycopg2 import register_vector
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from utils.benchmark_utils import (
@@ -304,14 +306,18 @@ def scenario1_mono_direct(conn, products: List[dict], embed_client):
     stocks = [p['stock'] for p in products]
 
     cur.execute("""
-                WITH input_products AS (SELECT name, description, price, stock, embedding, ord
-                                        FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[], %s::vector[])
-                                                 WITH ORDINALITY AS i(name, description, price, stock, embedding, ord)),
+                WITH input_products AS (SELECT name, description, price, stock, ord
+                                        FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[])
+                                                 WITH ORDINALITY AS i(name, description, price, stock, ord)),
+                     input_embeddings AS (SELECT ord, embedding
+                                          FROM unnest(%s::vector[])
+                                                   WITH ORDINALITY AS e(embedding, ord)),
                      inserted_products AS (
                 INSERT
                 INTO products (name, description, price, stock_count, embedding)
-                SELECT name, description, price, stock, embedding
-                FROM input_products RETURNING product_id, name),
+                SELECT i.name, i.description, i.price, i.stock, e.embedding
+                FROM input_products i
+                         JOIN input_embeddings e ON i.ord = e.ord RETURNING product_id, name),
                      product_mapping AS (
                 SELECT p.product_id, i.ord
                 FROM inserted_products p
@@ -332,7 +338,7 @@ def scenario1_mono_direct(conn, products: List[dict], embed_client):
                     JOIN product_mapping m
                 ON c.p_idx = m.ord)
                 SELECT 1;
-                """, (names, descriptions, prices, stocks, [list(e) for e in embeddings],
+                """, (names, descriptions, prices, stocks, [np.array(e) for e in embeddings],
                       # Review data
                       [i + 1 for i, p in enumerate(products) for _ in p['reviews']],
                       [r['rating'] for p in products for r in p['reviews']],
@@ -428,6 +434,7 @@ def main():
 
     # Warmup for mono_direct
     conn_wd, _ = connect_and_get_pid()
+    register_vector(conn_wd)
     setup_pg_database(conn_wd)
     truncate_pg_tables(conn_wd)
     scenario1_mono_direct(conn_wd, warmup_products, embed_client)
@@ -451,6 +458,7 @@ def main():
         setup_pg_database(conn_qdrant)
 
         conn_direct, pg_pid_direct = connect_and_get_pid()
+        register_vector(conn_direct)
         warmup_pg_connection(conn_direct)
         setup_pg_database(conn_direct)
 

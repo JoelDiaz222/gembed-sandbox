@@ -6,9 +6,13 @@ from statistics import mean, median
 from typing import Callable, List
 
 import grpc
+import numpy as np
 import requests
 import tei_pb2 as pb2
 import tei_pb2_grpc as pb2_grpc
+from data.loader import get_review_texts
+from pgvector.psycopg2 import register_vector
+from psycopg2.extras import execute_values
 from utils.benchmark_utils import (
     EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
@@ -16,9 +20,7 @@ from utils.benchmark_utils import (
     safe_stdev, calc_iqr, compute_metrics,
     connect_and_get_pid, warmup_pg_connection, clear_model_cache,
 )
-from data.loader import get_review_texts
 from utils.plot_utils import save_single_run_csv
-from psycopg2.extras import execute_values
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -86,8 +88,10 @@ def setup_database(conn):
     """Initialize database schema."""
     cur = conn.cursor()
     cur.execute("""
-                CREATE EXTENSION IF NOT EXISTS vector;
-                CREATE EXTENSION IF NOT EXISTS pg_gembed;
+                CREATE
+                EXTENSION IF NOT EXISTS vector;
+                CREATE
+                EXTENSION IF NOT EXISTS pg_gembed;
                 DROP TABLE IF EXISTS embeddings_test;
                 CREATE TABLE embeddings_test
                 (
@@ -132,12 +136,10 @@ def benchmark_external_client_gen(conn, texts: List[str], embed_fn: Callable):
 
     embeddings = embed_fn(texts)
 
-    values = [(text, embedding) for text, embedding in zip(texts, embeddings)]
     execute_values(
         cur,
         "INSERT INTO embeddings_test (text, embedding) VALUES %s",
-        values,
-        template="(%s, %s::vector)",
+        list(zip(texts, [np.array(e) for e in embeddings])),
         page_size=len(texts)
     )
 
@@ -154,9 +156,11 @@ def run_benchmark_iteration(conn, py_pid: int, pg_pid: int, benchmark_fn: Callab
     return BenchmarkResult(time_s=elapsed, stats=stats)
 
 
-def setup_method_connection(texts: List[str], benchmark_fn: Callable):
+def setup_method_connection(texts: List[str], benchmark_fn: Callable, is_external: bool = False):
     """Create and warmup a connection for a method, returning connection and PIDs."""
     conn, pg_pid = connect_and_get_pid()
+    if is_external:
+        register_vector(conn)
     py_pid = os.getpid()
 
     # Warm up this specific connection
@@ -288,6 +292,10 @@ def main():
         test_data = {size: get_review_texts(size, shuffle=False) for size in test_sizes}
 
         # Define all methods to benchmark
+        # Internal methods (pg_local, pg_grpc) do NOT need register_vector.
+        # External methods (ext_*) DO need register_vector — handled in setup_method_connection.
+        EXTERNAL_METHODS = {'ext_direct', 'ext_grpc', 'ext_http'}
+
         def make_methods(direct_client, grpc_client, http_client):
             return {
                 'pg_local': lambda c, t: benchmark_internal_db_gen(
@@ -323,7 +331,8 @@ def main():
             pids = {}
             try:
                 for method_name, benchmark_fn in methods.items():
-                    conn, py_pid, pg_pid = setup_method_connection(texts, benchmark_fn)
+                    is_ext = method_name in EXTERNAL_METHODS
+                    conn, py_pid, pg_pid = setup_method_connection(texts, benchmark_fn, is_external=is_ext)
                     connections[method_name] = conn
                     pids[method_name] = (py_pid, pg_pid)
 

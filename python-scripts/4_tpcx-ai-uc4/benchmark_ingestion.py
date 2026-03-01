@@ -11,6 +11,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
+import numpy as np
+from pgvector.psycopg2 import register_vector
 
 import chromadb
 from utils.benchmark_utils import (
@@ -101,14 +103,14 @@ def setup_pg_direct_indexed(conn, embed_client, ingestion_data: List[Tuple]):
     cur = conn.cursor()
     cur.execute("CREATE INDEX ON reviews USING hnsw (embedding vector_cosine_ops)"
                 " WITH (m=16, ef_construction=100);")
-    
+
     texts = [b[0] for b in ingestion_data]
     spams = [b[1] for b in ingestion_data]
     embeddings = embed_client.embed(texts)
-    
-    execute_values(cur, 
+
+    execute_values(cur,
         "INSERT INTO reviews (text, spam, embedding) VALUES %s",
-        list(zip(texts, spams, embeddings))
+        list(zip(texts, spams, [np.array(e) for e in embeddings]))
     )
     conn.commit()
     cur.close()
@@ -211,6 +213,7 @@ def main():
 
             # PG Direct
             conn, pg_pid = connect_and_get_pid()
+            register_vector(conn)
             warmup_pg_connection(conn)
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,

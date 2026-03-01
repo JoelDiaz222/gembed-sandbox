@@ -8,6 +8,12 @@ from statistics import mean, median
 from typing import Callable, List
 
 import chromadb
+import numpy as np
+from data.loader import get_review_texts
+from pgvector.psycopg2 import register_vector
+from psycopg2.extras import execute_values
+from qdrant_client import QdrantClient, models
+from qdrant_client.models import Distance, VectorParams, PointStruct
 from utils.benchmark_utils import (
     QDRANT_URL, QDRANT_CONTAINER_NAME, EMBED_ANYTHING_MODEL,
     BenchmarkResult, ResourceMonitor,
@@ -15,10 +21,7 @@ from utils.benchmark_utils import (
     safe_stdev, calc_iqr, compute_metrics,
     connect_and_get_pid, warmup_pg_connection, cleanup_chroma, clear_model_cache,
 )
-from data.loader import get_review_texts
 from utils.plot_utils import save_single_run_csv
-from qdrant_client import QdrantClient, models
-from qdrant_client.models import Distance, VectorParams, PointStruct
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -31,8 +34,10 @@ def setup_pg_schema(conn):
     """Initialize PostgreSQL schema."""
     cur = conn.cursor()
     cur.execute("""
-                CREATE EXTENSION IF NOT EXISTS vector;
-                CREATE EXTENSION IF NOT EXISTS pg_gembed;
+                CREATE
+                EXTENSION IF NOT EXISTS vector;
+                CREATE
+                EXTENSION IF NOT EXISTS pg_gembed;
                 DROP TABLE IF EXISTS embeddings_test;
                 CREATE TABLE embeddings_test
                 (
@@ -87,9 +92,12 @@ def populate_pg_external(conn, texts: List[str], embed_fn: Callable):
     """Insert data using external (Python-side) generation."""
     embeddings = embed_fn(texts)
     cur = conn.cursor()
-    # Use batch insert for fairness
-    sql = "INSERT INTO embeddings_test (text, embedding) VALUES (%s, %s)"
-    cur.executemany(sql, list(zip(texts, embeddings)))
+    execute_values(
+        cur,
+        "INSERT INTO embeddings_test (text, embedding) VALUES %s",
+        list(zip(texts, [np.array(e) for e in embeddings])),
+        page_size=len(texts)
+    )
     conn.commit()
     cur.close()
 
@@ -207,16 +215,16 @@ def print_header():
 
 def print_result(label: str, results: List[BenchmarkResult]):
     times = [r.time_s for r in results]
-    py_deltas = [r.stats.py_delta_mb for r in results];
-    py_peaks = [r.stats.py_peak_mb for r in results];
+    py_deltas = [r.stats.py_delta_mb for r in results]
+    py_peaks = [r.stats.py_peak_mb for r in results]
     py_cpus = [r.stats.py_cpu for r in results]
-    pg_deltas = [r.stats.pg_delta_mb for r in results];
-    pg_peaks = [r.stats.pg_peak_mb for r in results];
+    pg_deltas = [r.stats.pg_delta_mb for r in results]
+    pg_peaks = [r.stats.pg_peak_mb for r in results]
     pg_cpus = [r.stats.pg_cpu for r in results]
-    qd_deltas = [r.stats.qd_delta_mb for r in results];
-    qd_peaks = [r.stats.qd_peak_mb for r in results];
+    qd_deltas = [r.stats.qd_delta_mb for r in results]
+    qd_peaks = [r.stats.qd_peak_mb for r in results]
     qd_cpus = [r.stats.qd_cpu for r in results]
-    sys_mems = [r.stats.sys_mem_mb for r in results];
+    sys_mems = [r.stats.sys_mem_mb for r in results]
     sys_cpus = [r.stats.sys_cpu for r in results]
 
     def fmt(vals, p=1): return f"{mean(vals):.{p}f}±{safe_stdev(vals):.{p}f}"
@@ -304,13 +312,14 @@ def main():
                 results_by_size[size][method_name] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  {method_name}: {elapsed:.2f}s", flush=True)
 
-            # Run External PG methods (ext_direct)
+            # Run External PG methods (ext_direct) — register_vector on these connections
             # Indexed
             conn_ext, pg_pid_ext = connect_and_get_pid()
+            register_vector(conn_ext)
             try:
                 elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
                                                             lambda: setup_pg_ext_indexed(conn_ext, texts,
-                                                                                       embed_client.embed))
+                                                                                         embed_client.embed))
                 results_by_size[size]['ext_direct_indexed'] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  ext_direct_indexed: {elapsed:.2f}s", flush=True)
                 clear_model_cache()
@@ -319,10 +328,11 @@ def main():
 
             # Deferred
             conn_ext, pg_pid_ext = connect_and_get_pid()
+            register_vector(conn_ext)
             try:
                 elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
                                                             lambda: setup_pg_ext_deferred(conn_ext, texts,
-                                                                                        embed_client.embed))
+                                                                                          embed_client.embed))
                 results_by_size[size]['ext_direct_deferred'] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  ext_direct_deferred: {elapsed:.2f}s", flush=True)
                 clear_model_cache()
@@ -373,7 +383,8 @@ def main():
                 conn.close()
 
     # Collect metrics for each size
-    methods = ['pg_local_indexed', 'pg_local_deferred', 'ext_direct_indexed', 'ext_direct_deferred', 'qd_indexed', 'qd_deferred', 'chroma']
+    methods = ['pg_local_indexed', 'pg_local_deferred', 'ext_direct_indexed', 'ext_direct_deferred', 'qd_indexed',
+               'qd_deferred', 'chroma']
     all_results = []
     for size in test_sizes:
         results = results_by_size[size]
@@ -393,7 +404,7 @@ def main():
             }
 
             # Add PG or Qdrant specific metrics
-            if 'pg_' in method_name:
+            if 'pg_' in method_name or 'ext_' in method_name:
                 stats_dict['pg_cpu'] = result.stats.pg_cpu
                 stats_dict['pg_mem_delta'] = result.stats.pg_delta_mb
                 stats_dict['pg_mem_peak'] = result.stats.pg_peak_mb

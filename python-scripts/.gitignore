@@ -11,4 +11,5 @@ __pycache__/
 output/
 
 # TPCx-AI
+data/CUSTOMER_IMAGES/
 data/Review.psv
