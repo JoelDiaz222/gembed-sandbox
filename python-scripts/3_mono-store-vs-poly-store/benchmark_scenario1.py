@@ -110,14 +110,12 @@ def setup_pg_database(conn):
                     PRIMARY KEY (product_id, category_name)
                 );
                 """)
-    conn.commit()
     cur.close()
 
 
 def truncate_pg_tables(conn):
     cur = conn.cursor()
     cur.execute("TRUNCATE products, reviews, product_categories CASCADE;")
-    conn.commit()
     cur.close()
 
 
@@ -285,7 +283,6 @@ def scenario1_mono_store(conn, products: List[dict]):
                       category_p_indices, category_names))
     cur.execute(
         "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
-    conn.commit()
     cur.close()
 
 
@@ -349,7 +346,6 @@ def scenario1_mono_direct(conn, products: List[dict], embed_client):
 
     cur.execute(
         "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
-    conn.commit()
     cur.close()
 
 
@@ -357,7 +353,6 @@ def scenario1_poly_store_chroma(conn, products: List[dict], embed_client, chroma
     """Insert data into PG, embed from app data, store in Chroma."""
     cur = conn.cursor()
     product_ids = batch_insert_products(cur, products)
-    conn.commit()
     documents = [build_embedding_context(p) for p in products]
     embeddings = embed_client.embed(documents)
     chroma_collection.add(ids=[str(pid) for pid in product_ids], embeddings=embeddings, documents=documents)
@@ -368,7 +363,6 @@ def scenario1_poly_store_qdrant(conn, products: List[dict], embed_client, qdrant
     """Insert data into PG, embed from app data, store in Qdrant."""
     cur = conn.cursor()
     product_ids = batch_insert_products(cur, products)
-    conn.commit()
     documents = [build_embedding_context(p) for p in products]
     embeddings = embed_client.embed(documents)
     points = [PointStruct(id=pid, vector=emb, payload={"text": doc})
@@ -448,19 +442,23 @@ def main():
         conn_mono, pg_pid_mono = connect_and_get_pid()
         warmup_pg_connection(conn_mono)
         setup_pg_database(conn_mono)
+        conn_mono.commit()
 
         conn_chroma, pg_pid_chroma = connect_and_get_pid()
         warmup_pg_connection(conn_chroma)
         setup_pg_database(conn_chroma)
+        conn_chroma.commit()
 
         conn_qdrant, pg_pid_qdrant = connect_and_get_pid()
         warmup_pg_connection(conn_qdrant)
         setup_pg_database(conn_qdrant)
+        conn_qdrant.commit()
 
         conn_direct, pg_pid_direct = connect_and_get_pid()
         register_vector(conn_direct)
         warmup_pg_connection(conn_direct)
         setup_pg_database(conn_direct)
+        conn_direct.commit()
 
         try:
             # Mono-Store
@@ -468,6 +466,7 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_mono,
                 lambda: scenario1_mono_store(conn_mono, products))
+            conn_mono.commit()
             results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
@@ -477,6 +476,7 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_direct,
                 lambda: scenario1_mono_direct(conn_direct, products, embed_client))
+            conn_direct.commit()
             results_by_size[size]['mono_direct_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  mono_direct_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
@@ -488,6 +488,7 @@ def main():
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid_chroma,
                     lambda: scenario1_poly_store_chroma(conn_chroma, products, embed_client, col_c))
+                conn_chroma.commit()
                 results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
                 clear_model_cache()
@@ -501,6 +502,7 @@ def main():
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid_qdrant,
                     lambda: scenario1_poly_store_qdrant(conn_qdrant, products, embed_client, qd))
+                conn_qdrant.commit()
                 results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
                 clear_model_cache()

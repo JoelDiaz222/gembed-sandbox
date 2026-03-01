@@ -100,7 +100,6 @@ def setup_database(conn):
                     embedding vector(384)
                 );
                 """)
-    conn.commit()
     cur.close()
 
 
@@ -108,7 +107,6 @@ def truncate_table(conn):
     """Clear test table."""
     cur = conn.cursor()
     cur.execute("TRUNCATE embeddings_test;")
-    conn.commit()
     cur.close()
 
 
@@ -126,7 +124,6 @@ def benchmark_internal_db_gen(conn, texts: List[str], provider: str, model: str)
           """
     cur.execute(sql, (texts, provider, model))
 
-    conn.commit()
     cur.close()
 
 
@@ -143,7 +140,6 @@ def benchmark_external_client_gen(conn, texts: List[str], embed_fn: Callable):
         page_size=len(texts)
     )
 
-    conn.commit()
     cur.close()
 
 
@@ -172,6 +168,7 @@ def setup_method_connection(texts: List[str], benchmark_fn: Callable, is_externa
     benchmark_fn(conn, warmup_texts)
     clear_model_cache()
 
+    conn.commit()
     return conn, py_pid, pg_pid
 
 
@@ -179,8 +176,10 @@ def run_single_iteration(conn, py_pid, pg_pid, texts: List[str],
                          benchmark_fn: Callable) -> BenchmarkResult:
     """Run a single benchmark iteration on an existing connection."""
     truncate_table(conn)
-    return run_benchmark_iteration(conn, py_pid, pg_pid,
+    res = run_benchmark_iteration(conn, py_pid, pg_pid,
                                    lambda c: benchmark_fn(c, texts))
+    conn.commit()
+    return res
 
 
 # =============================================================================
@@ -280,6 +279,7 @@ def main():
     # Initialize setup connection (just for schema setup)
     conn, _ = connect_and_get_pid()
     setup_database(conn)
+    conn.commit()
     conn.close()
 
     # Initialize external clients (these are reused across connections)

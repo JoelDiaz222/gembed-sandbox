@@ -105,7 +105,6 @@ def setup_pg_schema(conn):
                     embedding vector(512)
                 );
                 """)
-    conn.commit()
     cur.close()
 
 
@@ -125,7 +124,6 @@ def s1_populate_pg(conn, image_paths: List[str]):
                        JOIN persons p ON t.n = p.name
               """
         cur.execute(sql, (image_paths, batch_names, MODEL_NAME, str(base_temp.absolute())))
-        conn.commit()
     cur.close()
 
 
@@ -203,7 +201,6 @@ def serve_s1_pg_unified(conn, query_paths: List[str]):
         cur.execute(sql, (MODEL_NAME, str(base_temp.absolute()), TOP_K))
         _ = cur.fetchall()
 
-    conn.commit()
     cur.close()
 
 
@@ -214,7 +211,6 @@ def serve_s1_pg_direct(conn, embed_client, query_paths: List[str]):
     for emb in embeddings:
         cur.execute("SELECT path FROM faces ORDER BY embedding <-> %s LIMIT %s", (np.array(emb), TOP_K))
         _ = cur.fetchall()
-    conn.commit()
     cur.close()
 
 
@@ -276,6 +272,7 @@ def main():
     register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
+    conn_pg.commit()
     clear_model_cache()
     s1_ingest_pg_unified(conn_pg, ingest_paths)
 
@@ -313,6 +310,7 @@ def main():
             py_pid, get_pg_pid(conn_pg),
             lambda: serve_s1_pg_unified(conn_pg, queries))
         results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
+        conn_pg.commit()
         print(f"  pg_unified: {elapsed:.2f}s", flush=True)
 
         # PG Direct
@@ -320,6 +318,7 @@ def main():
             py_pid, pg_pid,
             lambda: serve_s1_pg_direct(conn_pg, embed_client, queries))
         results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+        conn_pg.commit()
         print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
 
         clear_model_cache()

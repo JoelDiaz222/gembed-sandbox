@@ -228,7 +228,6 @@ def setup_pg_schema(conn):
                     review_text TEXT
                 );
                 """, (EMBEDDING_DIM,))
-    conn.commit()
     cur.close()
 
 
@@ -273,7 +272,6 @@ def populate_pg(conn,
         "CREATE INDEX ON s3_customers USING hnsw (embedding vector_cosine_ops) "
         "WITH (m=16, ef_construction=100);"
     )
-    conn.commit()
     cur.close()
 
 
@@ -349,7 +347,6 @@ def serve_pg_gembed_unified(conn, query_image_paths: List[str], top_k: int):
                         );
                     """, (MODEL_NAME, str(tmp), top_k))
         _ = cur.fetchall()
-    conn.commit()
     cur.close()
 
 
@@ -378,7 +375,6 @@ def serve_pg_direct(conn, embed_client: EmbedAnythingImageClient,
     for emb in embeddings:
         cur.execute(sql, ([np.array(emb)], top_k))
         _ = cur.fetchall()
-    conn.commit()
     cur.close()
 
 
@@ -520,7 +516,9 @@ def main():
     register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
+    conn_pg.commit()
     populate_pg(conn_pg, products, customers, purchases, reviews, customer_embeddings)
+    conn_pg.commit()
 
     # ── Qdrant setup ─────────────────────────────────────────────────────
     qd_client = QdrantClient(url=QDRANT_URL)
@@ -539,6 +537,7 @@ def main():
     serve_two_step_qdrant(conn_pg, qd_client, embed_client, warmup_q, top_k)
     clear_model_cache()
     serve_two_step_chroma(conn_pg, ch_col, embed_client, warmup_q, top_k)
+    conn_pg.commit()
     clear_model_cache()
 
     results_by_size = {s: {m: None for m in methods} for s in test_sizes}
@@ -558,6 +557,7 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, get_pg_pid(conn_pg),
                 lambda: serve_pg_gembed_unified(conn_pg, query_image_paths, top_k))
+            conn_pg.commit()
             results_by_size[size]['pg_gembed_unified'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_gembed_unified : {elapsed:.3f}s  "
                   f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
@@ -565,6 +565,7 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, get_pg_pid(conn_pg),
                 lambda: serve_pg_direct(conn_pg, embed_client, query_image_paths, top_k))
+            conn_pg.commit()
             results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_direct         : {elapsed:.3f}s  "
                   f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
@@ -575,6 +576,7 @@ def main():
                 lambda: serve_two_step_qdrant(conn_pg, qd_client, embed_client,
                                               query_image_paths, top_k),
                 container_name=QDRANT_CONTAINER_NAME)
+            conn_pg.commit()
             results_by_size[size]['two_step_qdrant'] = BenchmarkResult(elapsed, stats)
             print(f"  two_step_qdrant   : {elapsed:.3f}s  "
                   f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)
@@ -584,6 +586,7 @@ def main():
                 py_pid, get_pg_pid(conn_pg),
                 lambda: serve_two_step_chroma(conn_pg, ch_col, embed_client,
                                               query_image_paths, top_k))
+            conn_pg.commit()
             results_by_size[size]['two_step_chroma'] = BenchmarkResult(elapsed, stats)
             print(f"  two_step_chroma   : {elapsed:.3f}s  "
                   f"({n_eff_queries / elapsed:.1f} q/s)", flush=True)

@@ -105,14 +105,12 @@ def setup_pg_schema(conn):
                     embedding vector(512)
                 );
                 """)
-    conn.commit()
     cur.close()
 
 
 def truncate_pg_table(conn):
     cur = conn.cursor()
     cur.execute("TRUNCATE faces, persons RESTART IDENTITY")
-    conn.commit()
     cur.close()
 
 
@@ -132,7 +130,6 @@ def s1_populate_pg(conn, image_paths: List[str]):
                        JOIN persons p ON t.n = p.name
               """
         cur.execute(sql, (image_paths, batch_names, MODEL_NAME, str(base_temp.absolute())))
-        conn.commit()
     cur.close()
 
 
@@ -148,7 +145,6 @@ def s1_ingest_pg_direct(conn, image_paths: List[str], embed_client: EmbedAnythin
                    "INSERT INTO faces (path, embedding) VALUES %s",
                    list(zip(image_paths, [np.array(e) for e in embeddings]))
                    )
-    conn.commit()
     cur.close()
 
 
@@ -276,12 +272,14 @@ def main():
         register_vector(conn)
         warmup_pg_connection(conn)
         setup_pg_schema(conn)
+        conn.commit()
         clear_model_cache()
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
                 lambda: s1_ingest_pg_unified(conn, paths))
             results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
+            conn.commit()
             print(f"  pg_unified: {elapsed:.2f}s", flush=True)
 
             # PG Direct
@@ -289,6 +287,7 @@ def main():
                 py_pid, pg_pid,
                 lambda: s1_ingest_pg_direct(conn, paths, embed_client))
             results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
+            conn.commit()
             print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
             clear_model_cache()
         finally:

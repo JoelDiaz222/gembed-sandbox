@@ -94,7 +94,6 @@ def setup_pg_indexed(conn, ingestion_data: List[Tuple]):
                 " WITH (m=16, ef_construction=100);")
     cur.close()
     populate_pg_database(conn, ingestion_data)
-    conn.commit()
 
 
 def setup_pg_direct_indexed(conn, embed_client, ingestion_data: List[Tuple]):
@@ -112,7 +111,6 @@ def setup_pg_direct_indexed(conn, embed_client, ingestion_data: List[Tuple]):
         "INSERT INTO reviews (text, spam, embedding) VALUES %s",
         list(zip(texts, spams, [np.array(e) for e in embeddings]))
     )
-    conn.commit()
     cur.close()
 
 
@@ -207,6 +205,7 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
                 lambda: setup_pg_indexed(conn, ingestion_data))
+            conn.commit()
             results_by_size[size]['pg_indexed'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_indexed: {elapsed:.2f}s", flush=True)
             conn.close()
@@ -218,6 +217,7 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
                 lambda: setup_pg_direct_indexed(conn, embed_client, ingestion_data))
+            conn.commit()
             results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_direct: {elapsed:.2f}s", flush=True)
             conn.close()
@@ -246,6 +246,7 @@ def main():
                     lambda: setup_chroma(c_client, embed_client, ingestion_data))
                 results_by_size[size]['chroma'] = BenchmarkResult(elapsed, stats)
                 print(f"  chroma: {elapsed:.2f}s", flush=True)
+            finally:
                 cleanup_chroma(c_client, c_path)
                 clear_model_cache()
         except Exception:

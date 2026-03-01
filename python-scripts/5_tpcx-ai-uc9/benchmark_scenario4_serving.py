@@ -221,7 +221,6 @@ def setup_pg_schema(conn):
                     product_id  INTEGER REFERENCES s4_products (product_id)
                 );
                 """, (EMBEDDING_DIM,))
-    conn.commit()
     cur.close()
 
 
@@ -249,7 +248,6 @@ def populate_pg(conn, products: list, customers: list, purchases: list,
         "CREATE INDEX ON s4_customers USING hnsw (embedding vector_cosine_ops) "
         "WITH (m=16, ef_construction=100);"
     )
-    conn.commit()
     cur.close()
 
 
@@ -323,7 +321,6 @@ def serve_pg_gembed_unified(conn, query_image_paths: List[str],
                       AND %s;
                     """, (MODEL_NAME, str(tmp), top_k, category, price_lo, price_hi))
         _ = cur.fetchall()
-    conn.commit()
     cur.close()
 
 
@@ -519,6 +516,7 @@ def main():
                     py_pid, get_pg_pid(conn_pg),
                     lambda lo=price_lo, hi=price_hi: serve_pg_gembed_unified(
                         conn_pg, query_image_paths, TARGET_CATEGORY, lo, hi, top_k))
+                conn_pg.commit()
                 entry[f'pg_gembed_unified_f{frac}'] = {
                     'time_s': elapsed,
                     'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
@@ -538,6 +536,7 @@ def main():
                         conn_pg, qd_client, embed_client, query_image_paths,
                         TARGET_CATEGORY, lo, hi, top_k),
                     container_name=QDRANT_CONTAINER_NAME)
+                conn_pg.commit()
                 entry[f'qdrant_native_f{frac}'] = {
                     'time_s': elapsed,
                     'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,
@@ -556,6 +555,7 @@ def main():
                     lambda lo=price_lo, hi=price_hi: serve_chroma_native(
                         conn_pg, ch_col, embed_client, query_image_paths,
                         TARGET_CATEGORY, lo, hi, top_k))
+                conn_pg.commit()
                 entry[f'chroma_native_f{frac}'] = {
                     'time_s': elapsed,
                     'throughput': n_eff_queries / elapsed if elapsed > 0 else 0,

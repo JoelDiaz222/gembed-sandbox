@@ -100,7 +100,6 @@ def setup_pg_schema(conn):
                     embedding  vector(512)
                 );
                 """)
-    conn.commit()
     cur.close()
 
 
@@ -121,7 +120,6 @@ def s2_populate_pg(conn, image_paths: List[str]):
                        JOIN persons p ON t.n = p.name
               """
         cur.execute(sql, (image_paths, batch_names, MODEL_NAME, str(base_temp.absolute())))
-        conn.commit()
     cur.close()
 
 
@@ -153,7 +151,6 @@ def s2_ingest_dist_common(conn, image_paths: List[str]) -> List[int]:
         list(zip(image_paths, person_ids)),
         fetch=True)
     all_ids = [r[0] for r in results]
-    conn.commit()
     cur.close()
     return all_ids
 
@@ -228,7 +225,6 @@ def serve_s2_pg_unified(conn, query_paths: List[str]):
         cur.execute(sql, (MODEL_NAME, str(base_temp.absolute()), TOP_K))
         _ = cur.fetchall()
 
-    conn.commit()
     cur.close()
 
 
@@ -239,7 +235,6 @@ def serve_s2_pg_direct(conn, embed_client, query_paths: List[str]):
     for emb in embeddings:
         cur.execute("SELECT image_data FROM faces ORDER BY embedding <-> %s LIMIT %s", (np.array(emb), TOP_K))
         _ = cur.fetchall()
-    conn.commit()
     cur.close()
 
 
@@ -260,7 +255,6 @@ def serve_s2_qdrant(client, conn, embed_client: EmbedAnythingImageClient, query_
         cur.execute("SELECT image_data FROM faces WHERE id = ANY(%s::int[])", (all_pg_ids,))
         _ = cur.fetchall()
         cur.close()
-        conn.commit()
 
 
 def serve_s2_chroma(collection, conn, embed_client: EmbedAnythingImageClient, query_paths: List[str]):
@@ -280,7 +274,6 @@ def serve_s2_chroma(collection, conn, embed_client: EmbedAnythingImageClient, qu
         cur.execute("SELECT image_data FROM faces WHERE id = ANY(%s::int[])", (all_pg_ids,))
         _ = cur.fetchall()
         cur.close()
-        conn.commit()
 
 
 # =============================================================================
@@ -328,6 +321,7 @@ def main():
     register_vector(conn_pg)
     warmup_pg_connection(conn_pg)
     setup_pg_schema(conn_pg)
+    conn_pg.commit()
     clear_model_cache()
     s2_ingest_pg_unified(conn_pg, ingest_paths)
 
@@ -371,6 +365,7 @@ def main():
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, pg_pid,
             lambda: serve_s2_pg_unified(conn_pg, queries))
+        conn_pg.commit()
         results_by_size[size]['pg_unified'] = BenchmarkResult(elapsed, stats)
         print(f"  pg_unified: {elapsed:.2f}s", flush=True)
 
@@ -378,6 +373,7 @@ def main():
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, pg_pid,
             lambda: serve_s2_pg_direct(conn_pg, embed_client, queries))
+        conn_pg.commit()
         results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
         print(f"  pg_direct:  {elapsed:.2f}s", flush=True)
 
@@ -386,6 +382,7 @@ def main():
             py_pid, pg_pid2,
             lambda: serve_s2_qdrant(qd, conn_pg2, embed_client, queries),
             container_name=QDRANT_CONTAINER_NAME)
+        conn_pg2.commit()
         results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
         print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
 
@@ -393,6 +390,7 @@ def main():
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, pg_pid3,
             lambda: serve_s2_chroma(c_col, conn_pg3, embed_client, queries))
+        conn_pg3.commit()
         results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
         print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
 

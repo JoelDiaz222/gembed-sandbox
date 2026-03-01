@@ -101,14 +101,12 @@ def setup_pg_database(conn):
                     PRIMARY KEY (product_id, category_name)
                 );
                 """)
-    conn.commit()
     cur.close()
 
 
 def clear_embeddings(conn):
     cur = conn.cursor()
     cur.execute("UPDATE products SET embedding = NULL;")
-    conn.commit()
     cur.close()
 
 
@@ -168,7 +166,6 @@ def batch_insert_products(cur, products: List[dict]) -> List[int]:
 def insert_product_data(conn, products: List[dict]) -> List[int]:
     cur = conn.cursor()
     product_ids = batch_insert_products(cur, products)
-    conn.commit()
     cur.close()
     return product_ids
 
@@ -246,7 +243,6 @@ def scenario2_mono_store(conn):
                 """, (EMBED_ANYTHING_MODEL,))
     cur.execute(
         "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
-    conn.commit()
     cur.close()
 
 
@@ -291,7 +287,6 @@ def scenario2_mono_direct(conn, embed_client):
 
     cur.execute(
         "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
-    conn.commit()
     cur.close()
 
 
@@ -388,6 +383,7 @@ def main():
     clear_embeddings(conn_w)
     scenario2_mono_direct(conn_w, embed_client)
     clear_embeddings(conn_w)
+    conn_w.commit()
     clear_model_cache()
     conn_w.close()
 
@@ -405,28 +401,33 @@ def main():
         warmup_pg_connection(conn_mono)
         setup_pg_database(conn_mono)
         insert_product_data(conn_mono, products)
+        conn_mono.commit()
 
         conn_chroma, pg_pid_chroma = connect_and_get_pid()
         warmup_pg_connection(conn_chroma)
         setup_pg_database(conn_chroma)
         insert_product_data(conn_chroma, products)
+        conn_chroma.commit()
 
         conn_qdrant, pg_pid_qdrant = connect_and_get_pid()
         warmup_pg_connection(conn_qdrant)
         setup_pg_database(conn_qdrant)
         insert_product_data(conn_qdrant, products)
+        conn_qdrant.commit()
 
         conn_direct, pg_pid_direct = connect_and_get_pid()
         register_vector(conn_direct)
         warmup_pg_connection(conn_direct)
         setup_pg_database(conn_direct)
         insert_product_data(conn_direct, products)
+        conn_direct.commit()
 
         try:
             # Mono-Store
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_mono,
                 lambda: scenario2_mono_store(conn_mono))
+            conn_mono.commit()
             results_by_size[size]['pg_mono_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  pg_mono_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
@@ -435,6 +436,7 @@ def main():
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_direct,
                 lambda: scenario2_mono_direct(conn_direct, embed_client))
+            conn_direct.commit()
             results_by_size[size]['mono_direct_deferred'] = BenchmarkResult(elapsed, stats)
             print(f"  mono_direct_deferred: {elapsed:.2f}s", flush=True)
             clear_model_cache()
@@ -445,6 +447,7 @@ def main():
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid_chroma,
                     lambda: scenario2_poly_store_chroma(conn_chroma, embed_client, col_c))
+                conn_chroma.commit()
                 results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
                 clear_model_cache()
@@ -457,6 +460,7 @@ def main():
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid_qdrant,
                     lambda: scenario2_poly_store_qdrant(conn_qdrant, embed_client, qd))
+                conn_qdrant.commit()
                 results_by_size[size]['poly_qdrant'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_qdrant: {elapsed:.2f}s", flush=True)
                 clear_model_cache()

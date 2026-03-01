@@ -46,7 +46,6 @@ def setup_pg_schema(conn):
                     embedding vector(384)
                 );
                 """)
-    conn.commit()
     cur.close()
 
 
@@ -62,7 +61,6 @@ def populate_pg_database(conn, texts: List[str], provider: str):
                unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
           """
     cur.execute(sql, (texts, provider, EMBED_ANYTHING_MODEL))
-    conn.commit()
     cur.close()
 
 
@@ -72,9 +70,8 @@ def setup_pg_indexed(conn, texts: List[str], provider: str):
     cur = conn.cursor()
     cur.execute(
         "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
-    conn.commit()
-    cur.close()
     populate_pg_database(conn, texts, provider)
+    conn.commit()
 
 
 def setup_pg_deferred(conn, texts: List[str], provider: str):
@@ -98,7 +95,6 @@ def populate_pg_external(conn, texts: List[str], embed_fn: Callable):
         list(zip(texts, [np.array(e) for e in embeddings])),
         page_size=len(texts)
     )
-    conn.commit()
     cur.close()
 
 
@@ -108,9 +104,8 @@ def setup_pg_ext_indexed(conn, texts: List[str], embed_fn: Callable):
     cur = conn.cursor()
     cur.execute(
         "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
-    conn.commit()
-    cur.close()
     populate_pg_external(conn, texts, embed_fn)
+    conn.commit()
 
 
 def setup_pg_ext_deferred(conn, texts: List[str], embed_fn: Callable):

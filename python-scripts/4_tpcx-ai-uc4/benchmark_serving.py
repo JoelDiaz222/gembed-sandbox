@@ -90,7 +90,6 @@ def setup_pg_indexed(conn, ingestion_data: List[Tuple]):
                 " WITH (m=16, ef_construction=100);")
     cur.close()
     populate_pg_database(conn, ingestion_data)
-    conn.commit()
 
 
 def setup_qdrant_common(client, embed_client, ingestion_data: List[Tuple]):
@@ -145,7 +144,6 @@ def serve_pg(conn, input_texts: List[str]):
           """
     cur.execute(sql, (input_texts, EMBED_ANYTHING_MODEL, input_texts))
     result = cur.fetchall()
-    conn.commit()
     cur.close()
     return result
 
@@ -164,7 +162,6 @@ def serve_pg_direct(conn, embed_client, input_texts: List[str]):
         rows = cur.fetchall()
         spam_votes = sum(1 for r in rows if r[0])
         predictions.append(spam_votes >= 3)
-    conn.commit()
     cur.close()
     return predictions
 
@@ -258,6 +255,7 @@ def main():
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, pg_pid,
             lambda: serve_pg(conn_pg, input_texts))
+        conn_pg.commit()
         results_by_size[size]['pg'] = BenchmarkResult(elapsed, stats)
         print(f"  pg       : {elapsed:.2f}s", flush=True)
 
@@ -265,6 +263,7 @@ def main():
         elapsed, _, stats = ResourceMonitor.measure(
             py_pid, pg_pid,
             lambda: serve_pg_direct(conn_pg, embed_client, input_texts))
+        conn_pg.commit()
         results_by_size[size]['pg_direct'] = BenchmarkResult(elapsed, stats)
         print(f"  pg_direct: {elapsed:.2f}s", flush=True)
 
