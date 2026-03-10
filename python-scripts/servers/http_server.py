@@ -29,7 +29,6 @@ class EmbeddingRequest(BaseModel):
 
 class EmbeddingData(BaseModel):
     embedding: List[float]
-    index: int
 
 
 class EmbeddingResponse(BaseModel):
@@ -42,8 +41,8 @@ async def create_embeddings(request: EmbeddingRequest):
     embeddings = embed_texts(request.input, request.model)
 
     data = [
-        EmbeddingData(embedding=emb, index=i)
-        for i, emb in enumerate(embeddings)
+        EmbeddingData(embedding=emb)
+        for emb in embeddings
     ]
 
     return EmbeddingResponse(data=data, model=request.model)
