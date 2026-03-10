@@ -270,6 +270,7 @@ def main():
         conn_pg, pg_pid = connect_and_get_pid()
         register_vector(conn_pg)
         warmup_pg_connection(conn_pg)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
@@ -283,6 +284,7 @@ def main():
 
         # Qdrant
         qd = create_qdrant_client()
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, None,
@@ -298,6 +300,7 @@ def main():
 
         # Chroma
         c_client, c_path = create_chroma_client()
+        embed_client.embed(['warmup'])
         try:
             c_col = c_client.get_collection("reviews")
             elapsed, _, stats = ResourceMonitor.measure(

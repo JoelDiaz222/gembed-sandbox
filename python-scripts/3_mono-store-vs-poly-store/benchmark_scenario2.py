@@ -423,6 +423,7 @@ def main():
         setup_pg_database(conn_direct)
         insert_product_data(conn_direct, products)
         conn_direct.commit()
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_direct,
@@ -440,6 +441,7 @@ def main():
         setup_pg_database(conn_chroma)
         insert_product_data(conn_chroma, products)
         conn_chroma.commit()
+        embed_client.embed(['warmup'])
         try:
             client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
             try:
@@ -461,6 +463,7 @@ def main():
         setup_pg_database(conn_qdrant)
         insert_product_data(conn_qdrant, products)
         conn_qdrant.commit()
+        embed_client.embed(['warmup'])
         try:
             qd = create_qdrant_client()
             try:

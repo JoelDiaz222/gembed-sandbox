@@ -389,6 +389,7 @@ def main():
         conn_pg, pg_pid = connect_and_get_pid()
         register_vector(conn_pg)
         warmup_pg_connection(conn_pg)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
@@ -403,6 +404,7 @@ def main():
         # Poly-Store Qdrant
         conn_pg2, pg_pid2 = connect_and_get_pid()
         warmup_pg_connection(conn_pg2)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid2,
@@ -418,6 +420,7 @@ def main():
         # Poly-Store Chroma
         conn_pg3, pg_pid3 = connect_and_get_pid()
         warmup_pg_connection(conn_pg3)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid3,

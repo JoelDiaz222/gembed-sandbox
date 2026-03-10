@@ -576,6 +576,7 @@ def main():
 
             conn_pg, pg_pid = connect_and_get_pid()
             warmup_pg_connection(conn_pg)
+            embed_client.embed(['warmup'])
             try:
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid,
@@ -590,6 +591,7 @@ def main():
 
             conn_pg, pg_pid = connect_and_get_pid()
             warmup_pg_connection(conn_pg)
+            embed_client.embed(['warmup'])
             try:
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid,
@@ -606,6 +608,7 @@ def main():
 
             conn_pg, pg_pid = connect_and_get_pid()
             warmup_pg_connection(conn_pg)
+            embed_client.embed(['warmup'])
             try:
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid,

@@ -227,6 +227,7 @@ def main():
 
             # Qdrant
             qd = create_qdrant_client()
+            embed_client.embed(['warmup'])
             try:
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, None,
@@ -242,6 +243,7 @@ def main():
 
             # Chroma
             c_client, c_path = create_chroma_client()
+            embed_client.embed(['warmup'])
             try:
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, None,

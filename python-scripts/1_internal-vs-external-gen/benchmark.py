@@ -166,7 +166,6 @@ def setup_method_connection(texts: List[str], benchmark_fn: Callable, is_externa
     warmup_texts = get_review_texts(8, shuffle=False)
     truncate_table(conn)
     benchmark_fn(conn, warmup_texts)
-    clear_model_cache()
 
     conn.commit()
     return conn, py_pid, pg_pid

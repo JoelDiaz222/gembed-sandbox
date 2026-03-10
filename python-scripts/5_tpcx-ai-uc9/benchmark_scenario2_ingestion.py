@@ -341,6 +341,7 @@ def main():
         warmup_pg_connection(conn)
         setup_pg_schema(conn)
         conn.commit()
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid,
@@ -358,6 +359,7 @@ def main():
         setup_pg_schema(conn2)
         qd = create_qdrant_client()
         clear_model_cache()
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid2,
@@ -378,6 +380,7 @@ def main():
         c_client, c_path = create_chroma_client()
         col = c_client.create_collection("faces", configuration={"hnsw": {"space": "cosine"}})
         clear_model_cache()
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid3,

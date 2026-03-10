@@ -307,6 +307,7 @@ def main():
         # Indexed
         conn_ext, pg_pid_ext = connect_and_get_pid()
         register_vector(conn_ext)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
                                                         lambda: setup_pg_ext_indexed(conn_ext, texts,
@@ -320,6 +321,7 @@ def main():
         # Deferred
         conn_ext, pg_pid_ext = connect_and_get_pid()
         register_vector(conn_ext)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid_ext,
                                                         lambda: setup_pg_ext_deferred(conn_ext, texts,
@@ -332,6 +334,7 @@ def main():
 
         # Run Qdrant indexed
         client = QdrantClient(url=QDRANT_URL)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                         lambda: setup_qdrant(client, texts, embed_client.embed,
@@ -345,6 +348,7 @@ def main():
 
         # Run Qdrant deferred
         client = QdrantClient(url=QDRANT_URL)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                         lambda: setup_qdrant(client, texts, embed_client.embed,
@@ -358,6 +362,7 @@ def main():
 
         # Run Chroma
         client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
                                                         lambda: benchmark_chroma(collection, texts,

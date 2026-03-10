@@ -465,6 +465,7 @@ def main():
         setup_pg_database(conn_direct)
         truncate_pg_tables(conn_direct)
         conn_direct.commit()
+        embed_client.embed(['warmup'])
         try:
             elapsed, _, stats = ResourceMonitor.measure(
                 py_pid, pg_pid_direct,
@@ -482,6 +483,7 @@ def main():
         setup_pg_database(conn_chroma)
         truncate_pg_tables(conn_chroma)
         conn_chroma.commit()
+        embed_client.embed(['warmup'])
         try:
             client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
             try:
@@ -503,6 +505,7 @@ def main():
         setup_pg_database(conn_qdrant)
         truncate_pg_tables(conn_qdrant)
         conn_qdrant.commit()
+        embed_client.embed(['warmup'])
         try:
             qd = create_qdrant_client()
             try:
