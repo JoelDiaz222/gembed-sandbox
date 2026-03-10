@@ -304,6 +304,9 @@ def main():
                 'pg_grpc': lambda c, t: benchmark_internal_db_gen(
                     c, t, "grpc", EMBED_ANYTHING_MODEL
                 ),
+                'pg_http': lambda c, t: benchmark_internal_db_gen(
+                    c, t, "http", EMBED_ANYTHING_MODEL
+                ),
                 'ext_direct': lambda c, t: benchmark_external_client_gen(
                     c, t, direct_client.embed
                 ),

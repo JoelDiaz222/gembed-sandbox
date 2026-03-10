@@ -30,6 +30,7 @@ STYLE_MAP = {
     'pg_grpc_indexed': (COLOR_PG_ALT, '-', 'D'),
     'pg_grpc_deferred': (COLOR_PG_ALT, '--', 'D'),
     'pg_grpc': (COLOR_PG_ALT, ':', 'D'),
+    'pg_http': (COLOR_PG_ALT, ':', 'X'),
 
     # Vector Databases
     'qdrant': (COLOR_VECTOR_QD, '-.', 'D'),
@@ -60,6 +61,7 @@ LABEL_MAP = {
     'mono_store': 'Mono-Store (PG, Local)',
     'internal': 'PG (Local)',
     'pg_grpc': 'PG (gRPC)',
+    'pg_http': 'PG (HTTP)',
     'pg_indexed': 'PG (Local, Indexed)',
     'pg_deferred': 'PG (Local, Deferred Index)',
     'pg_local_indexed': 'PG (Local, Indexed)',
