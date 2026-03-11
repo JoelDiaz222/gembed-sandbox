@@ -46,6 +46,7 @@ STYLE_MAP = {
     'ext_direct_indexed': (COLOR_DIRECT, '-', '*'),
     'ext_direct_deferred': (COLOR_DIRECT, '--', '*'),
     'mono_pg_direct_deferred': (COLOR_DIRECT, '--', 'o'),
+    'mono_ext_direct_deferred': (COLOR_DIRECT, '--', '*'),
     'mono_pg_unified_deferred': (COLOR_PG_ALT, '--', 's'),
     'poly_qdrant_deferred': (COLOR_VECTOR_QD, ':', 'D'),
 
@@ -70,13 +71,13 @@ LABEL_MAP = {
     'pg_mono_deferred': 'Mono-Store (PG, Local, Deferred Index)',
     'pg_grpc_indexed': 'PG (gRPC, Indexed)',
     'pg_grpc_deferred': 'PG (gRPC, Deferred Index)',
-    'ext_direct': 'Python Direct',
+    'ext_direct': 'Ext Direct',
     'external': 'PG External Client',
-    'ext_direct_indexed': 'Python Direct (Indexed)',
-    'ext_direct_deferred': 'Python Direct (Deferred Index)',
-    'pg_unified': 'PG (Local, Unified)',
-    'pg_direct': 'PG (Python Direct)',
-    'pg_gembed_unified': 'PG (Local, Unified)',
+    'ext_direct_indexed': 'Ext Direct (Indexed)',
+    'ext_direct_deferred': 'Ext Direct (Deferred Index)',
+    'pg_unified': 'PG Local',
+    'pg_direct': 'Ext Direct',
+    'pg_gembed_unified': 'PG Local',
     'ext_grpc': 'External gRPC',
     'ext_http': 'External HTTP',
     'chroma': 'ChromaDB',
@@ -87,9 +88,9 @@ LABEL_MAP = {
     'two_step_qdrant': 'Poly-Store (PG, Qdrant)',
     'qd_indexed': 'Qdrant (Indexed)',
     'qd_deferred': 'Qdrant (Deferred Index)',
-    'mono_pg_unified_deferred': 'Mono-Store (PG, Local, Unified, Deferred Index)',
-    'mono_pg_direct_deferred': 'Mono-Store (PG, Python Direct, Deferred Index)',
-    'poly_qdrant_deferred': 'Poly-Store (PG, Qdrant, Deferred Index)'
+    'mono_pg_unified_deferred': 'Mono-Store (PG Local)',
+    'mono_ext_direct_deferred': 'Mono-Store (Ext Direct)',
+    'poly_qdrant_deferred': 'Poly-Store (PG, Qdrant Deferred)'
 }
 
 
@@ -379,6 +380,11 @@ def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
     if not methods:
         print(f"No methods found in CSV: {csv_file}")
         return
+
+    # Place ChromaDB before Qdrant
+    if 'chroma' in methods and 'qd_indexed' in methods:
+        methods.remove('chroma')
+        methods.insert(methods.index('qd_indexed'), 'chroma')
 
     # Get unique sizes
     sizes = sorted(df['size'].unique())

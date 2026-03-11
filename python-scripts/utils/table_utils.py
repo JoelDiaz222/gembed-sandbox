@@ -20,16 +20,19 @@ LABEL_MAP = {
     'pg_local_deferred': 'PG Local Deferred',
     'pg_grpc_indexed': 'PG gRPC Indexed',
     'pg_grpc_deferred': 'PG gRPC Deferred',
+    'ext_direct_indexed': 'Ext Direct Indexed',
+    'ext_direct_deferred': 'Ext Direct Deferred',
     'qd_indexed': 'QD Indexed',
     'qd_deferred': 'QD Deferred',
 
     # Benchmark 3
     'unified': 'Unified',
-    'poly_chroma': 'Dist. Chroma',
+    'poly_chroma': 'Poly-Store (PG, ChromaDB)',
     'poly_qdrant': 'Dist. Qdrant',
-    'poly_qdrant_deferred': 'Dist. Qdrant (Deferred)',
-    'mono_pg_unified_deferred': 'Mono-Store (Unified)',
+    'poly_qdrant_deferred': 'Poly-Store (PG, QD Deferred)',
+    'mono_pg_unified_deferred': 'Mono-Store (PG Local)',
     'mono_pg_direct_deferred': 'Mono-Store (Direct)',
+    'mono_ext_direct_deferred': 'Mono-Store (Ext Direct)',
 
     # Benchmark 4
     'pg_indexed': 'PG Indexed',
@@ -68,6 +71,11 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
     if not methods:
         print(f"No methods found in CSV: {csv_file}")
         return
+
+    # Place ChromaDB before Qdrant
+    if 'chroma' in methods and 'qd_indexed' in methods:
+        methods.remove('chroma')
+        methods.insert(methods.index('qd_indexed'), 'chroma')
 
     sizes = sorted(df['size'].unique())
 
