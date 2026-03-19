@@ -13,6 +13,8 @@ COLOR_REMOTE_GRPC = '#845ec2'  # Light Indigo (gRPC Remote)
 COLOR_REMOTE_HTTP = '#d65db1'  # Light Magenta (HTTP Remote)
 COLOR_B6_EA = '#003f5c'  # Navy  – EmbedAnything (Candle + CUDA)
 COLOR_B6_ORT = '#ffa600'  # Amber – ONNX Runtime (CPU)
+COLOR_B7_MYSQL = '#00af91'  # Teal  – MySQL (mysql_gembed)
+COLOR_B7_REDIS = '#ef5675'  # Coral – Redis (redis_gembed)
 
 STYLE_MAP = {
     # PostgreSQL / Internal Group
@@ -93,6 +95,10 @@ LABEL_MAP = {
     'poly_qdrant_deferred': 'Poly-Store (PG, Qdrant Deferred)',
     'embed_anything': 'EmbedAnything (Candle, CUDA)',
     'ort': 'ONNX Runtime (CPU)',
+    # Benchmark 7 adapters
+    'pg': 'PostgreSQL (pg\\_gembed)',
+    'mysql': 'MySQL (mysql\\_gembed)',
+    'redis': 'Redis (redis\\_gembed)',
 }
 
 
@@ -227,12 +233,14 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         for method in methods:
             color, ls, marker, label = get_style(method)
             y_vals = [r[method].get(f'{key}_median', r[method].get(key, 0)) for r in all_results if method in r]
-            q1_vals = [r[method].get(f'{key}_q1', r[method].get(f'{key}_median', 0)) for r in all_results if method in r]
-            q3_vals = [r[method].get(f'{key}_q3', r[method].get(f'{key}_median', 0)) for r in all_results if method in r]
+            q1_vals = [r[method].get(f'{key}_q1', r[method].get(f'{key}_median', 0)) for r in all_results if
+                       method in r]
+            q3_vals = [r[method].get(f'{key}_q3', r[method].get(f'{key}_median', 0)) for r in all_results if
+                       method in r]
             y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
             if not any(y_vals): continue
             ax.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
-                         linewidth=2.0, capsize=3, markersize=6, alpha=0.9)
+                        linewidth=2.0, capsize=3, markersize=6, alpha=0.9)
 
         ax.set_xlabel('Scale (Log Scale)')
         ax.set_ylabel(y_label)
@@ -263,7 +271,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         plt.xlabel('Scale (Log Scale)')
         plt.ylabel('Throughput (ops/sec)')
-        
+
         plt.legend(loc='best', frameon=True, framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.3)
         plt.xscale('log', base=2)
@@ -272,7 +280,8 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.close()
 
     def plot_normalized_throughput():
-        baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_pg_direct_deferred', 'mono_ext_direct_deferred']
+        baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_pg_direct_deferred',
+                               'mono_ext_direct_deferred']
         baseline_method = None
         for candidate in baseline_candidates:
             if candidate in methods:
@@ -314,7 +323,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.xlabel('Batch Size (Log Scale)')
         baseline_label = LABEL_MAP.get(baseline_method, baseline_method)
         plt.ylabel(f'Relative Throughput (vs {baseline_label})')
-        
+
         plt.legend(loc='best', frameon=True, framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.3)
 
@@ -337,13 +346,22 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
     print(f"Plots saved to {output_dir} (PDF + PNG)")
 
 
-def _is_b6_methods(methods: List[str]) -> bool:
+def _is_extensibility_methods(methods: List[str]) -> bool:
     """Return True when every method follows the <backend>_<model_name> pattern
-    used by Benchmark 6 (e.g. 'embed_anything_openai--clip-vit-base-patch32', 'ort_openai--clip-vit-base-patch32')."""
+    used by Benchmark 6 (e.g. 'embed_anything_openai/clip-vit-base-patch32')."""
     b6_backends = {'embed_anything', 'ort', 'candle'}
     return bool(methods) and all(
         any(m.startswith(f"{b}_") for b in b6_backends) for m in methods
     )
+
+
+def _is_portability_methods(methods: List[str]) -> bool:
+    """Return True when every method follows the <adapter>_<model_name> pattern
+    used by Benchmark 7 (e.g. 'pg_sentence-transformers/all-MiniLM-L6-v2')."""
+    b7_adapters = {'pg', 'mysql', 'redis'}
+    return bool(methods) and all(
+        any(m.startswith(f"{a}_") for a in b7_adapters) for m in methods
+    ) and not _is_extensibility_methods(methods)
 
 
 def generate_plots_b6(
@@ -454,10 +472,10 @@ def generate_plots_b6(
         )
 
     ax.set_xticks(list(x))
-    ax.set_xticklabels([m.replace('--', '/') for m in seen_models], rotation=15, ha='right')
+    ax.set_xticklabels(seen_models, rotation=15, ha='right')
     ax.set_xlabel('Model')
     ax.set_ylabel(r'Throughput (img/s)')
-    
+
     ax.legend(loc='best', frameon=True, framealpha=0.9)
     ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
     ax.set_axisbelow(True)
@@ -494,10 +512,10 @@ def generate_plots_b6(
         )
         ax.axhline(y=1.0, color='#aaaaaa', linestyle='--', linewidth=1.0, zorder=2)
         ax.set_xticks(list(x))
-        ax.set_xticklabels([m.replace('--', '/') for m in seen_models], rotation=15, ha='right')
+        ax.set_xticklabels(seen_models, rotation=15, ha='right')
         ax.set_xlabel('Model')
         ax.set_ylabel(r'Speedup vs.\ CPU')
-        
+
         ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
         ax.set_axisbelow(True)
         plt.tight_layout()
@@ -534,7 +552,7 @@ def generate_plots_b6(
             ax.bar(offsets, heights, yerr=[err_lo, err_hi], **bar_kwargs)
 
         ax.set_xticks(list(x))
-        ax.set_xticklabels([m.replace('--', '/') for m in seen_models], rotation=15, ha='right')
+        ax.set_xticklabels(seen_models, rotation=15, ha='right')
         ax.set_xlabel('Model')
         ax.set_ylabel(y_label)
         ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
@@ -554,6 +572,146 @@ def generate_plots_b6(
     plot_resource_single('sys_mem', 'Memory (MB)', 'memory', 'system_resources')
 
     print(f"Benchmark 6 plots saved to {output_dir} (PDF + PNG)")
+
+
+def generate_plots_b7(
+        all_results: List[dict],
+        output_dir: Path,
+        timestamp: str,
+        methods: List[str],
+):
+    """Paper-quality grouped bar charts for Benchmark 7 (portability: pg vs mysql vs redis).
+
+    Uses single-panel resource plots (one chart per metric) to match the
+    style of generate_plots_b6 in this file: compact, legend inside, no
+    dual-panel layout.
+    """
+    configure_latex_style()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    b7_adapters = ['pg', 'mysql', 'redis']
+    adapter_color = {
+        'pg': COLOR_PG_MAIN,
+        'mysql': COLOR_B7_MYSQL,
+        'redis': COLOR_B7_REDIS,
+    }
+    adapter_label = {
+        'pg': LABEL_MAP.get('pg', 'PostgreSQL (pg\\_gembed)'),
+        'mysql': LABEL_MAP.get('mysql', 'MySQL (mysql\\_gembed)'),
+        'redis': LABEL_MAP.get('redis', 'Redis (redis\\_gembed)'),
+    }
+    adapter_hatch = {
+        'pg': '',
+        'mysql': '//',
+        'redis': 'xx',
+    }
+
+    seen_adapters = []
+    seen_models = []
+    for m in methods:
+        for a in b7_adapters:
+            if m.startswith(f"{a}_"):
+                model_name = m[len(a) + 1:]
+                if a not in seen_adapters:
+                    seen_adapters.append(a)
+                if model_name not in seen_models:
+                    seen_models.append(model_name)
+                break
+
+    n_models = len(seen_models)
+    n_adapters = len(seen_adapters)
+    if n_models == 0 or n_adapters == 0:
+        return
+
+    aggregated: dict = {}
+    for r in all_results:
+        for m in methods:
+            if m not in r:
+                continue
+            existing = aggregated.get(m, {})
+            for key, val in r[m].items():
+                if key not in existing:
+                    existing[key] = val
+            aggregated[m] = existing
+
+    def _get(m, metric):
+        d = aggregated.get(m, {})
+        return (
+            d.get(f'{metric}_median', d.get(metric, 0)) or 0,
+            d.get(f'{metric}_q1', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
+            d.get(f'{metric}_q3', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
+        )
+
+    bar_width = 0.8 / n_adapters
+    x = range(n_models)
+
+    # ── Throughput ─────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(max(6, 2.5 * n_models), 4.5))
+    for ai, adapter in enumerate(seen_adapters):
+        offsets = [xi + (ai - (n_adapters - 1) / 2) * bar_width for xi in x]
+        heights, err_lo, err_hi = [], [], []
+        for model_name in seen_models:
+            med, q1, q3 = _get(f"{adapter}_{model_name}", 'throughput')
+            heights.append(med)
+            err_lo.append(max(0.0, med - q1))
+            err_hi.append(max(0.0, q3 - med))
+        ax.bar(offsets, heights, width=bar_width,
+               label=adapter_label[adapter],
+               color=adapter_color[adapter],
+               hatch=adapter_hatch[adapter],
+               edgecolor='white', linewidth=0.5,
+               yerr=[err_lo, err_hi], capsize=3,
+               error_kw={'linewidth': 1.0, 'ecolor': '#555555'}, zorder=3)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(seen_models, rotation=15, ha='right')
+    ax.set_xlabel('Model')
+    ax.set_ylabel(r'Throughput (texts/s)')
+    ax.legend(loc='best', frameon=True, framealpha=0.9)
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    plt.savefig(output_dir / f"throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
+    plt.savefig(output_dir / f"throughput_{timestamp}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # ── Resource plots (single panel per metric) ───────────────────────────
+    def plot_resource_single(key, y_label, metric_type, filename_suffix):
+        fig, ax = plt.subplots(figsize=(max(5, 2.0 * n_models), 4.5))
+        for ai, adapter in enumerate(seen_adapters):
+            offsets = [xi + (ai - (n_adapters - 1) / 2) * bar_width for xi in x]
+            heights, err_lo, err_hi = [], [], []
+            for model_name in seen_models:
+                med, q1, q3 = _get(f"{adapter}_{model_name}", key)
+                heights.append(med)
+                err_lo.append(max(0.0, med - q1))
+                err_hi.append(max(0.0, q3 - med))
+            ax.bar(offsets, heights, width=bar_width,
+                   label=adapter_label[adapter],
+                   color=adapter_color[adapter],
+                   hatch=adapter_hatch[adapter],
+                   edgecolor='white', linewidth=0.5,
+                   yerr=[err_lo, err_hi], capsize=3,
+                   error_kw={'linewidth': 1.0, 'ecolor': '#555555'}, zorder=3)
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(seen_models, rotation=15, ha='right')
+        ax.set_xlabel('Model')
+        ax.set_ylabel(y_label)
+        ax.legend(loc='best', frameon=True, framealpha=0.9)
+        ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
+        ax.set_axisbelow(True)
+        plt.tight_layout()
+        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
+        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.png", dpi=300, bbox_inches='tight')
+        plt.close()
+
+    plot_resource_single('py_cpu', r'CPU (\%)', 'cpu', 'python_resources')
+    plot_resource_single('py_mem_peak', 'Memory (MiB)', 'memory', 'python_resources')
+    plot_resource_single('pg_cpu', r'CPU (\%)', 'cpu', 'postgres_resources')
+    plot_resource_single('pg_mem_peak', 'Memory (MiB)', 'memory', 'postgres_resources')
+    plot_resource_single('sys_cpu', r'CPU (\%)', 'cpu', 'system_resources')
+    plot_resource_single('sys_mem', 'Memory (MiB)', 'memory', 'system_resources')
+
+    print(f"Benchmark 7 plots saved to {output_dir} (PDF + PNG)")
 
 
 def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
@@ -616,7 +774,9 @@ def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
         all_results.append(result_entry)
 
     # Route to the appropriate plot function
-    if _is_b6_methods(methods):
+    if _is_portability_methods(methods):
+        generate_plots_b7(all_results, output_dir, timestamp, methods)
+    elif _is_extensibility_methods(methods):
         generate_plots_b6(all_results, output_dir, timestamp, methods)
     else:
         generate_plots(all_results, output_dir, timestamp, methods)

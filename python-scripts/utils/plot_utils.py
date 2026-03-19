@@ -13,11 +13,8 @@ COLOR_REMOTE_GRPC = '#845ec2'  # Light Indigo (gRPC Remote)
 COLOR_REMOTE_HTTP = '#d65db1'  # Light Magenta (HTTP Remote)
 COLOR_B6_EA = '#003f5c'  # Navy  – EmbedAnything (Candle + CUDA)
 COLOR_B6_ORT = '#ffa600'  # Amber – ONNX Runtime (CPU)
-
-# Benchmark 7 – Portability (one colour per DB adapter)
-COLOR_B7_PG = '#003f5c'  # Navy   – PostgreSQL (pg_gembed)
-COLOR_B7_MYSQL = '#ef5675'  # Coral  – MySQL (mysql_gembed)
-COLOR_B7_REDIS = '#ffa600'  # Amber  – Redis (redis_gembed)
+COLOR_B7_MYSQL = '#00af91'  # Teal  – MySQL (mysql_gembed)
+COLOR_B7_REDIS = '#ef5675'  # Coral – Redis (redis_gembed)
 
 STYLE_MAP = {
     # PostgreSQL / Internal Group
@@ -624,7 +621,7 @@ def generate_plots_b7(
 
     b7_adapters = ['pg', 'mysql', 'redis']
     adapter_color = {
-        'pg': COLOR_B7_PG,
+        'pg': COLOR_PG_MAIN,
         'mysql': COLOR_B7_MYSQL,
         'redis': COLOR_B7_REDIS,
     }
@@ -778,7 +775,7 @@ def generate_plots_b7(
         plt.close()
 
     plot_resource_dual('py_cpu', 'py_mem_peak', 'Python Process', 'python_resources')
-    plot_resource_dual('pg_cpu', 'pg_mem_peak', 'DB Process', 'db_resources')
+    plot_resource_dual('pg_cpu', 'pg_mem_peak', 'PostgreSQL Connection', 'postgres_resources')
     plot_resource_dual('sys_cpu', 'sys_mem', 'System', 'system_resources')
 
     print(f"Benchmark 7 plots saved to {output_dir} (PDF + PNG)")
