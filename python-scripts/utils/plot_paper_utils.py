@@ -118,12 +118,12 @@ def configure_latex_style():
         "font.family": "serif",
         "font.serif": ["Computer Modern Roman", "Times New Roman"],
         "mathtext.fontset": "cm",
-        "axes.labelsize": 11,
-        "font.size": 10,
-        "legend.fontsize": 9,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
-        "lines.linewidth": 1.5,
+        "axes.labelsize": 16,
+        "font.size": 16,
+        "legend.fontsize": 14,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "lines.linewidth": 2.0,
         "figure.autolayout": True,
         'text.usetex': True
     })
@@ -221,53 +221,28 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
     has_pg_data = any(m in r and r[m].get('pg_mem_peak', 0) > 0 for r in all_results for m in methods)
     has_qd_data = any(m in r and r[m].get('qd_mem_peak', 0) > 0 for r in all_results for m in methods)
 
-    def plot_dual(cpu_key, mem_key, component_name, filename_suffix):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    def plot_single(key, y_label, metric_type, filename_suffix):
+        fig, ax = plt.subplots(figsize=(7, 5))
 
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get(f'{cpu_key}_median', r[method].get(cpu_key, 0)) for r in all_results if method in r]
-            q1_vals = [r[method].get(f'{cpu_key}_q1', r[method].get(f'{cpu_key}_median', 0)) for r in all_results if
-                       method in r]
-            q3_vals = [r[method].get(f'{cpu_key}_q3', r[method].get(f'{cpu_key}_median', 0)) for r in all_results if
-                       method in r]
-            # Asymmetric error bars: lower = median - Q1, upper = Q3 - median
+            y_vals = [r[method].get(f'{key}_median', r[method].get(key, 0)) for r in all_results if method in r]
+            q1_vals = [r[method].get(f'{key}_q1', r[method].get(f'{key}_median', 0)) for r in all_results if method in r]
+            q3_vals = [r[method].get(f'{key}_q3', r[method].get(f'{key}_median', 0)) for r in all_results if method in r]
             y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
             if not any(y_vals): continue
-            ax1.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
-                         linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
+            ax.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
+                         linewidth=2.0, capsize=3, markersize=6, alpha=0.9)
 
-        ax1.set_xlabel('Scale (Log Scale)')
-        ax1.set_ylabel(r'CPU (\%)')
-        ax1.set_title(f'{component_name} CPU Usage')
-        ax1.grid(True, linestyle='--', alpha=0.3)
-        ax1.set_xscale('log', base=2)
+        ax.set_xlabel('Scale (Log Scale)')
+        ax.set_ylabel(y_label)
+        ax.grid(True, linestyle='--', alpha=0.3)
+        ax.set_xscale('log', base=2)
 
-        for method in methods:
-            color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get(f'{mem_key}_median', r[method].get(mem_key, 0)) for r in all_results if method in r]
-            q1_vals = [r[method].get(f'{mem_key}_q1', r[method].get(f'{mem_key}_median', 0)) for r in all_results if
-                       method in r]
-            q3_vals = [r[method].get(f'{mem_key}_q3', r[method].get(f'{mem_key}_median', 0)) for r in all_results if
-                       method in r]
-            # Asymmetric error bars: lower = median - Q1, upper = Q3 - median
-            y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
-            if not any(y_vals): continue
-            ax2.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
-                         linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
-
-        ax2.set_xlabel('Scale (Log Scale)')
-        ax2.set_ylabel('Memory (MB)')
-        ax2.set_title(f'{component_name} Memory Usage')
-        ax2.grid(True, linestyle='--', alpha=0.3)
-        ax2.set_xscale('log', base=2)
-
-        handles, labels = ax2.get_legend_handles_labels()
-        fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, -0.05), ncol=4, frameon=False)
+        ax.legend(loc='best', frameon=True, framealpha=0.9)
         plt.tight_layout()
-        plt.subplots_adjust(bottom=0.2)
-        plt.savefig(output_dir / f"{filename_suffix}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
-        plt.savefig(output_dir / f"{filename_suffix}_{timestamp}.png", dpi=300, bbox_inches='tight')
+        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
+        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.png", dpi=300, bbox_inches='tight')
         plt.close()
 
     def plot_throughput():
@@ -288,8 +263,8 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         plt.xlabel('Scale (Log Scale)')
         plt.ylabel('Throughput (ops/sec)')
-        plt.title('System Throughput')
-        plt.legend(frameon=True, framealpha=0.9)
+        
+        plt.legend(loc='best', frameon=True, framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.3)
         plt.xscale('log', base=2)
         plt.savefig(output_dir / f"throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
@@ -339,8 +314,8 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.xlabel('Batch Size (Log Scale)')
         baseline_label = LABEL_MAP.get(baseline_method, baseline_method)
         plt.ylabel(f'Relative Throughput (vs {baseline_label})')
-        plt.title(f'Relative Throughput Normalized to {baseline_label}')
-        plt.legend(frameon=True, framealpha=0.9)
+        
+        plt.legend(loc='best', frameon=True, framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.3)
 
         plt.savefig(output_dir / f"normalized_throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
@@ -349,12 +324,16 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
     plot_throughput()
     plot_normalized_throughput()
-    plot_dual('py_cpu', 'py_mem_peak', 'Python Process', 'python_resources')
+    plot_single('py_cpu', r'CPU (\%)', 'cpu', 'python_resources')
+    plot_single('py_mem_peak', 'Memory (MB)', 'memory', 'python_resources')
     if has_pg_data:
-        plot_dual('pg_cpu', 'pg_mem_peak', 'PostgreSQL Connection', 'postgres_resources')
+        plot_single('pg_cpu', r'CPU (\%)', 'cpu', 'postgres_resources')
+        plot_single('pg_mem_peak', 'Memory (MB)', 'memory', 'postgres_resources')
     if has_qd_data:
-        plot_dual('qd_cpu', 'qd_mem_peak', 'Qdrant Container', 'qdrant_resources')
-    plot_dual('sys_cpu', 'sys_mem', 'System', 'system_resources')
+        plot_single('qd_cpu', r'CPU (\%)', 'cpu', 'qdrant_resources')
+        plot_single('qd_mem_peak', 'Memory (MB)', 'memory', 'qdrant_resources')
+    plot_single('sys_cpu', r'CPU (\%)', 'cpu', 'system_resources')
+    plot_single('sys_mem', 'Memory (MB)', 'memory', 'system_resources')
     print(f"Plots saved to {output_dir} (PDF + PNG)")
 
 
@@ -478,8 +457,8 @@ def generate_plots_b6(
     ax.set_xticklabels([m.replace('--', '/') for m in seen_models], rotation=15, ha='right')
     ax.set_xlabel('Model')
     ax.set_ylabel(r'Throughput (img/s)')
-    ax.set_title(r'Image Embedding Throughput by Backend \& Model (PG Local)')
-    ax.legend(frameon=True, framealpha=0.9)
+    
+    ax.legend(loc='best', frameon=True, framealpha=0.9)
     ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
     ax.set_axisbelow(True)
 
@@ -518,7 +497,7 @@ def generate_plots_b6(
         ax.set_xticklabels([m.replace('--', '/') for m in seen_models], rotation=15, ha='right')
         ax.set_xlabel('Model')
         ax.set_ylabel(r'Speedup vs.\ CPU')
-        ax.set_title(r'EmbedAnything (Candle, CUDA) Speedup over CPU')
+        
         ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
         ax.set_axisbelow(True)
         plt.tight_layout()
@@ -528,23 +507,18 @@ def generate_plots_b6(
 
     # Resource plots: CPU + memory, one dual chart per component.
     # Same grouped-bar layout as the throughput chart.
-    def plot_resource_dual(cpu_key, mem_key, component_name, filename_suffix):
-        fig, (ax_cpu, ax_mem) = plt.subplots(1, 2, figsize=(max(10, 4.0 * n_models), 4.5))
+    def plot_resource_single(key, y_label, metric_type, filename_suffix):
+        fig, ax = plt.subplots(figsize=(max(5, 2.0 * n_models), 4.5))
 
         for bi, backend in enumerate(seen_backends):
             offsets = [xi + (bi - (n_backends - 1) / 2) * bar_width for xi in x]
-            cpu_heights, cpu_lo, cpu_hi = [], [], []
-            mem_heights, mem_lo, mem_hi = [], [], []
+            heights, err_lo, err_hi = [], [], []
             for model_name in seen_models:
                 method_name = f"{backend}_{model_name}"
-                c_med, c_q1, c_q3 = _get(method_name, cpu_key)
-                m_med, m_q1, m_q3 = _get(method_name, mem_key)
-                cpu_heights.append(c_med)
-                cpu_lo.append(max(0.0, c_med - c_q1))
-                cpu_hi.append(max(0.0, c_q3 - c_med))
-                mem_heights.append(m_med)
-                mem_lo.append(max(0.0, m_med - m_q1))
-                mem_hi.append(max(0.0, m_q3 - m_med))
+                med, q1, q3 = _get(method_name, key)
+                heights.append(med)
+                err_lo.append(max(0.0, med - q1))
+                err_hi.append(max(0.0, q3 - med))
 
             bar_kwargs = dict(
                 width=bar_width,
@@ -557,33 +531,27 @@ def generate_plots_b6(
                 error_kw={'linewidth': 1.0, 'ecolor': '#555555'},
                 zorder=3,
             )
-            ax_cpu.bar(offsets, cpu_heights, yerr=[cpu_lo, cpu_hi], **bar_kwargs)
-            ax_mem.bar(offsets, mem_heights, yerr=[mem_lo, mem_hi], **bar_kwargs)
+            ax.bar(offsets, heights, yerr=[err_lo, err_hi], **bar_kwargs)
 
-        for ax, ylabel, title in [
-            (ax_cpu, r'CPU (\%)', f'{component_name} CPU Usage'),
-            (ax_mem, 'Memory (MB)', f'{component_name} Memory Usage'),
-        ]:
-            ax.set_xticks(list(x))
-            ax.set_xticklabels([m.replace('--', '/') for m in seen_models], rotation=15, ha='right')
-            ax.set_xlabel('Model')
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
-            ax.set_axisbelow(True)
+        ax.set_xticks(list(x))
+        ax.set_xticklabels([m.replace('--', '/') for m in seen_models], rotation=15, ha='right')
+        ax.set_xlabel('Model')
+        ax.set_ylabel(y_label)
+        ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
+        ax.set_axisbelow(True)
 
-        handles, labels = ax_mem.get_legend_handles_labels()
-        fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, -0.05),
-                   ncol=n_backends, frameon=False)
+        ax.legend(loc='best', frameon=True, framealpha=0.9)
         plt.tight_layout()
-        plt.subplots_adjust(bottom=0.2)
-        plt.savefig(output_dir / f"{filename_suffix}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
-        plt.savefig(output_dir / f"{filename_suffix}_{timestamp}.png", dpi=300, bbox_inches='tight')
+        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
+        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.png", dpi=300, bbox_inches='tight')
         plt.close()
 
-    plot_resource_dual('py_cpu', 'py_mem_peak', 'Python Process', 'python_resources')
-    plot_resource_dual('pg_cpu', 'pg_mem_peak', 'PostgreSQL Connection', 'postgres_resources')
-    plot_resource_dual('sys_cpu', 'sys_mem', 'System', 'system_resources')
+    plot_resource_single('py_cpu', r'CPU (\%)', 'cpu', 'python_resources')
+    plot_resource_single('py_mem_peak', 'Memory (MB)', 'memory', 'python_resources')
+    plot_resource_single('pg_cpu', r'CPU (\%)', 'cpu', 'postgres_resources')
+    plot_resource_single('pg_mem_peak', 'Memory (MB)', 'memory', 'postgres_resources')
+    plot_resource_single('sys_cpu', r'CPU (\%)', 'cpu', 'system_resources')
+    plot_resource_single('sys_mem', 'Memory (MB)', 'memory', 'system_resources')
 
     print(f"Benchmark 6 plots saved to {output_dir} (PDF + PNG)")
 

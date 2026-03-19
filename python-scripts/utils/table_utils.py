@@ -43,7 +43,7 @@ LABEL_MAP = {
 
     # Benchmark 6 backends
     'embed_anything': 'EmbedAnything (Candle, CUDA)',
-    'ort': 'ONNX Runtime (ORT)',
+    'ort': 'ONNX Runtime (CPU)',
 }
 
 
