@@ -40,6 +40,10 @@ LABEL_MAP = {
     'PostgreSQL': 'PostgreSQL',
     'ChromaDB': 'ChromaDB',
     'Qdrant': 'Qdrant',
+
+    # Benchmark 6 backends
+    'embed_anything': 'EmbedAnything (Candle, CUDA)',
+    'ort': 'ONNX Runtime (ORT)',
 }
 
 
@@ -79,12 +83,23 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
 
     sizes = sorted(df['size'].unique())
 
-    # Find the appropriate baseline
-    baseline_method = None
-    for candidate in baseline_candidates:
-        if candidate in methods:
-            baseline_method = candidate
-            break
+    b6_backends = {'embed_anything', 'ort'}
+
+    def _method_label(m: str) -> str:
+        """Human-readable column header, with B6-aware fallback."""
+        if m in LABEL_MAP:
+            return LABEL_MAP[m]
+        for b in b6_backends:
+            if m.startswith(f"{b}_"):
+                model_short = m[len(b) + 1:]
+                backend_lbl = LABEL_MAP.get(b, b.replace('_', ' ').title())
+                return f"{backend_lbl} / {model_short}"
+        return m.replace('_', ' ').title()
+
+    baseline_method = next(
+        (c for c in baseline_candidates if c in methods),
+        next((m for m in methods if m.startswith('ort_')), None)
+    )
 
     for metric in metrics:
         table_data = []
@@ -156,7 +171,7 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
                 row_data[max_method] = f"\\textbf{{{row_data[max_method]}}}"
 
         # Create LaTeX table string
-        header_labels = [LABEL_MAP.get(m, m.replace('_', ' ').title()) for m in methods]
+        header_labels = [_method_label(m) for m in methods]
 
         latex_string = f"% Auto-generated from {Path(csv_file).name}\n"
         latex_string += "\\begin{tabular}{l" + "c" * len(methods) + "}\n"
@@ -181,7 +196,7 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
         # --- Generate Speedup Table ---
         if metric == 'throughput' and baseline_method and speedup_data:
             display_methods = [m for m in methods if m != baseline_method]
-            sp_header_labels = [LABEL_MAP.get(m, m.replace('_', ' ').title()) for m in display_methods]
+            sp_header_labels = [_method_label(m) for m in display_methods]
 
             sp_latex = f"% Speedup relative to {LABEL_MAP.get(baseline_method, baseline_method)} \n"
             sp_latex += "\\begin{tabular}{l" + "c" * len(display_methods) + "}\n"
