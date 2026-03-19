@@ -82,3 +82,9 @@ benchmarks:
     script: "6_extensibility/benchmark.py"
     runs: 15
     sizes: [ 1024 ]
+
+  7_portability:
+    enabled: true
+    script: "7_portability/benchmark.py"
+    runs: 15
+    sizes: [ 1024 ]
