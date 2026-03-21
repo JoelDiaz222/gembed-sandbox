@@ -8,6 +8,7 @@ from typing import List, Optional
 import mysql.connector
 import psutil
 import redis
+from data.loader import get_review_texts
 from utils.benchmark_utils import (
     BenchmarkResult,
     ResourceMonitor,
@@ -16,7 +17,6 @@ from utils.benchmark_utils import (
     clear_model_cache,
 )
 from utils.plot_utils import save_single_run_csv
-from data.loader import get_review_texts
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -55,7 +55,7 @@ def warmup_pg(conn, model: str) -> None:
 def run_pg(conn, model: str, texts: List[str]) -> None:
     cur = conn.cursor()
     cur.execute(
-        "SELECT embed_texts(%s, %s, %s::text[])",
+        "SELECT 1 FROM embed_texts(%s, %s, %s::text[]) LIMIT 1",
         (BACKEND, model, texts),
     )
     _ = cur.fetchall()
@@ -109,7 +109,7 @@ def get_mysql_pid(conn) -> Optional[int]:
 def warmup_mysql(conn, model: str) -> None:
     cur = conn.cursor()
     cur.execute(
-        "SELECT EMBED_TEXTS(%s, %s, %s)",
+        "SELECT 1 WHERE EMBED_TEXTS(%s, %s, %s) IS NOT NULL",
         (BACKEND, model, '["warmup text"]'),
     )
     cur.fetchall()
@@ -121,7 +121,7 @@ def run_mysql(conn, model: str, texts: List[str]) -> None:
     json_texts = json.dumps(texts)
     cur = conn.cursor()
     cur.execute(
-        "SELECT EMBED_TEXTS(%s, %s, %s)",
+        "SELECT 1 WHERE EMBED_TEXTS(%s, %s, %s) IS NOT NULL",
         (BACKEND, model, json_texts),
     )
     _ = cur.fetchall()
@@ -148,12 +148,15 @@ def get_redis_server_pid() -> Optional[int]:
     return None
 
 
+LUA_EMBEDS_RUN = "redis.call('G.EMBEDS', unpack(ARGV)); return 1"
+
+
 def warmup_redis(r: redis.Redis, model: str) -> None:
-    r.execute_command("G.EMBEDS", BACKEND, model, "warmup text")
+    r.execute_command("EVAL", LUA_EMBEDS_RUN, 0, BACKEND, model, "warmup text")
 
 
 def run_redis(r: redis.Redis, model: str, texts: List[str]) -> None:
-    _ = r.execute_command("G.EMBEDS", BACKEND, model, *texts)
+    _ = r.execute_command("EVAL", LUA_EMBEDS_RUN, 0, BACKEND, model, *texts)
 
 
 # =============================================================================

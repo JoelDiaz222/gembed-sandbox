@@ -55,7 +55,7 @@ def warmup_pg_connection_images(conn, backend: str, model: str, warmup_dir: str)
     """
     cur = conn.cursor()
     cur.execute(
-        "SELECT embed_image_directory(%s, %s, %s)",
+        "SELECT 1 FROM embed_image_directory(%s, %s, %s) LIMIT 1",
         (backend, model, warmup_dir)
     )
     cur.fetchall()
@@ -67,7 +67,7 @@ def run_pg_benchmark(conn, backend: str, model: str, tmp_dir_path: str):
     """Run the in-DB image embedding benchmark for a specific backend and model."""
     cur = conn.cursor()
     cur.execute(
-        "SELECT embed_image_directory(%s, %s, %s)",
+        "SELECT 1 FROM embed_image_directory(%s, %s, %s) LIMIT 1",
         (backend, model, tmp_dir_path)
     )
     _ = cur.fetchall()
