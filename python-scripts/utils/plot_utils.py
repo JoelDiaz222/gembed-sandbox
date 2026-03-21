@@ -23,6 +23,8 @@ STYLE_MAP = {
     'mono_store': (COLOR_PG_MAIN, '-', 'o'),
     'internal': (COLOR_PG_MAIN, '-', 'o'),
     'pg': (COLOR_PG_MAIN, '-', 'o'),
+    'mysql': (COLOR_B7_MYSQL, '-', 's'),
+    'redis': (COLOR_B7_REDIS, '-', 'D'),
 
     # PG Variants (Indexed/Deferred/gRPC)
     'pg_indexed': (COLOR_PG_ALT, '-', 's'),
@@ -304,7 +306,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
     def plot_normalized_throughput():
         baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_pg_direct_deferred',
-                               'mono_ext_direct_deferred']
+                               'mono_ext_direct_deferred', 'pg']
         baseline_method = None
         for candidate in baseline_candidates:
             if candidate in methods:
@@ -610,173 +612,57 @@ def generate_plots_b7(
         timestamp: str,
         methods: List[str],
 ):
-    """Grouped bar chart for Benchmark 7 (portability: pg vs mysql vs redis).
-
-    Layout: one group of bars per model, one bar per DB adapter within the group.
-    Only a single size is expected (the benchmark runs at one fixed scale).
-    IQR-based asymmetric error bars are drawn when available.
     """
-    configure_latex_style()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    Generate plots for Benchmark 7 (portability).
+    For each model tested, extracts the adapter-specific results and generates
+    line plots across batch sizes (including normalized throughput), storing
+    them in a subdirectory per model.
+    """
     b7_adapters = ['pg', 'mysql', 'redis']
-    adapter_color = {
-        'pg': COLOR_PG_MAIN,
-        'mysql': COLOR_B7_MYSQL,
-        'redis': COLOR_B7_REDIS,
-    }
-    adapter_label = {
-        'pg': LABEL_MAP.get('pg', 'PostgreSQL (pg\\_gembed)'),
-        'mysql': LABEL_MAP.get('mysql', 'MySQL (mysql\\_gembed)'),
-        'redis': LABEL_MAP.get('redis', 'Redis (redis\\_gembed)'),
-    }
-    adapter_hatch = {
-        'pg': '',
-        'mysql': '//',
-        'redis': 'xx',
-    }
 
-    # Preserve order in which adapters and models first appear
-    seen_adapters = []
+    # Find all unique models and adapters
     seen_models = []
-    method_map: dict = {}  # method_name -> (adapter, model_slug)
+    seen_adapters = []
     for m in methods:
         for a in b7_adapters:
             if m.startswith(f"{a}_"):
-                model_name = m[len(a) + 1:]  # everything after "<adapter>_"
-                method_map[m] = (a, model_name)
-                if a not in seen_adapters:
-                    seen_adapters.append(a)
+                model_name = m[len(a) + 1:]
                 if model_name not in seen_models:
                     seen_models.append(model_name)
+                if a not in seen_adapters:
+                    seen_adapters.append(a)
                 break
 
-    n_models = len(seen_models)
-    n_adapters = len(seen_adapters)
-    if n_models == 0 or n_adapters == 0:
+    if not seen_models or not seen_adapters:
         return
 
-    # Aggregate across sizes (expect a single size, but handle multiple gracefully)
-    aggregated: dict = {}
-    for r in all_results:
-        for m in methods:
-            if m not in r:
-                continue
-            existing = aggregated.get(m, {})
-            for key, val in r[m].items():
-                if key not in existing:
-                    existing[key] = val
-            aggregated[m] = existing
+    for model_name in seen_models:
+        model_methods = []
+        for a in seen_adapters:
+            model_methods.append(a)
 
-    def _get(m, metric):
-        d = aggregated.get(m, {})
-        return (
-            d.get(f'{metric}_median', d.get(metric, 0)) or 0,
-            d.get(f'{metric}_q1', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
-            d.get(f'{metric}_q3', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
-        )
+        # Build model_results for this specific model
+        model_results = []
+        for r in all_results:
+            model_entry = {'size': r['size']}
+            has_data = False
+            for a in seen_adapters:
+                full_method = f"{a}_{model_name}"
+                if full_method in r:
+                    model_entry[a] = r[full_method]
+                    has_data = True
+            if has_data:
+                model_results.append(model_entry)
 
-    bar_width = 0.8 / n_adapters
-    x = range(n_models)
+        if not model_results:
+            continue
 
-    # ── Throughput grouped bar chart ──────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(max(6, 2.8 * n_models), 4.5))
+        safe_model_name = model_name.replace('/', '--')
+        model_dir = output_dir / safe_model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
 
-    for ai, adapter in enumerate(seen_adapters):
-        offsets = [xi + (ai - (n_adapters - 1) / 2) * bar_width for xi in x]
-        heights, err_lo, err_hi = [], [], []
-        for model_slug in seen_models:
-            method_name = f"{adapter}_{model_slug}"
-            med, q1, q3 = _get(method_name, 'throughput')
-            heights.append(med)
-            err_lo.append(max(0.0, med - q1))
-            err_hi.append(max(0.0, q3 - med))
-
-        ax.bar(
-            offsets, heights,
-            width=bar_width,
-            label=adapter_label[adapter],
-            color=adapter_color[adapter],
-            hatch=adapter_hatch[adapter],
-            edgecolor='white',
-            linewidth=0.5,
-            yerr=[err_lo, err_hi],
-            capsize=3,
-            error_kw={'linewidth': 1.0, 'ecolor': '#555555'},
-            zorder=3,
-        )
-
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(seen_models, rotation=20, ha='right')
-    ax.set_xlabel('Model')
-    ax.set_ylabel(r'Throughput (texts/s)')
-    ax.set_title(r'Text Embedding Throughput by Adapter \& Model (EmbedAnything)')
-    ax.legend(frameon=True, framealpha=0.9)
-    ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
-    ax.set_axisbelow(True)
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
-    plt.savefig(output_dir / f"throughput_{timestamp}.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # ── Resource plots ────────────────────────────────────────────────────────
-    def plot_resource_dual(cpu_key, mem_key, component_name, filename_suffix):
-        fig, (ax_cpu, ax_mem) = plt.subplots(1, 2, figsize=(max(10, 4.0 * n_models), 4.5))
-
-        for ai, adapter in enumerate(seen_adapters):
-            offsets = [xi + (ai - (n_adapters - 1) / 2) * bar_width for xi in x]
-            cpu_heights, cpu_lo, cpu_hi = [], [], []
-            mem_heights, mem_lo, mem_hi = [], [], []
-            for model_slug in seen_models:
-                method_name = f"{adapter}_{model_slug}"
-                c_med, c_q1, c_q3 = _get(method_name, cpu_key)
-                m_med, m_q1, m_q3 = _get(method_name, mem_key)
-                cpu_heights.append(c_med)
-                cpu_lo.append(max(0.0, c_med - c_q1))
-                cpu_hi.append(max(0.0, c_q3 - c_med))
-                mem_heights.append(m_med)
-                mem_lo.append(max(0.0, m_med - m_q1))
-                mem_hi.append(max(0.0, m_q3 - m_med))
-
-            bar_kwargs = dict(
-                width=bar_width,
-                label=adapter_label[adapter],
-                color=adapter_color[adapter],
-                hatch=adapter_hatch[adapter],
-                edgecolor='white',
-                linewidth=0.5,
-                capsize=3,
-                error_kw={'linewidth': 1.0, 'ecolor': '#555555'},
-                zorder=3,
-            )
-            ax_cpu.bar(offsets, cpu_heights, yerr=[cpu_lo, cpu_hi], **bar_kwargs)
-            ax_mem.bar(offsets, mem_heights, yerr=[mem_lo, mem_hi], **bar_kwargs)
-
-        for ax, ylabel, title in [
-            (ax_cpu, r'CPU (\%)', f'{component_name} CPU Usage'),
-            (ax_mem, 'Memory (MiB)', f'{component_name} Memory Usage'),
-        ]:
-            ax.set_xticks(list(x))
-            ax.set_xticklabels(seen_models, rotation=20, ha='right')
-            ax.set_xlabel('Model')
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
-            ax.set_axisbelow(True)
-
-        handles, labels = ax_mem.get_legend_handles_labels()
-        fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, -0.05),
-                   ncol=n_adapters, frameon=False)
-        plt.tight_layout()
-        plt.subplots_adjust(bottom=0.2)
-        plt.savefig(output_dir / f"{filename_suffix}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
-        plt.savefig(output_dir / f"{filename_suffix}_{timestamp}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-
-    plot_resource_dual('py_cpu', 'py_mem_peak', 'Python Process', 'python_resources')
-    plot_resource_dual('pg_cpu', 'pg_mem_peak', 'PostgreSQL Connection', 'postgres_resources')
-    plot_resource_dual('sys_cpu', 'sys_mem', 'System', 'system_resources')
+        # We reuse the main `generate_plots` implementation
+        generate_plots(model_results, model_dir, timestamp, model_methods)
 
     print(f"Benchmark 7 plots saved to {output_dir} (PDF + PNG)")
 

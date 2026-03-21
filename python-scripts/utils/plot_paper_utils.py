@@ -23,6 +23,8 @@ STYLE_MAP = {
     'mono_store': (COLOR_PG_MAIN, '-', 'o'),
     'internal': (COLOR_PG_MAIN, '-', 'o'),
     'pg': (COLOR_PG_MAIN, '-', 'o'),
+    'mysql': (COLOR_B7_MYSQL, '-', 's'),
+    'redis': (COLOR_B7_REDIS, '-', 'D'),
 
     # PG Variants (Indexed/Deferred/gRPC)
     'pg_indexed': (COLOR_PG_ALT, '-', 's'),
@@ -281,7 +283,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
     def plot_normalized_throughput():
         baseline_candidates = ['ext_direct', 'pg_direct', 'ext_direct_indexed', 'mono_pg_direct_deferred',
-                               'mono_ext_direct_deferred']
+                               'mono_ext_direct_deferred', 'pg']
         baseline_method = None
         for candidate in baseline_candidates:
             if candidate in methods:
@@ -580,138 +582,59 @@ def generate_plots_b7(
         timestamp: str,
         methods: List[str],
 ):
-    """Paper-quality grouped bar charts for Benchmark 7 (portability: pg vs mysql vs redis).
-
-    Uses single-panel resource plots (one chart per metric) to match the
-    style of generate_plots_b6 in this file: compact, legend inside, no
-    dual-panel layout.
     """
-    configure_latex_style()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    Generate plots for Benchmark 7 (portability).
+    For each model tested, extracts the adapter-specific results and generates
+    line plots across batch sizes (including normalized throughput), storing
+    them in a subdirectory per model.
+    """
     b7_adapters = ['pg', 'mysql', 'redis']
-    adapter_color = {
-        'pg': COLOR_PG_MAIN,
-        'mysql': COLOR_B7_MYSQL,
-        'redis': COLOR_B7_REDIS,
-    }
-    adapter_label = {
-        'pg': LABEL_MAP.get('pg', 'PostgreSQL (pg\\_gembed)'),
-        'mysql': LABEL_MAP.get('mysql', 'MySQL (mysql\\_gembed)'),
-        'redis': LABEL_MAP.get('redis', 'Redis (redis\\_gembed)'),
-    }
-    adapter_hatch = {
-        'pg': '',
-        'mysql': '//',
-        'redis': 'xx',
-    }
 
-    seen_adapters = []
+    # Find all unique models and adapters
     seen_models = []
+    seen_adapters = []
     for m in methods:
         for a in b7_adapters:
             if m.startswith(f"{a}_"):
                 model_name = m[len(a) + 1:]
-                if a not in seen_adapters:
-                    seen_adapters.append(a)
                 if model_name not in seen_models:
                     seen_models.append(model_name)
+                if a not in seen_adapters:
+                    seen_adapters.append(a)
                 break
 
-    n_models = len(seen_models)
-    n_adapters = len(seen_adapters)
-    if n_models == 0 or n_adapters == 0:
+    if not seen_models or not seen_adapters:
         return
 
-    aggregated: dict = {}
-    for r in all_results:
-        for m in methods:
-            if m not in r:
-                continue
-            existing = aggregated.get(m, {})
-            for key, val in r[m].items():
-                if key not in existing:
-                    existing[key] = val
-            aggregated[m] = existing
+    for model_name in seen_models:
+        model_methods = []
+        for a in seen_adapters:
+            model_methods.append(a)
 
-    def _get(m, metric):
-        d = aggregated.get(m, {})
-        return (
-            d.get(f'{metric}_median', d.get(metric, 0)) or 0,
-            d.get(f'{metric}_q1', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
-            d.get(f'{metric}_q3', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
-        )
+        # Build model_results for this specific model
+        model_results = []
+        for r in all_results:
+            model_entry = {'size': r['size']}
+            has_data = False
+            for a in seen_adapters:
+                full_method = f"{a}_{model_name}"
+                if full_method in r:
+                    model_entry[a] = r[full_method]
+                    has_data = True
+            if has_data:
+                model_results.append(model_entry)
 
-    bar_width = 0.8 / n_adapters
-    x = range(n_models)
+        if not model_results:
+            continue
 
-    # ── Throughput ─────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(max(6, 2.5 * n_models), 4.5))
-    for ai, adapter in enumerate(seen_adapters):
-        offsets = [xi + (ai - (n_adapters - 1) / 2) * bar_width for xi in x]
-        heights, err_lo, err_hi = [], [], []
-        for model_name in seen_models:
-            med, q1, q3 = _get(f"{adapter}_{model_name}", 'throughput')
-            heights.append(med)
-            err_lo.append(max(0.0, med - q1))
-            err_hi.append(max(0.0, q3 - med))
-        ax.bar(offsets, heights, width=bar_width,
-               label=adapter_label[adapter],
-               color=adapter_color[adapter],
-               hatch=adapter_hatch[adapter],
-               edgecolor='white', linewidth=0.5,
-               yerr=[err_lo, err_hi], capsize=3,
-               error_kw={'linewidth': 1.0, 'ecolor': '#555555'}, zorder=3)
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(seen_models, rotation=15, ha='right')
-    ax.set_xlabel('Model')
-    ax.set_ylabel(r'Throughput (texts/s)')
-    ax.legend(loc='best', frameon=True, framealpha=0.9)
-    ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
-    ax.set_axisbelow(True)
-    plt.tight_layout()
-    plt.savefig(output_dir / f"throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
-    plt.savefig(output_dir / f"throughput_{timestamp}.png", dpi=300, bbox_inches='tight')
-    plt.close()
+        safe_model_name = model_name.replace('/', '--')
+        model_dir = output_dir / safe_model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Resource plots (single panel per metric) ───────────────────────────
-    def plot_resource_single(key, y_label, metric_type, filename_suffix):
-        fig, ax = plt.subplots(figsize=(max(5, 2.0 * n_models), 4.5))
-        for ai, adapter in enumerate(seen_adapters):
-            offsets = [xi + (ai - (n_adapters - 1) / 2) * bar_width for xi in x]
-            heights, err_lo, err_hi = [], [], []
-            for model_name in seen_models:
-                med, q1, q3 = _get(f"{adapter}_{model_name}", key)
-                heights.append(med)
-                err_lo.append(max(0.0, med - q1))
-                err_hi.append(max(0.0, q3 - med))
-            ax.bar(offsets, heights, width=bar_width,
-                   label=adapter_label[adapter],
-                   color=adapter_color[adapter],
-                   hatch=adapter_hatch[adapter],
-                   edgecolor='white', linewidth=0.5,
-                   yerr=[err_lo, err_hi], capsize=3,
-                   error_kw={'linewidth': 1.0, 'ecolor': '#555555'}, zorder=3)
-        ax.set_xticks(list(x))
-        ax.set_xticklabels(seen_models, rotation=15, ha='right')
-        ax.set_xlabel('Model')
-        ax.set_ylabel(y_label)
-        ax.legend(loc='best', frameon=True, framealpha=0.9)
-        ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
-        ax.set_axisbelow(True)
-        plt.tight_layout()
-        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
-        plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.png", dpi=300, bbox_inches='tight')
-        plt.close()
+        # We reuse the main `generate_plots` implementation
+        generate_plots(model_results, model_dir, timestamp, model_methods)
 
-    plot_resource_single('py_cpu', r'CPU (\%)', 'cpu', 'python_resources')
-    plot_resource_single('py_mem_peak', 'Memory (MiB)', 'memory', 'python_resources')
-    plot_resource_single('pg_cpu', r'CPU (\%)', 'cpu', 'postgres_resources')
-    plot_resource_single('pg_mem_peak', 'Memory (MiB)', 'memory', 'postgres_resources')
-    plot_resource_single('sys_cpu', r'CPU (\%)', 'cpu', 'system_resources')
-    plot_resource_single('sys_mem', 'Memory (MiB)', 'memory', 'system_resources')
-
-    print(f"Benchmark 7 plots saved to {output_dir} (PDF + PNG)")
+    print(f"Benchmark 7 per-model plots saved in subdirectories of {output_dir}")
 
 
 def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
