@@ -49,7 +49,7 @@ def setup_pg_schema(conn):
     cur.close()
 
 
-def populate_pg_database(conn, texts: List[str], provider: str):
+def populate_pg_database(conn, texts: List[str], backend: str):
     """Insert data using internal generation."""
     cur = conn.cursor()
     sql = """
@@ -60,24 +60,24 @@ def populate_pg_database(conn, texts: List[str], provider: str):
           FROM input_data,
                unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
           """
-    cur.execute(sql, (texts, provider, EMBED_ANYTHING_MODEL))
+    cur.execute(sql, (texts, backend, EMBED_ANYTHING_MODEL))
     cur.close()
 
 
-def setup_pg_indexed(conn, texts: List[str], provider: str):
+def setup_pg_indexed(conn, texts: List[str], backend: str):
     """Index exists BEFORE embedding generation."""
     setup_pg_schema(conn)
     cur = conn.cursor()
     cur.execute(
         "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
-    populate_pg_database(conn, texts, provider)
+    populate_pg_database(conn, texts, backend)
     conn.commit()
 
 
-def setup_pg_deferred(conn, texts: List[str], provider: str):
+def setup_pg_deferred(conn, texts: List[str], backend: str):
     """Index created AFTER embedding generation."""
     setup_pg_schema(conn)
-    populate_pg_database(conn, texts, provider)
+    populate_pg_database(conn, texts, backend)
     cur = conn.cursor()
     cur.execute(
         "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
@@ -289,14 +289,14 @@ def main():
         print(f"\nSize: {size}", flush=True)
 
         # Run PG local methods individually to clear GPU memory between runs
-        for method_name, (provider, strategy) in method_configs.items():
+        for method_name, (backend, strategy) in method_configs.items():
             conn, pg_pid = connect_and_get_pid()
-            warmup_pg_connection(conn, provider)
+            warmup_pg_connection(conn, backend)
             fn = setup_pg_indexed if strategy == "indexed" else setup_pg_deferred
             # Warmup setup (not measured)
-            fn(conn, warmup_texts, provider)
+            fn(conn, warmup_texts, backend)
             try:
-                elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, texts, provider))
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, pg_pid, lambda: fn(conn, texts, backend))
                 results_by_size[size][method_name] = BenchmarkResult(time_s=elapsed, stats=stats)
                 print(f"  {method_name}: {elapsed:.2f}s", flush=True)
                 clear_model_cache()

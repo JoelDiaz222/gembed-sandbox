@@ -188,7 +188,7 @@ def main():
     print(f"Sizes    : {test_sizes}")
     print(f"Adapters : {adapters}")
     print(f"Models   : {MODELS}")
-    print(f"Embedder : {BACKEND}")
+    print(f"Backend  : {BACKEND}")
 
     py_pid = os.getpid()
 

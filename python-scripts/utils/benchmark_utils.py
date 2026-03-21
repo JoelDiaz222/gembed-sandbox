@@ -322,7 +322,7 @@ def connect_and_get_pid() -> Tuple[psycopg2.extensions.connection, int]:
     return conn, pid
 
 
-def warmup_pg_connection(conn, provider: str = 'embed_anything',
+def warmup_pg_connection(conn, backend: str = 'embed_anything',
                          model_name: str = EMBED_ANYTHING_MODEL):
     """
     Warm up a PostgreSQL connection by running a small embedding query.
@@ -338,7 +338,7 @@ def warmup_pg_connection(conn, provider: str = 'embed_anything',
     cur = conn.cursor()
     cur.execute(
         "SELECT embed_texts(%s, %s, ARRAY['warmup text for benchmark']::text[])",
-        (provider, model_name)
+        (backend, model_name)
     )
     cur.fetchall()
     conn.commit()
