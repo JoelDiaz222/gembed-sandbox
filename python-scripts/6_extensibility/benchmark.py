@@ -55,7 +55,7 @@ def warmup_pg_connection_images(conn, backend: str, model: str, warmup_dir: str)
     """
     cur = conn.cursor()
     cur.execute(
-        "SELECT embed_image_directory(%s, %s, %s)",
+        "SELECT 1 FROM embed_image_directory(%s, %s, %s) LIMIT 1",
         (backend, model, warmup_dir)
     )
     cur.fetchall()
@@ -67,7 +67,7 @@ def run_pg_benchmark(conn, backend: str, model: str, tmp_dir_path: str):
     """Run the in-DB image embedding benchmark for a specific backend and model."""
     cur = conn.cursor()
     cur.execute(
-        "SELECT embed_image_directory(%s, %s, %s)",
+        "SELECT 1 FROM embed_image_directory(%s, %s, %s) LIMIT 1",
         (backend, model, tmp_dir_path)
     )
     _ = cur.fetchall()
@@ -89,7 +89,7 @@ def main():
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    methods = [f"{b}_{m.replace('/', '--')}" for m in DEFAULT_MODELS for b in BACKENDS]
+    methods = [f"{b}_{m}" for m in DEFAULT_MODELS for b in BACKENDS]
 
     print(f"\nBenchmark 6: Image Embedding Backends Comparison")
     print(f"Run ID     : {run_id}")
@@ -123,9 +123,8 @@ def main():
             tmp_path = str(tmp_dir.absolute())
 
             for model in DEFAULT_MODELS:
-                model_name = model.replace('/', '--')
                 for backend in BACKENDS:
-                    method_name = f"{backend}_{model_name}"
+                    method_name = f"{backend}_{model}"
                     conn, pg_pid = connect_and_get_pid()
                     try:
                         warmup_pg_connection_images(conn, backend, model, tmp_path)

@@ -110,7 +110,7 @@ def truncate_table(conn):
     cur.close()
 
 
-def benchmark_internal_db_gen(conn, texts: List[str], provider: str, model: str):
+def benchmark_internal_db_gen(conn, texts: List[str], backend: str, model: str):
     """Benchmark pg_gembed internal generation."""
     cur = conn.cursor()
 
@@ -122,7 +122,7 @@ def benchmark_internal_db_gen(conn, texts: List[str], provider: str, model: str)
           FROM input_data,
                unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
           """
-    cur.execute(sql, (texts, provider, model))
+    cur.execute(sql, (texts, backend, model))
 
     cur.close()
 

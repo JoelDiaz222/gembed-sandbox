@@ -18,3 +18,5 @@ psutil
 embed_anything
 docker
 qdrant_client
+mysql-connector-python
+redis
