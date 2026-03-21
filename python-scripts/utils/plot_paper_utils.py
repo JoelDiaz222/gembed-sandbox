@@ -303,21 +303,27 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if
-                      method in r]
+            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if method in r]
+            q1_vals = [r[method].get('throughput_q1', r[method].get('throughput_median', 0)) for r in all_results if method in r]
+            q3_vals = [r[method].get('throughput_q3', r[method].get('throughput_median', 0)) for r in all_results if method in r]
 
             if not any(y_vals): continue
 
-            norm_y_vals = []
-            valid_sizes = []
-            for sz, y, b in zip(sizes, y_vals, baseline_y_vals):
+            norm_y_vals, norm_q1_vals, norm_q3_vals, valid_sizes = [], [], [], []
+            for sz, y, q1, q3, b in zip(sizes, y_vals, q1_vals, q3_vals, baseline_y_vals):
                 if y and b and b > 0:
                     norm_y_vals.append(y / b)
+                    norm_q1_vals.append(q1 / b)
+                    norm_q3_vals.append(q3 / b)
                     valid_sizes.append(sz)
 
             if not norm_y_vals: continue
 
-            plt.plot(valid_sizes, norm_y_vals, marker=marker, linestyle=ls, color=color, label=label, alpha=0.9)
+            y_errs = [[y - q1 for y, q1 in zip(norm_y_vals, norm_q1_vals)],
+                      [q3 - y for y, q3 in zip(norm_y_vals, norm_q3_vals)]]
+
+            plt.errorbar(valid_sizes, norm_y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
+                         linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
 
         plt.xscale('log', base=2)
         plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
