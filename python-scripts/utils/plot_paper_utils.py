@@ -220,7 +220,8 @@ def save_single_run_csv(all_results: List[dict], output_dir: Path, run_id: str, 
     return str(path)
 
 
-def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, methods: List[str]):
+def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, methods: List[str],
+                   throughput_unit: str = 'rows/s'):
     configure_latex_style()
     output_dir.mkdir(parents=True, exist_ok=True)
     sizes = [r['size'] for r in all_results]
@@ -244,7 +245,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
             ax.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                         linewidth=2.0, capsize=3, markersize=6, alpha=0.9)
 
-        ax.set_xlabel('Scale (Log Scale)')
+        ax.set_xlabel('Input Size (Log Scale)')
         ax.set_ylabel(y_label)
         ax.grid(True, linestyle='--', alpha=0.3)
         ax.set_xscale('log', base=2)
@@ -271,8 +272,8 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
             plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                          linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
 
-        plt.xlabel('Scale (Log Scale)')
-        plt.ylabel('Throughput (ops/sec)')
+        plt.xlabel('Input Size (Log Scale)')
+        plt.ylabel(f'Throughput ({throughput_unit})')
 
         plt.legend(loc='best', frameon=True, framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.3)
@@ -303,9 +304,12 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if method in r]
-            q1_vals = [r[method].get('throughput_q1', r[method].get('throughput_median', 0)) for r in all_results if method in r]
-            q3_vals = [r[method].get('throughput_q3', r[method].get('throughput_median', 0)) for r in all_results if method in r]
+            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if
+                      method in r]
+            q1_vals = [r[method].get('throughput_q1', r[method].get('throughput_median', 0)) for r in all_results if
+                       method in r]
+            q3_vals = [r[method].get('throughput_q3', r[method].get('throughput_median', 0)) for r in all_results if
+                       method in r]
 
             if not any(y_vals): continue
 
@@ -328,7 +332,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.xscale('log', base=2)
         plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
 
-        plt.xlabel('Batch Size (Log Scale)')
+        plt.xlabel('Input Size (Log Scale)')
         baseline_label = LABEL_MAP.get(baseline_method, baseline_method)
         plt.ylabel(f'Relative Throughput (vs {baseline_label})')
 
@@ -637,8 +641,7 @@ def generate_plots_b7(
         model_dir = output_dir / safe_model_name
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        # We reuse the main `generate_plots` implementation
-        generate_plots(model_results, model_dir, timestamp, model_methods)
+        generate_plots(model_results, model_dir, timestamp, model_methods, 'texts/s')
 
     print(f"Benchmark 7 per-model plots saved in subdirectories of {output_dir}")
 
