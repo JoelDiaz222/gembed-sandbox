@@ -16,6 +16,8 @@ DATA_DIR = Path(__file__).parent.parent / "data" / "CUSTOMER_IMAGES"
 BACKENDS = ["embed_anything", "ort"]
 DEFAULT_MODELS = [
     "openai/clip-vit-base-patch32",
+    "openai/clip-vit-large-patch14",
+    "google/siglip-large-patch16-384"
 ]
 
 
