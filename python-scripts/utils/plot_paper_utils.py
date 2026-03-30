@@ -8,7 +8,7 @@ COLOR_PG_MAIN = '#003f5c'  # Navy Blue (Internal/Mono-Store)
 COLOR_PG_ALT = '#444e86'  # Slate (Indexed/Optimized)
 COLOR_VECTOR_QD = '#ff1f5b'  # Crimson (Qdrant)
 COLOR_VECTOR_CH = '#ffa600'  # Amber (Chroma)
-COLOR_DIRECT = '#00af91'  # Teal (In-Process Direct)
+COLOR_DIRECT = '#00af91'  # Teal (In-Process Local)
 COLOR_REMOTE_GRPC = '#845ec2'  # Light Indigo (gRPC Remote)
 COLOR_REMOTE_HTTP = '#d65db1'  # Light Magenta (HTTP Remote)
 COLOR_B6_EA = '#003f5c'  # Navy  – EmbedAnything (Candle + CUDA)
@@ -46,7 +46,7 @@ STYLE_MAP = {
     'chroma': (COLOR_VECTOR_CH, '-.', '^'),
     'poly_chroma': (COLOR_VECTOR_CH, '-.', '^'),
 
-    # Application Clients (Direct/In-Process)
+    # Application Clients (Local/In-Process)
     'ext_direct': (COLOR_DIRECT, '--', '*'),
     'external': (COLOR_DIRECT, '--', '*'),
     'ext_direct_indexed': (COLOR_DIRECT, '-', '*'),
@@ -67,33 +67,33 @@ LABEL_MAP = {
     'internal': 'PG (Local)',
     'pg_grpc': 'PG (gRPC)',
     'pg_http': 'PG (HTTP)',
-    'pg_indexed': 'PG (Local, Indexed)',
+    'pg_indexed': 'PG (Local, Immediate Index)',
     'pg_deferred': 'PG (Local, Deferred Index)',
-    'pg_local_indexed': 'PG (Local, Indexed)',
+    'pg_local_indexed': 'PG (Local, Immediate Index)',
     'pg_local_deferred': 'PG (Local, Deferred Index)',
-    'pg_mono_indexed': 'Mono-Store (PG, Local, Indexed)',
+    'pg_mono_indexed': 'Mono-Store (PG, Local, Immediate Index)',
     'pg_mono_deferred': 'Mono-Store (PG, Local, Deferred Index)',
-    'pg_grpc_indexed': 'PG (gRPC, Indexed)',
+    'pg_grpc_indexed': 'PG (gRPC, Immediate Index)',
     'pg_grpc_deferred': 'PG (gRPC, Deferred Index)',
-    'ext_direct': 'Ext. Direct',
+    'ext_direct': 'App. Local',
     'external': 'PG External Client',
-    'ext_direct_indexed': 'Ext. Direct (Indexed)',
-    'ext_direct_deferred': 'Ext. Direct (Deferred Index)',
+    'ext_direct_indexed': 'App. Local (Immediate Index)',
+    'ext_direct_deferred': 'App. Local (Deferred Index)',
     'pg_unified': 'PG Local',
-    'pg_direct': 'Ext. Direct',
+    'pg_direct': 'App. Local',
     'pg_gembed_unified': 'PG Local',
-    'ext_grpc': 'Ext. gRPC',
-    'ext_http': 'Ext. HTTP',
+    'ext_grpc': 'App. gRPC',
+    'ext_http': 'App. HTTP',
     'chroma': 'ChromaDB',
     'qdrant': 'Qdrant',
     'poly_chroma': 'Poly-Store (PG, ChromaDB)',
     'poly_qdrant': 'Poly-Store (PG, Qdrant)',
     'two_step_chroma': 'Poly-Store (PG, ChromaDB)',
     'two_step_qdrant': 'Poly-Store (PG, Qdrant)',
-    'qd_indexed': 'Qdrant (Indexed)',
+    'qd_indexed': 'Qdrant (Immediate Index)',
     'qd_deferred': 'Qdrant (Deferred Index)',
     'mono_pg_unified_deferred': 'Mono-Store (PG Local Deferred)',
-    'mono_ext_direct_deferred': 'Mono-Store (Ext. Direct Deferred)',
+    'mono_ext_direct_deferred': 'Mono-Store (App. Local Deferred)',
     'poly_qdrant_deferred': 'Poly-Store (PG, Qdrant Deferred)',
     'embed_anything': 'EmbedAnything (Candle, CUDA)',
     'ort': 'ONNX Runtime (CPU)',
@@ -235,12 +235,9 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get(f'{key}_median', r[method].get(key, 0)) for r in all_results if method in r]
-            q1_vals = [r[method].get(f'{key}_q1', r[method].get(f'{key}_median', 0)) for r in all_results if
-                       method in r]
-            q3_vals = [r[method].get(f'{key}_q3', r[method].get(f'{key}_median', 0)) for r in all_results if
-                       method in r]
-            y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
+            y_vals = [r[method].get(key, 0) for r in all_results if method in r]
+            std_vals = [r[method].get(f'{key}_std', 0) for r in all_results if method in r]
+            y_errs = std_vals
             if not any(y_vals): continue
             ax.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                         linewidth=2.0, capsize=3, markersize=6, alpha=0.9)
@@ -260,14 +257,12 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.figure(figsize=(7, 5))
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if
+            y_vals = [r[method].get('throughput', 0) for r in all_results if
                       method in r]
-            q1_vals = [r[method].get('throughput_q1', r[method].get('throughput_median', 0)) for r in all_results if
+            std_vals = [r[method].get('throughput_std', 0) for r in all_results if
                        method in r]
-            q3_vals = [r[method].get('throughput_q3', r[method].get('throughput_median', 0)) for r in all_results if
-                       method in r]
-            # Asymmetric error bars: lower = median - Q1, upper = Q3 - median
-            y_errs = [[y - q1 for y, q1 in zip(y_vals, q1_vals)], [q3 - y for y, q3 in zip(y_vals, q3_vals)]]
+            # Symmetric error bars tracking std
+            y_errs = std_vals
             if not any(y_vals): continue
             plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                          linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
@@ -296,7 +291,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         plt.figure(figsize=(8, 6))
 
-        baseline_y_vals = [r[baseline_method].get('throughput_median', r[baseline_method].get('throughput', 0)) for r in
+        baseline_y_vals = [r[baseline_method].get('throughput', 0) for r in
                            all_results if baseline_method in r]
         if not any(baseline_y_vals):
             plt.close()
@@ -304,27 +299,23 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get('throughput_median', r[method].get('throughput', 0)) for r in all_results if
+            y_vals = [r[method].get('throughput', 0) for r in all_results if
                       method in r]
-            q1_vals = [r[method].get('throughput_q1', r[method].get('throughput_median', 0)) for r in all_results if
-                       method in r]
-            q3_vals = [r[method].get('throughput_q3', r[method].get('throughput_median', 0)) for r in all_results if
+            std_vals = [r[method].get('throughput_std', 0) for r in all_results if
                        method in r]
 
             if not any(y_vals): continue
 
-            norm_y_vals, norm_q1_vals, norm_q3_vals, valid_sizes = [], [], [], []
-            for sz, y, q1, q3, b in zip(sizes, y_vals, q1_vals, q3_vals, baseline_y_vals):
+            norm_y_vals, norm_std_vals, valid_sizes = [], [], []
+            for sz, y, std, b in zip(sizes, y_vals, std_vals, baseline_y_vals):
                 if y and b and b > 0:
                     norm_y_vals.append(y / b)
-                    norm_q1_vals.append(q1 / b)
-                    norm_q3_vals.append(q3 / b)
+                    norm_std_vals.append(std / b)
                     valid_sizes.append(sz)
 
             if not norm_y_vals: continue
 
-            y_errs = [[y - q1 for y, q1 in zip(norm_y_vals, norm_q1_vals)],
-                      [q3 - y for y, q3 in zip(norm_y_vals, norm_q3_vals)]]
+            y_errs = norm_std_vals
 
             plt.errorbar(valid_sizes, norm_y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                          linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
@@ -448,9 +439,8 @@ def generate_plots_b6(
     def _get(m, metric):
         d = aggregated.get(m, {})
         return (
-            d.get(f'{metric}_median', d.get(metric, 0)) or 0,
-            d.get(f'{metric}_q1', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
-            d.get(f'{metric}_q3', d.get(f'{metric}_median', d.get(metric, 0))) or 0,
+            d.get(metric, 0) or 0,
+            d.get(f'{metric}_std', 0) or 0,
         )
 
     # Throughput grouped bar chart
@@ -461,13 +451,12 @@ def generate_plots_b6(
 
     for bi, backend in enumerate(seen_backends):
         offsets = [xi + (bi - (n_backends - 1) / 2) * bar_width for xi in x]
-        heights, err_lo, err_hi = [], [], []
+        heights, err_vals = [], []
         for model_name in seen_models:
             method_name = f"{backend}_{model_name}"
-            med, q1, q3 = _get(method_name, 'throughput')
-            heights.append(med)
-            err_lo.append(max(0.0, med - q1))
-            err_hi.append(max(0.0, q3 - med))
+            mean_val, std_val = _get(method_name, 'throughput')
+            heights.append(mean_val)
+            err_vals.append(std_val)
 
         ax.bar(
             offsets, heights,
@@ -477,7 +466,7 @@ def generate_plots_b6(
             hatch=backend_hatch[backend],
             edgecolor='white',
             linewidth=0.5,
-            yerr=[err_lo, err_hi],
+            yerr=err_vals,
             capsize=3,
             error_kw={'linewidth': 1.0, 'ecolor': '#555555'},
             zorder=3,
@@ -500,24 +489,23 @@ def generate_plots_b6(
     # Speedup bar chart  (embed_anything / ort, per model)
     if 'embed_anything' in seen_backends and 'ort' in seen_backends:
         fig, ax = plt.subplots(figsize=(max(5, 2.0 * n_models), 4.0))
-        speedups, err_lo_sp, err_hi_sp = [], [], []
+        speedups, err_sp_vals = [], []
         for model_name in seen_models:
-            ea_med, ea_q1, ea_q3 = _get(f'embed_anything_{model_name}', 'throughput')
-            ort_med, ort_q1, ort_q3 = _get(f'ort_{model_name}', 'throughput')
-            sp = (ea_med / ort_med) if ort_med > 0 else 0.0
-            # Simple propagation: speedup bounds from the bar extremes
-            sp_lo = (ea_q1 / ort_q3) if ort_q3 > 0 else 0.0
-            sp_hi = (ea_q3 / ort_q1) if ort_q1 > 0 else 0.0
+            ea_mean, ea_std = _get(f'embed_anything_{model_name}', 'throughput')
+            ort_mean, ort_std = _get(f'ort_{model_name}', 'throughput')
+            sp = (ea_mean / ort_mean) if ort_mean > 0 else 0.0
+            # Simple error propagation for division
+            sp_rel_err = (ea_std / ea_mean if ea_mean > 0 else 0.0) + (ort_std / ort_mean if ort_mean > 0 else 0.0)
+            sp_std = sp * sp_rel_err
             speedups.append(sp)
-            err_lo_sp.append(max(0.0, sp - sp_lo))
-            err_hi_sp.append(max(0.0, sp_hi - sp))
+            err_sp_vals.append(sp_std)
 
         ax.bar(
             list(x), speedups,
             color=COLOR_B6_EA,
             edgecolor='white',
             linewidth=0.5,
-            yerr=[err_lo_sp, err_hi_sp],
+            yerr=err_sp_vals,
             capsize=3,
             error_kw={'linewidth': 1.0, 'ecolor': '#555555'},
             zorder=3,
@@ -542,13 +530,12 @@ def generate_plots_b6(
 
         for bi, backend in enumerate(seen_backends):
             offsets = [xi + (bi - (n_backends - 1) / 2) * bar_width for xi in x]
-            heights, err_lo, err_hi = [], [], []
+            heights, err_vals = [], []
             for model_name in seen_models:
                 method_name = f"{backend}_{model_name}"
-                med, q1, q3 = _get(method_name, key)
-                heights.append(med)
-                err_lo.append(max(0.0, med - q1))
-                err_hi.append(max(0.0, q3 - med))
+                mean_val, std_val = _get(method_name, key)
+                heights.append(mean_val)
+                err_vals.append(std_val)
 
             bar_kwargs = dict(
                 width=bar_width,
@@ -561,7 +548,7 @@ def generate_plots_b6(
                 error_kw={'linewidth': 1.0, 'ecolor': '#555555'},
                 zorder=3,
             )
-            ax.bar(offsets, heights, yerr=[err_lo, err_hi], **bar_kwargs)
+            ax.bar(offsets, heights, yerr=err_vals, **bar_kwargs)
 
         ax.set_xticks(list(x))
         ax.set_xticklabels(seen_models, rotation=15, ha='right')

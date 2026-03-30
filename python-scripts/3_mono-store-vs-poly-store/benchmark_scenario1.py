@@ -37,7 +37,7 @@ def generate_products(n: int) -> List[dict]:
                        "Toys", "Health", "Automotive", "Food", "Office"]
     adjectives = ["Premium", "Professional", "Essential", "Advanced", "Classic"]
     total_reviews_needed = int(n * 3.5) + 100
-    reviews_pool = get_review_texts(total_reviews_needed, shuffle=False)
+    reviews_pool = get_review_texts(total_reviews_needed, shuffle=True)
     review_idx = 0
     products = []
     for i in range(n):

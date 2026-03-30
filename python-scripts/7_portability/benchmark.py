@@ -196,7 +196,7 @@ def main():
     py_pid = os.getpid()
 
     # Pre-load texts for all sizes
-    texts_by_size = {size: get_review_texts(size, shuffle=False) for size in test_sizes}
+    texts_by_size = {size: get_review_texts(size, shuffle=True) for size in test_sizes}
 
     # ------------------------------------------------------------------
     # Warm-up phase (all adapters × all models, excluded from timing)

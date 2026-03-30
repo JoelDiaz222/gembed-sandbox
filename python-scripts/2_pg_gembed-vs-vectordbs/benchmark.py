@@ -258,8 +258,8 @@ def main():
     embed_client = EmbedAnythingDirectClient()
 
     # Pre-load all test data
-    test_data = {size: get_review_texts(size, shuffle=False) for size in test_sizes}
-    warmup_texts = get_review_texts(8, shuffle=False)
+    test_data = {size: get_review_texts(size, shuffle=True) for size in test_sizes}
+    warmup_texts = get_review_texts(8, shuffle=True)
 
     # Define all PG methods
     method_configs = {

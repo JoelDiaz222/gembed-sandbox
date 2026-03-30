@@ -163,7 +163,7 @@ def setup_method_connection(texts: List[str], benchmark_fn: Callable, is_externa
     warmup_pg_connection(conn)
 
     # Method-specific warm-up with small data
-    warmup_texts = get_review_texts(8, shuffle=False)
+    warmup_texts = get_review_texts(8, shuffle=True)
     truncate_table(conn)
     benchmark_fn(conn, warmup_texts)
 
@@ -288,7 +288,7 @@ def main():
 
     try:
         # Pre-load all test data
-        test_data = {size: get_review_texts(size, shuffle=False) for size in test_sizes}
+        test_data = {size: get_review_texts(size, shuffle=True) for size in test_sizes}
 
         # Define all methods to benchmark
         # Internal methods (pg_local, pg_grpc) do NOT need register_vector.

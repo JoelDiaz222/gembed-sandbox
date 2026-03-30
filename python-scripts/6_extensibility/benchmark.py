@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -25,7 +26,7 @@ DEFAULT_MODELS = [
 # Data Helpers
 # =============================================================================
 
-def get_all_image_paths(limit: int) -> List[str]:
+def get_all_image_paths(limit: int, shuffle: bool = True) -> List[str]:
     """Gather image paths from DATA_DIR, recycling if necessary."""
     imgs = []
     for ext in ("*.jpg", "*.jpeg", "*.png"):
@@ -35,6 +36,10 @@ def get_all_image_paths(limit: int) -> List[str]:
         raise ValueError(f"No images found in {DATA_DIR}. Please ensure TPCx-AI data is present.")
 
     imgs = [str(p.absolute()) for p in imgs]
+    
+    if shuffle:
+        random.shuffle(imgs)
+
     if len(imgs) < limit:
         mult = (limit // len(imgs)) + 1
         imgs = (imgs * mult)[:limit]

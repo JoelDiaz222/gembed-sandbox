@@ -110,29 +110,27 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
             speedup_row = {'Input Size': size}
             size_df = df[df['size'] == size]
 
-            # Pre-calculate baseline median if this is throughput
-            baseline_median = None
+            # Pre-calculate baseline mean if this is throughput
+            baseline_mean = None
             if metric == 'throughput' and baseline_method:
                 metric_col = f'{baseline_method}_{metric}'
                 if metric_col in size_df.columns:
                     b_vals = size_df[metric_col].dropna()
                     if not b_vals.empty:
-                        baseline_median = np.median(b_vals)
+                        baseline_mean = np.mean(b_vals)
 
             for method in methods:
                 metric_col = f'{method}_{metric}'
                 if metric_col in size_df.columns:
                     values = size_df[metric_col].dropna()
                     if not values.empty:
-                        median = np.median(values)
-                        q1 = np.percentile(values, 25)
-                        q3 = np.percentile(values, 75)
-                        iqr = q3 - q1
+                        mean_val = np.mean(values)
+                        std_val = np.std(values)
                         # Format to one decimal place for consistency
-                        row[method] = f"{median:.1f} ({iqr:.1f})"
+                        row[method] = f"{mean_val:.1f} ({std_val:.1f})"
 
-                        if metric == 'throughput' and baseline_median and baseline_median > 0:
-                            speedup_row[method] = median / baseline_median
+                        if metric == 'throughput' and baseline_mean and baseline_mean > 0:
+                            speedup_row[method] = mean_val / baseline_mean
                         else:
                             speedup_row[method] = None
                     else:
@@ -151,18 +149,18 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
             continue
 
         # --- Generate Standard Table ---
-        # Bold the best value in each row (highest median for throughput, lowest for time_s)
+        # Bold the best value in each row (highest mean for throughput, lowest for time_s)
         for row_data in table_data:
-            max_median = -1.0 if metric == 'throughput' else float('inf')
+            max_mean = -1.0 if metric == 'throughput' else float('inf')
             max_method = None
             for method in methods:
                 val = row_data.get(method)
                 if val and val != "-":
                     try:
-                        median = float(val.split(' ')[0])
-                        if (metric == 'throughput' and median > max_median) or \
-                                (metric != 'throughput' and median < max_median):
-                            max_median = median
+                        mean_val = float(val.split(' ')[0])
+                        if (metric == 'throughput' and mean_val > max_mean) or \
+                                (metric != 'throughput' and mean_val < max_mean):
+                            max_mean = mean_val
                             max_method = method
                     except (ValueError, IndexError):
                         continue  # Ignore malformed entries
