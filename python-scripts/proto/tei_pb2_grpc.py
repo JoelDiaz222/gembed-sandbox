@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from proto import tei_pb2 as proto_dot_tei__pb2
+import tei_pb2 as tei__pb2
 
-GRPC_GENERATED_VERSION = '1.76.0'
+GRPC_GENERATED_VERSION = '1.78.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in proto/tei_pb2_grpc.py depends on'
+        + ' but the generated code in tei_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,13 +36,18 @@ class EmbedStub(object):
         """
         self.Embed = channel.unary_unary(
                 '/tei.v1.Embed/Embed',
-                request_serializer=proto_dot_tei__pb2.EmbedRequest.SerializeToString,
-                response_deserializer=proto_dot_tei__pb2.EmbedResponse.FromString,
+                request_serializer=tei__pb2.EmbedRequest.SerializeToString,
+                response_deserializer=tei__pb2.EmbedResponse.FromString,
                 _registered_method=True)
         self.EmbedBatch = channel.unary_unary(
                 '/tei.v1.Embed/EmbedBatch',
-                request_serializer=proto_dot_tei__pb2.EmbedBatchRequest.SerializeToString,
-                response_deserializer=proto_dot_tei__pb2.EmbedBatchResponse.FromString,
+                request_serializer=tei__pb2.EmbedBatchRequest.SerializeToString,
+                response_deserializer=tei__pb2.EmbedBatchResponse.FromString,
+                _registered_method=True)
+        self.ClearCache = channel.unary_unary(
+                '/tei.v1.Embed/ClearCache',
+                request_serializer=tei__pb2.ClearCacheRequest.SerializeToString,
+                response_deserializer=tei__pb2.ClearCacheResponse.FromString,
                 _registered_method=True)
 
 
@@ -61,18 +66,29 @@ class EmbedServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ClearCache(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_EmbedServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Embed': grpc.unary_unary_rpc_method_handler(
                     servicer.Embed,
-                    request_deserializer=proto_dot_tei__pb2.EmbedRequest.FromString,
-                    response_serializer=proto_dot_tei__pb2.EmbedResponse.SerializeToString,
+                    request_deserializer=tei__pb2.EmbedRequest.FromString,
+                    response_serializer=tei__pb2.EmbedResponse.SerializeToString,
             ),
             'EmbedBatch': grpc.unary_unary_rpc_method_handler(
                     servicer.EmbedBatch,
-                    request_deserializer=proto_dot_tei__pb2.EmbedBatchRequest.FromString,
-                    response_serializer=proto_dot_tei__pb2.EmbedBatchResponse.SerializeToString,
+                    request_deserializer=tei__pb2.EmbedBatchRequest.FromString,
+                    response_serializer=tei__pb2.EmbedBatchResponse.SerializeToString,
+            ),
+            'ClearCache': grpc.unary_unary_rpc_method_handler(
+                    servicer.ClearCache,
+                    request_deserializer=tei__pb2.ClearCacheRequest.FromString,
+                    response_serializer=tei__pb2.ClearCacheResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -100,8 +116,8 @@ class Embed(object):
             request,
             target,
             '/tei.v1.Embed/Embed',
-            proto_dot_tei__pb2.EmbedRequest.SerializeToString,
-            proto_dot_tei__pb2.EmbedResponse.FromString,
+            tei__pb2.EmbedRequest.SerializeToString,
+            tei__pb2.EmbedResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -127,8 +143,35 @@ class Embed(object):
             request,
             target,
             '/tei.v1.Embed/EmbedBatch',
-            proto_dot_tei__pb2.EmbedBatchRequest.SerializeToString,
-            proto_dot_tei__pb2.EmbedBatchResponse.FromString,
+            tei__pb2.EmbedBatchRequest.SerializeToString,
+            tei__pb2.EmbedBatchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ClearCache(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tei.v1.Embed/ClearCache',
+            tei__pb2.ClearCacheRequest.SerializeToString,
+            tei__pb2.ClearCacheResponse.FromString,
             options,
             channel_credentials,
             insecure,

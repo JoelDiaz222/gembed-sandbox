@@ -5,6 +5,7 @@ package tei.v1;
 service Embed {
     rpc Embed (EmbedRequest) returns (EmbedResponse);
     rpc EmbedBatch (EmbedBatchRequest) returns (EmbedBatchResponse);
+    rpc ClearCache (ClearCacheRequest) returns (ClearCacheResponse);
 }
 
 message Metadata {
@@ -54,3 +55,7 @@ message EmbedBatchResponse {
 message Embedding {
     repeated float values = 1;
 }
+
+message ClearCacheRequest {}
+
+message ClearCacheResponse {}

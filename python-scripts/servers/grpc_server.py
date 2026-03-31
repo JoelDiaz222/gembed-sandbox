@@ -1,5 +1,5 @@
 import asyncio
-
+import gc
 import embed_anything
 import grpc
 import tei_pb2 as pb2
@@ -45,6 +45,12 @@ class EmbedService(pb2_grpc.EmbedServicer):
             response.embeddings.append(embedding_msg)
 
         return response
+
+    async def ClearCache(self, request, context):
+        global model_cache
+        model_cache.clear()
+        gc.collect()
+        return pb2.ClearCacheResponse()
 
 
 async def serve():

@@ -55,6 +55,13 @@ class EmbedAnythingGrpcClient:
         response = self.stub.EmbedBatch(request)
         return [list(emb.values) for emb in response.embeddings]
 
+    def clear_cache(self):
+        try:
+            request = pb2.ClearCacheRequest()
+            self.stub.ClearCache(request)
+        except grpc.RpcError:
+            pass
+
     def close(self):
         self.channel.close()
 
@@ -78,6 +85,12 @@ class EmbedAnythingHttpClient:
         response.raise_for_status()
         data = response.json()
         return [item["embedding"] for item in data["data"]]
+
+    def clear_cache(self):
+        try:
+            self.session.post(f"{self.base_url}/v1/clear_cache")
+        except requests.exceptions.RequestException:
+            pass
 
 
 # =============================================================================
@@ -337,6 +350,8 @@ def main():
                     results_by_size[size][method_name] = result
                     print(f"  {method_name}: {result.time_s:.2f}s", flush=True)
                     clear_model_cache()
+                    grpc_client.clear_cache()
+                    http_client.clear_cache()
                 finally:
                     conn.close()
 

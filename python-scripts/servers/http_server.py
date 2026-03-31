@@ -1,3 +1,4 @@
+import gc
 from typing import List
 
 import embed_anything
@@ -46,6 +47,13 @@ async def create_embeddings(request: EmbeddingRequest):
     ]
 
     return EmbeddingResponse(data=data, model=request.model)
+
+@app.post("/v1/clear_cache")
+async def clear_cache():
+    global model_cache
+    model_cache.clear()
+    gc.collect()
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
