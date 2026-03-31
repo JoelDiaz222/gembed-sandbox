@@ -61,24 +61,24 @@ STYLE_MAP = {
 
 LABEL_MAP = {
     'pg': 'PostgreSQL',
-    'pg_local': 'PG (Local)',
+    'pg_local': 'PG Local',
     'pg_mono_store': 'Mono-Store (PG, Local)',
     'mono_store': 'Mono-Store (PG, Local)',
-    'internal': 'PG (Local)',
-    'pg_grpc': 'PG (gRPC)',
-    'pg_http': 'PG (HTTP)',
-    'pg_indexed': 'PG (Local, Immediate Index)',
-    'pg_deferred': 'PG (Local, Deferred Index)',
-    'pg_local_indexed': 'PG (Local, Immediate Index)',
-    'pg_local_deferred': 'PG (Local, Deferred Index)',
+    'internal': 'PG Local',
+    'pg_grpc': 'PG gRPC',
+    'pg_http': 'PG HTTP',
+    'pg_indexed': 'PG Local Immediate',
+    'pg_deferred': 'PG Local Deferred',
+    'pg_local_indexed': 'PG Local Immediate',
+    'pg_local_deferred': 'PG Local Deferred',
     'pg_mono_indexed': 'Mono-Store (PG, Local, Immediate Index)',
     'pg_mono_deferred': 'Mono-Store (PG, Local, Deferred Index)',
     'pg_grpc_indexed': 'PG (gRPC, Immediate Index)',
     'pg_grpc_deferred': 'PG (gRPC, Deferred Index)',
     'ext_direct': 'App. Local',
     'external': 'PG External Client',
-    'ext_direct_indexed': 'App. Local (Immediate Index)',
-    'ext_direct_deferred': 'App. Local (Deferred Index)',
+    'ext_direct_indexed': 'App. Local Immediate',
+    'ext_direct_deferred': 'App. Local Deferred',
     'pg_unified': 'PG Local',
     'pg_direct': 'App. Local',
     'pg_gembed_unified': 'PG Local',
@@ -86,15 +86,16 @@ LABEL_MAP = {
     'ext_http': 'App. HTTP',
     'chroma': 'ChromaDB',
     'qdrant': 'Qdrant',
-    'poly_chroma': 'Poly-Store (PG, ChromaDB)',
-    'poly_qdrant': 'Poly-Store (PG, Qdrant)',
-    'two_step_chroma': 'Poly-Store (PG, ChromaDB)',
-    'two_step_qdrant': 'Poly-Store (PG, Qdrant)',
-    'qd_indexed': 'Qdrant (Immediate Index)',
-    'qd_deferred': 'Qdrant (Deferred Index)',
+    'poly_chroma': 'Poly-Store (with ChromaDB)',
+    'poly_qdrant': 'Poly-Store (with Qdrant)',
+    'two_step_chroma': 'Poly-Store (with ChromaDB)',
+    'two_step_qdrant': 'Poly-Store (with Qdrant)',
+    'qd_indexed': 'Qdrant Immediate',
+    'qd_deferred': 'Qdrant Deferred',
     'mono_pg_unified_deferred': 'Mono-Store (PG Local Deferred)',
+    'mono_pg_direct_deferred': 'Mono-Store (App. Local Deferred)',
     'mono_ext_direct_deferred': 'Mono-Store (App. Local Deferred)',
-    'poly_qdrant_deferred': 'Poly-Store (PG, Qdrant Deferred)',
+    'poly_qdrant_deferred': 'Poly-Store (with Qdrant Deferred)',
     'embed_anything': 'EmbedAnything (Candle, CUDA)',
     'ort': 'ONNX Runtime (CPU)',
     # Benchmark 7 adapters
@@ -260,7 +261,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
             y_vals = [r[method].get('throughput', 0) for r in all_results if
                       method in r]
             std_vals = [r[method].get('throughput_std', 0) for r in all_results if
-                       method in r]
+                        method in r]
             # Symmetric error bars tracking std
             y_errs = std_vals
             if not any(y_vals): continue
@@ -302,7 +303,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
             y_vals = [r[method].get('throughput', 0) for r in all_results if
                       method in r]
             std_vals = [r[method].get('throughput_std', 0) for r in all_results if
-                       method in r]
+                        method in r]
 
             if not any(y_vals): continue
 
