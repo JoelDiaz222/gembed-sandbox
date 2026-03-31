@@ -1,8 +1,0 @@
-% Speedup relative to ort_openai/clip-vit-base-patch32 
-\begin{tabular}{lccccc}
-\toprule
-\textbf{Input Size} & \textbf{EmbedAnything (Candle, CUDA) / openai/clip-vit-base-patch32} & \textbf{EmbedAnything (Candle, CUDA) / openai/clip-vit-large-patch14} & \textbf{ONNX Runtime (CPU) / openai/clip-vit-large-patch14} & \textbf{EmbedAnything (Candle, CUDA) / google/siglip-large-patch16-384} & \textbf{ONNX Runtime (CPU) / google/siglip-large-patch16-384} \\
-\midrule
-1024 & \textbf{5.6x} & 1.7x & 0.1x & 0.9x & 0.1x \\
-\bottomrule
-\end{tabular}
