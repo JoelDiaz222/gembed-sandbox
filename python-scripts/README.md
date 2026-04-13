@@ -19,6 +19,11 @@ python-scripts/
 ├── 1_internal-vs-external-gen/         # Benchmark 1: Embedding generation methods
 ├── 2_pg_gembed-vs-vectordbs/           # Benchmark 2: Generation + storage comparison
 ├── 3_mono-store-vs-poly-store/         # Benchmark 3: Architecture comparison
+├── 4_tpcx-ai-uc4/                      # Benchmark 4: TPC-x AI Use Case 4
+├── 5_tpcx-ai-uc9/                      # Benchmark 5: TPC-x AI Use Case 9
+├── 6_extensibility/                    # Benchmark 6: Image embedding backend comparison
+├── 7_portability/                      # Benchmark 7: Multi-adapter portability
+└── 8_measure_gembed_overhead/          # Benchmark 8: Gembed stack overhead analysis
 ```
 
 ## Setup
@@ -123,6 +128,45 @@ Each scenario compares:
 ```bash
 PYTHONPATH=.:proto python3.13 3_mono-store-vs-poly-store/benchmark.py
 ```
+
+### Benchmark 8: Gembed Stack Overhead Analysis
+
+**Directory:** `8_measure_gembed_overhead/`
+
+> **Requires:** `pg_gembed` compiled from the `feature/telemetry` branch.
+
+Quantifies the latency overhead introduced by the full Gembed stack
+(C extension → C→Rust FFI → EmbedAnything backend) by reading internal
+timestamp checkpoints written to `/tmp/gembed_telemetry_log`.
+
+Measured overhead components (all in µs):
+
+| Component | What it covers |
+|---|---|
+| `validate_backend_us` | `validate_backend()` FFI call |
+| `validate_model_us` | `validate_model()` FFI call |
+| `pre_ffi_overhead_us` | C processing before the FFI boundary |
+| `ffi_roundtrip_us` | Full C→Rust→C crossing |
+| `rs_dispatch_us` | Rust backend dispatch before EmbedAnything |
+| `pure_embedding_us` | Actual EmbedAnything / Candle inference |
+| `rs_to_c_return_us` | Rust→C return path |
+| `post_ffi_overhead_us` | C processing after FFI returns |
+| **Stack overhead %** | `100 × (wall − inference) / wall` |
+
+Produces a stacked-bar chart (PDF + PNG) and a LaTeX table with
+mean ± std over 10 orchestrated runs.
+
+```bash
+# Single run
+PYTHONPATH=. venv/bin/python 8_measure_gembed_overhead/benchmark.py \
+    --sizes 1 8 64 512 4096
+
+# Full orchestrated run (10 × each size, generates plot + LaTeX table)
+./orchestrator.sh 8_measure_gembed_overhead
+```
+
+See [`8_measure_gembed_overhead/README.md`](8_measure_gembed_overhead/README.md)
+for full setup instructions.
 
 ## Benchmark Data
 
