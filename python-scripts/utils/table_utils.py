@@ -74,6 +74,10 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
 
     if not methods:
         print(f"No methods found in CSV: {csv_file}")
+        # Check whether this is a benchmark-8 overhead CSV despite having no
+        # standard methods — if so, delegate to the overhead table generator.
+        if _is_overhead_csv(df):
+            return generate_tables_b8(df, output_path, timestamp)
         return
 
     # Place ChromaDB before Qdrant
@@ -230,3 +234,112 @@ def generate_tables_from_csv(csv_file: str, output_dir: str, timestamp: str, met
                 f.write(sp_latex)
 
             print(f"Speedup table saved to {sp_filepath}")
+
+
+# ---------------------------------------------------------------------------
+# Benchmark 8: Measure Gembed overhead
+# ---------------------------------------------------------------------------
+
+def _is_overhead_csv(df) -> bool:
+    """Return True when the CSV has the benchmark-8 overhead column schema."""
+    return 'wall_time_us' in df.columns and 'ffi_roundtrip_us' in df.columns
+
+
+def generate_tables_b8(df, output_path: Path, timestamp: str):
+    """
+    Generate a booktabs LaTeX table for Benchmark 8 (Gembed overhead).
+
+    Rows: overhead component / total wall time / stack overhead %.
+    Columns: batch sizes.
+    All values are mean ± std over all rows for that size.
+    """
+    sizes = sorted(df['size'].unique().tolist())
+
+    components = [
+        ('validate_backend_us',  r'\texttt{validate\_backend()}'),
+        ('validate_model_us',    r'\texttt{validate\_model()}'),
+        ('pre_ffi_overhead_us',  r'Pre-FFI C overhead'),
+        ('ffi_roundtrip_us',     r'FFI roundtrip (C\,$\leftrightarrow$\,Rust)'),
+        ('rs_dispatch_us',       r'Rust backend dispatch'),
+        ('pure_embedding_us',    r'EmbedAnything inference'),
+        ('rs_to_c_return_us',    r'Rust\,$\to$\,C return'),
+        ('post_ffi_overhead_us', r'Post-FFI C overhead'),
+    ]
+
+    # Aggregate per size
+    agg = {}  # size -> {col: (mean, std)}
+    all_cols = [c for c, _ in components] + ['wall_time_us']
+    for sz in sizes:
+        sub = df[df['size'] == sz]
+        agg[sz] = {}
+        for col in all_cols:
+            vals = sub[col].dropna().values if col in sub.columns else np.array([])
+            agg[sz][col] = (
+                float(np.mean(vals)) if len(vals) else 0.0,
+                float(np.std(vals))  if len(vals) else 0.0,
+            )
+
+    col_spec = 'l' + 'r' * len(sizes)
+    size_headers = ' & '.join(f'$n={s}$' for s in sizes)
+
+    lines = [
+        r'\begin{table}[t]',
+        r'  \centering',
+        r'  \small',
+        r'  \caption{Gembed stack overhead breakdown (mean\,$\pm$\,std, in \textmu{}s)'
+        r'           across batch sizes. Backend: \texttt{embed\_anything},'
+        r'           model: \texttt{MiniLM\mbox{-}L6\mbox{-}v2} (warm model cache).}',
+        r'  \label{tab:gembed_overhead}',
+        f'  \\begin{{tabular}}{{{col_spec}}}',
+        r'    \toprule',
+        f'    \\textbf{{Component}} & {size_headers} \\\\',
+        r'    \midrule',
+    ]
+
+    for col, label in components:
+        parts = []
+        for sz in sizes:
+            mean_us, std_us = agg[sz].get(col, (0.0, 0.0))
+            parts.append(f'${mean_us:.0f}\\pm{std_us:.0f}$')
+        lines.append(f'    {label} & {" & ".join(parts)} \\\\')
+
+    # Wall-time row
+    lines.append(r'    \midrule')
+    wall_parts = []
+    for sz in sizes:
+        m, s = agg[sz].get('wall_time_us', (0.0, 0.0))
+        wall_parts.append(f'${m:.0f}\\pm{s:.0f}$')
+    lines.append(
+        r'    \textbf{Wall time (Python)} & '
+        + ' & '.join(wall_parts)
+        + r' \\'
+    )
+
+    # Stack overhead % row
+    lines.append(r'    \midrule')
+    pct_parts = []
+    for sz in sizes:
+        wall_mean, _ = agg[sz].get('wall_time_us', (0.0, 0.0))
+        emb_mean, emb_std = agg[sz].get('pure_embedding_us', (0.0, 0.0))
+        if wall_mean > 0:
+            pct = 100.0 * (wall_mean - emb_mean) / wall_mean
+            pct_std = 100.0 * emb_std / wall_mean
+            pct_parts.append(f'${pct:.1f}\\%\\pm{pct_std:.1f}\\%$')
+        else:
+            pct_parts.append('--')
+    lines.append(
+        r'    \textbf{Stack overhead} & '
+        + ' & '.join(pct_parts)
+        + r' \\'
+    )
+
+    lines += [
+        r'    \bottomrule',
+        r'  \end{tabular}',
+        r'\end{table}',
+    ]
+
+    tex_path = output_path / f'overhead_table_{timestamp}.tex'
+    tex_path.write_text('\n'.join(lines) + '\n')
+    print(f"LaTeX overhead table saved to {tex_path}")
+

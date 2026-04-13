@@ -325,8 +325,13 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
 
         plt.xlabel('Input Size (Log Scale)')
-        baseline_label = LABEL_MAP.get(baseline_method, baseline_method)
-        plt.ylabel(f'Relative Throughput (vs {baseline_label})')
+
+        if baseline_method in ['mono_pg_direct_deferred', 'mono_ext_direct_deferred']:
+            y_axis_baseline_name = 'App. Local Deferred'
+        else:
+            y_axis_baseline_name = LABEL_MAP.get(baseline_method, baseline_method)
+
+        plt.ylabel(f'Relative Throughput (vs {y_axis_baseline_name})')
 
         plt.legend(loc='best', frameon=True, framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.3)
@@ -474,7 +479,7 @@ def generate_plots_b6(
         )
 
     ax.set_xticks(list(x))
-    ax.set_xticklabels(seen_models, rotation=15, ha='right')
+    ax.set_xticklabels(seen_models, rotation=15, ha='center')
     ax.set_xlabel('Model')
     ax.set_ylabel(r'Throughput (img/s)')
 
@@ -648,6 +653,11 @@ def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if _is_overhead_csv(df):
+        generate_plots_b8(df, output_dir, timestamp)
+        print(f"Overhead plots generated from CSV: {csv_file}")
+        return
+
     # Extract method names from columns
     methods = []
     for col in df.columns:
@@ -701,3 +711,83 @@ def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
     else:
         generate_plots(all_results, output_dir, timestamp, methods)
     print(f"Plots generated from CSV: {csv_file}")
+
+
+def _is_overhead_csv(df) -> bool:
+    """Return True when the CSV has the benchmark-8 overhead column schema."""
+    return 'wall_time_us' in df.columns and 'ffi_roundtrip_us' in df.columns
+
+
+def generate_plots_b8(df, output_dir, timestamp: str):
+    """
+    Generate the overhead breakdown stacked-bar chart for Benchmark 8.
+    """
+    import numpy as np
+
+    configure_latex_style()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    sizes = sorted(df['size'].unique().tolist())
+
+    # Overhead components with distinct colors and hatch patterns for paper readability
+    components = [
+        ('validate_backend_us', r'validate\_backend()', '#003f5c', ''),
+        ('validate_model_us', r'validate\_model()', '#444e86', '//'),
+        ('pre_ffi_overhead_us', r'Pre-FFI C overhead', '#955196', '\\\\'),
+        ('rs_dispatch_us', r'Rust dispatch', '#dd5182', '..'),
+        ('pure_embedding_us', r'EmbedAnything inference', '#ff6e54', 'xx'),
+        ('rs_to_c_return_us', r'Rs\,$\to$\,C return', '#ffa600', '++'),
+        ('post_ffi_overhead_us', r'Post-FFI C overhead', '#00af91', '||'),
+    ]
+
+    # Aggregate per size
+    agg = {}  # size -> {col: (mean, std)}
+    for sz in sizes:
+        sub = df[df['size'] == sz]
+        agg[sz] = {}
+        for col, _, _, _ in components:
+            vals = sub[col].dropna().values if col in sub.columns else np.array([])
+            agg[sz][col] = (float(np.mean(vals)) if len(vals) else 0.0,
+                            float(np.std(vals)) if len(vals) else 0.0)
+        for col in ('wall_time_us', 'total_c_ext_us'):
+            vals = sub[col].dropna().values if col in sub.columns else np.array([])
+            agg[sz][col] = (float(np.mean(vals)) if len(vals) else 0.0,
+                            float(np.std(vals)) if len(vals) else 0.0)
+
+    x = list(range(len(sizes)))
+    xlabels = [str(s) for s in sizes]
+
+    # Standardized figure size for paper plots
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    bottoms = [0.0] * len(sizes)
+    for col, label, color, hatch in components:
+        heights = [agg[s][col][0] / 1_000.0 for s in sizes]  # µs → ms
+        ax.bar(x, heights, bottom=bottoms, label=label, color=color,
+               hatch=hatch, edgecolor='white', linewidth=0.5, zorder=3)
+        bottoms = [b + h for b, h in zip(bottoms, heights)]
+
+    # ±1σ error bars on total wall time
+    wall_means = [agg[s]['wall_time_us'][0] / 1_000.0 for s in sizes]
+    wall_stds = [agg[s]['wall_time_us'][1] / 1_000.0 for s in sizes]
+    ax.errorbar(x, wall_means, yerr=wall_stds, fmt='none', color='#333333',
+                capsize=4, linewidth=1.5, zorder=4)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(xlabels)
+    ax.set_xlabel(r'Batch size (\# texts)')
+    ax.set_ylabel(r'Time (ms)')
+
+    # Paper style: Use best legend placement and remove plot title
+    ax.legend(frameon=True, framealpha=0.9, loc='best')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / f'overhead_breakdown_{timestamp}.pdf',
+                format='pdf', bbox_inches='tight')
+    plt.savefig(output_dir / f'overhead_breakdown_{timestamp}.png',
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Benchmark 8 plot saved to {output_dir}")
