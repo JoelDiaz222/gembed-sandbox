@@ -93,4 +93,4 @@ benchmarks:
     enabled: true
     script: "8_measure_gembed_overhead/benchmark.py"
     runs: 10
-    sizes: [ 1, 2, 4, 8, 16 ]
+    sizes: [ 1, 32 ]

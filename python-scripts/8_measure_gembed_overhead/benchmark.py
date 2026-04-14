@@ -126,16 +126,16 @@ def compute_intervals(ts: Dict[str, int], size: int, wall_us: float) -> Dict:
     return {
         "size": size,
         "wall_time_us": wall_us,
-        "total_c_ext_us": gap("c_embed_batch_text_entry", "c_embed_batch_text_done"),
+        "total_c_ext_us": gap("c_ext_entry_embed_texts", "c_ext_exit_embed_texts"),
         "validate_backend_us": gap("c_validate_backend_start", "c_validate_backend_done"),
         "validate_model_us": gap("c_validate_model_start", "c_validate_model_done"),
         "validation_total_us": gap("c_validate_backend_start", "c_validate_model_done"),
-        "pre_ffi_overhead_us": gap("c_embed_batch_text_entry", "c_pre_ffi"),
+        "pre_ffi_overhead_us": gap("c_ext_entry_embed_texts", "c_pre_ffi"),
         "ffi_roundtrip_us": gap("c_pre_ffi", "c_post_ffi"),
         "rs_dispatch_us": gap("rs_pre_embed", "rs_ea_embed_texts_start"),
         "pure_embedding_us": gap("rs_ea_embed_texts_start", "rs_ea_embed_texts_done"),
         "rs_to_c_return_us": gap("rs_post_embed", "c_post_ffi"),
-        "post_ffi_overhead_us": gap("c_post_ffi", "c_embed_batch_text_done"),
+        "post_ffi_overhead_us": gap("c_post_ffi", "c_ext_exit_embed_texts"),
     }
 
 
