@@ -1,0 +1,24 @@
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Gembed stack overhead breakdown (mean\,$\pm$\,std, in \textmu{}s)           across batch sizes. Backend: \texttt{embed\_anything},           model: \texttt{MiniLM\mbox{-}L6\mbox{-}v2} (warm model cache).}
+  \label{tab:gembed_overhead}
+  \begin{tabular}{lrr}
+    \toprule
+    \textbf{Component} & $n=1$ & $n=32$ \\
+    \midrule
+    \texttt{validate\_backend()} & $1\pm1$ & $2\pm0$ \\
+    \texttt{validate\_model()} & $1\pm1$ & $2\pm1$ \\
+    Pre-FFI C overhead & $8\pm3$ & $17\pm3$ \\
+    FFI roundtrip (C\,$\leftrightarrow$\,Rust) & $1657\pm653$ & $73497\pm13165$ \\
+    Rust backend dispatch & $2\pm1$ & $6\pm1$ \\
+    EmbedAnything inference & $1650\pm653$ & $73480\pm13169$ \\
+    Rust\,$\to$\,C return & $1\pm1$ & $1\pm0$ \\
+    Post-FFI C overhead & $3\pm1$ & $33\pm4$ \\
+    \midrule
+    \textbf{Wall time (Python)} & $1775\pm654$ & $74013\pm13159$ \\
+    \midrule
+    \textbf{Stack overhead} & $7.1\%\pm36.8\%$ & $0.7\%\pm17.8\%$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
