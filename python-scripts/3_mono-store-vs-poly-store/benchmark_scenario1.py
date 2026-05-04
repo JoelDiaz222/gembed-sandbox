@@ -83,10 +83,10 @@ def setup_pg_database(conn):
                 EXTENSION IF NOT EXISTS vector;
                 CREATE
                 EXTENSION IF NOT EXISTS pg_gembed;
-                DROP TABLE IF EXISTS product_categories CASCADE;
-                DROP TABLE IF EXISTS reviews CASCADE;
-                DROP TABLE IF EXISTS products CASCADE;
-                CREATE TABLE products
+                DROP TABLE IF EXISTS product_category CASCADE;
+                DROP TABLE IF EXISTS review CASCADE;
+                DROP TABLE IF EXISTS product CASCADE;
+                CREATE TABLE product
                 (
                     product_id  SERIAL PRIMARY KEY,
                     name        TEXT NOT NULL,
@@ -95,17 +95,17 @@ def setup_pg_database(conn):
                     stock_count INTEGER DEFAULT 0,
                     embedding   vector(384)
                 );
-                CREATE TABLE reviews
+                CREATE TABLE review
                 (
                     review_id   SERIAL PRIMARY KEY,
-                    product_id  INTEGER REFERENCES products (product_id),
+                    product_id  INTEGER REFERENCES product (product_id),
                     rating      INTEGER CHECK (rating BETWEEN 1 AND 5),
                     review_text TEXT,
                     created_at  TIMESTAMP DEFAULT NOW()
                 );
-                CREATE TABLE product_categories
+                CREATE TABLE product_category
                 (
-                    product_id    INTEGER REFERENCES products (product_id),
+                    product_id    INTEGER REFERENCES product (product_id),
                     category_name TEXT,
                     PRIMARY KEY (product_id, category_name)
                 );
@@ -115,7 +115,7 @@ def setup_pg_database(conn):
 
 def truncate_pg_tables(conn):
     cur = conn.cursor()
-    cur.execute("TRUNCATE products, reviews, product_categories CASCADE;")
+    cur.execute("TRUNCATE product, review, product_category CASCADE;")
     cur.close()
 
 
@@ -141,7 +141,7 @@ def batch_insert_products(cur, products: List[dict]) -> List[int]:
                                                  WITH ORDINALITY AS i(name, description, price, stock, ord)),
                      inserted_products AS (
                 INSERT
-                INTO products (name, description, price, stock_count)
+                INTO product (name, description, price, stock_count)
                 SELECT name, description, price, stock
                 FROM input_products RETURNING product_id, name),
                      product_mapping AS (
@@ -151,14 +151,14 @@ def batch_insert_products(cur, products: List[dict]) -> List[int]:
                 ON p.name = i.name),
                     inserted_reviews AS (
                 INSERT
-                INTO reviews (product_id, rating, review_text)
+                INTO review (product_id, rating, review_text)
                 SELECT m.product_id, r.rating, r.text
                 FROM unnest(%s:: int [], %s:: int [], %s::text[]) AS r(p_idx, rating, text)
                     JOIN product_mapping m
                 ON r.p_idx = m.ord),
                     inserted_categories AS (
                 INSERT
-                INTO product_categories (product_id, category_name)
+                INTO product_category (product_id, category_name)
                 SELECT m.product_id, c.cat_name
                 FROM unnest(%s:: int [], %s::text[]) AS c (p_idx, cat_name)
                     JOIN product_mapping m
@@ -183,7 +183,7 @@ def create_chroma_client(base_path: str = "./chroma_bench3_s1", embed_fn: Callab
     client = chromadb.PersistentClient(path=db_path)
     configuration = {"hnsw": {"space": "cosine", "max_neighbors": 16, "ef_construction": 100}}
     emb_obj = EmbeddingWrapper(embed_fn)
-    collection = client.create_collection("products", embedding_function=emb_obj, configuration=configuration)
+    collection = client.create_collection("product", embedding_function=emb_obj, configuration=configuration)
     return client, collection, db_path
 
 
@@ -196,19 +196,19 @@ def cleanup_chroma(client, db_path: str):
 
 def create_qdrant_client():
     client = QdrantClient(url=QDRANT_URL)
-    if client.collection_exists("products"):
-        client.delete_collection("products")
+    if client.collection_exists("product"):
+        client.delete_collection("product")
     hnsw_config = models.HnswConfigDiff(m=16, ef_construct=100)
-    client.create_collection("products",
+    client.create_collection("product",
                              vectors_config=VectorParams(size=384, distance=Distance.COSINE,
                                                          hnsw_config=hnsw_config))
-    client.update_collection("products", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
+    client.update_collection("product", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=0))
     return client
 
 
 def cleanup_qdrant(client):
-    if client.collection_exists("products"):
-        client.delete_collection("products")
+    if client.collection_exists("product"):
+        client.delete_collection("product")
     client.close()
     time.sleep(0.1)
 
@@ -248,34 +248,34 @@ def scenario1_mono_store(conn, products: List[dict]):
                                                  WITH ORDINALITY AS i(name, description, price, stock, full_text, ord)),
                      computed_embeddings AS (SELECT id as ord, embedding
                                              FROM embed_texts_with_ids(
-                                                      'embed_anything', %s,
-                                                      (SELECT array_agg(ord ORDER BY ord) FROM input_products):: int [],
-                                                      (SELECT array_agg(full_text ORDER BY ord) FROM input_products)::text[]
-                                                   )),
+                                                     'embed_anything', %s,
+                                                     (SELECT array_agg(ord ORDER BY ord) FROM input_products):: int [],
+                                                     (SELECT array_agg(full_text ORDER BY ord) FROM input_products)::text[]
+                                                  )),
                      inserted_products AS (
                 INSERT
-                INTO products (product_id, name, description, price, stock_count, embedding)
+                INTO product (product_id, name, description, price, stock_count, embedding)
                 SELECT i.new_id, i.name, i.description, i.price, i.stock, e.embedding
                 FROM input_products i
                          JOIN computed_embeddings e ON i.ord = e.ord
                     ),
                      inserted_reviews AS (
-                         INSERT INTO reviews (product_id, rating, review_text)
+                         INSERT INTO review (product_id, rating, review_text)
                              SELECT i.new_id, r.rating, r.text
                              FROM unnest(%s:: int []
-                    , %s:: int []
-                    , %s::text[]) AS r(p_idx
-                    , rating
-                    , text)
+                   , %s:: int []
+                   , %s::text[]) AS r(p_idx
+                   , rating
+                   , text)
                     JOIN input_products i ON r.p_idx = i.ord)
-                    , inserted_categories AS (
-                    INSERT INTO product_categories (product_id
-                    , category_name)
+                   , inserted_categories AS (
+                    INSERT INTO product_category (product_id
+                   , category_name)
                     SELECT i.new_id
-                    , c.cat_name
+                   , c.cat_name
                     FROM unnest(%s:: int []
-                    , %s::text[]) AS c (p_idx
-                    , cat_name)
+                   , %s::text[]) AS c (p_idx
+                   , cat_name)
                     JOIN input_products i ON c.p_idx = i.ord)
                 SELECT 1;
                 """, (names, descriptions, prices, stocks, full_texts,
@@ -283,7 +283,7 @@ def scenario1_mono_store(conn, products: List[dict]):
                       review_p_indices, review_ratings, review_texts,
                       category_p_indices, category_names))
     cur.execute(
-        "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
+        "CREATE INDEX ON product USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
     cur.close()
 
 
@@ -293,11 +293,7 @@ def scenario1_mono_direct(conn, products: List[dict], embed_client):
     embeddings = embed_client.embed(full_texts)
 
     cur = conn.cursor()
-    # Insert products with embeddings
-    # Using a slightly simplified version of the batch insert for multi-table insertion
-    # We first insert products to get IDs, then reviews and categories.
 
-    # Insert products
     names = [p['name'] for p in products]
     descriptions = [p['description'] for p in products]
     prices = [p['price'] for p in products]
@@ -312,7 +308,7 @@ def scenario1_mono_direct(conn, products: List[dict], embed_client):
                                                    WITH ORDINALITY AS e(embedding, ord)),
                      inserted_products AS (
                 INSERT
-                INTO products (name, description, price, stock_count, embedding)
+                INTO product (name, description, price, stock_count, embedding)
                 SELECT i.name, i.description, i.price, i.stock, e.embedding
                 FROM input_products i
                          JOIN input_embeddings e ON i.ord = e.ord RETURNING product_id, name),
@@ -323,14 +319,14 @@ def scenario1_mono_direct(conn, products: List[dict], embed_client):
                 ON p.name = i.name),
                     inserted_reviews AS (
                 INSERT
-                INTO reviews (product_id, rating, review_text)
+                INTO review (product_id, rating, review_text)
                 SELECT m.product_id, r.rating, r.text
                 FROM unnest(%s:: int [], %s:: int [], %s::text[]) AS r(p_idx, rating, text)
                     JOIN product_mapping m
                 ON r.p_idx = m.ord),
                     inserted_categories AS (
                 INSERT
-                INTO product_categories (product_id, category_name)
+                INTO product_category (product_id, category_name)
                 SELECT m.product_id, c.cat_name
                 FROM unnest(%s:: int [], %s::text[]) AS c (p_idx, cat_name)
                     JOIN product_mapping m
@@ -346,7 +342,7 @@ def scenario1_mono_direct(conn, products: List[dict], embed_client):
                       [c for p in products for c in p['categories']]))
 
     cur.execute(
-        "CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
+        "CREATE INDEX ON product USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
     cur.close()
 
 
@@ -368,8 +364,8 @@ def scenario1_poly_store_qdrant(conn, products: List[dict], embed_client, qdrant
     embeddings = embed_client.embed(documents)
     points = [PointStruct(id=pid, vector=emb, payload={"text": doc})
               for pid, emb, doc in zip(product_ids, embeddings, documents)]
-    qdrant_client.upsert(collection_name="products", points=points, wait=True)
-    qdrant_client.update_collection("products", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
+    qdrant_client.upsert(collection_name="product", points=points, wait=True)
+    qdrant_client.update_collection("product", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
     cur.close()
 
 

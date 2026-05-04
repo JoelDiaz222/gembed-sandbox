@@ -105,8 +105,8 @@ def setup_database(conn):
                 EXTENSION IF NOT EXISTS vector;
                 CREATE
                 EXTENSION IF NOT EXISTS pg_gembed;
-                DROP TABLE IF EXISTS embeddings_test;
-                CREATE TABLE embeddings_test
+                DROP TABLE IF EXISTS review;
+                CREATE TABLE review
                 (
                     id        SERIAL PRIMARY KEY,
                     text      TEXT,
@@ -119,7 +119,7 @@ def setup_database(conn):
 def truncate_table(conn):
     """Clear test table."""
     cur = conn.cursor()
-    cur.execute("TRUNCATE embeddings_test;")
+    cur.execute("TRUNCATE review;")
     cur.close()
 
 
@@ -130,7 +130,7 @@ def benchmark_internal_db_gen(conn, texts: List[str], backend: str, model: str):
     sql = """
           WITH input_data AS (SELECT %s::text[] AS texts)
           INSERT
-          INTO embeddings_test (text, embedding)
+          INTO review (text, embedding)
           SELECT t, e
           FROM input_data,
                unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
@@ -148,7 +148,7 @@ def benchmark_external_client_gen(conn, texts: List[str], embed_fn: Callable):
 
     execute_values(
         cur,
-        "INSERT INTO embeddings_test (text, embedding) VALUES %s",
+        "INSERT INTO review (text, embedding) VALUES %s",
         list(zip(texts, [np.array(e) for e in embeddings])),
         page_size=len(texts)
     )

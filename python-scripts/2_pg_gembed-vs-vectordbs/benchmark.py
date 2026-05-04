@@ -38,8 +38,8 @@ def setup_pg_schema(conn):
                 EXTENSION IF NOT EXISTS vector;
                 CREATE
                 EXTENSION IF NOT EXISTS pg_gembed;
-                DROP TABLE IF EXISTS embeddings_test;
-                CREATE TABLE embeddings_test
+                DROP TABLE IF EXISTS review;
+                CREATE TABLE review
                 (
                     id        SERIAL PRIMARY KEY,
                     text      TEXT,
@@ -55,7 +55,7 @@ def populate_pg_database(conn, texts: List[str], backend: str):
     sql = """
           WITH input_data AS (SELECT %s::text[] AS texts)
           INSERT
-          INTO embeddings_test (text, embedding)
+          INTO review (text, embedding)
           SELECT t, e
           FROM input_data,
                unnest(texts, embed_texts(%s, %s, texts)) AS x(t, e)
@@ -69,7 +69,7 @@ def setup_pg_indexed(conn, texts: List[str], backend: str):
     setup_pg_schema(conn)
     cur = conn.cursor()
     cur.execute(
-        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+        "CREATE INDEX ON review USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
     populate_pg_database(conn, texts, backend)
     conn.commit()
 
@@ -80,7 +80,7 @@ def setup_pg_deferred(conn, texts: List[str], backend: str):
     populate_pg_database(conn, texts, backend)
     cur = conn.cursor()
     cur.execute(
-        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+        "CREATE INDEX ON review USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
     conn.commit()
     cur.close()
 
@@ -91,7 +91,7 @@ def populate_pg_external(conn, texts: List[str], embed_fn: Callable):
     cur = conn.cursor()
     execute_values(
         cur,
-        "INSERT INTO embeddings_test (text, embedding) VALUES %s",
+        "INSERT INTO review (text, embedding) VALUES %s",
         list(zip(texts, [np.array(e) for e in embeddings])),
         page_size=len(texts)
     )
@@ -103,7 +103,7 @@ def setup_pg_ext_indexed(conn, texts: List[str], embed_fn: Callable):
     setup_pg_schema(conn)
     cur = conn.cursor()
     cur.execute(
-        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+        "CREATE INDEX ON review USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
     populate_pg_external(conn, texts, embed_fn)
     conn.commit()
 
@@ -114,7 +114,7 @@ def setup_pg_ext_deferred(conn, texts: List[str], embed_fn: Callable):
     populate_pg_external(conn, texts, embed_fn)
     cur = conn.cursor()
     cur.execute(
-        "CREATE INDEX ON embeddings_test USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
+        "CREATE INDEX ON review USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);")
     conn.commit()
     cur.close()
 
