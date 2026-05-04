@@ -314,7 +314,7 @@ def scenario2_poly_store_chroma(conn, embed_client, chroma_collection):
         product_ids.append(pid)
         documents.append(f"{name}. {desc}. Price: ${price}. Reviews: {reviews}. Categories: {categories}")
     embeddings = embed_client.embed(documents)
-    chroma_collection.add(ids=[str(pid) for pid in product_ids], embeddings=embeddings, documents=documents)
+    chroma_collection.add(ids=[str(pid) for pid in product_ids], embeddings=embeddings)
     cur.close()
 
 
@@ -343,8 +343,8 @@ def scenario2_poly_store_qdrant(conn, embed_client, qdrant_client):
         product_ids.append(pid)
         documents.append(f"{name}. {desc}. Price: ${price}. Reviews: {reviews}. Categories: {categories}")
     embeddings = embed_client.embed(documents)
-    points = [PointStruct(id=pid, vector=emb, payload={"text": doc})
-              for pid, emb, doc in zip(product_ids, embeddings, documents)]
+    points = [PointStruct(id=pid, vector=emb)
+              for pid, emb in zip(product_ids, embeddings)]
     qdrant_client.upsert(collection_name="product", points=points, wait=True)
     qdrant_client.update_collection("product", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
     cur.close()

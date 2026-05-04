@@ -243,7 +243,7 @@ def scenario1_mono_store(conn, products: List[dict]):
                                                stock,
                                                full_text,
                                                ord,
-                                               nextval('products_product_id_seq') as new_id
+                                               nextval('product_product_id_seq') as new_id
                                         FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[], %s::text[])
                                                  WITH ORDINALITY AS i(name, description, price, stock, full_text, ord)),
                      computed_embeddings AS (SELECT id as ord, embedding
@@ -352,7 +352,7 @@ def scenario1_poly_store_chroma(conn, products: List[dict], embed_client, chroma
     product_ids = batch_insert_products(cur, products)
     documents = [build_embedding_context(p) for p in products]
     embeddings = embed_client.embed(documents)
-    chroma_collection.add(ids=[str(pid) for pid in product_ids], embeddings=embeddings, documents=documents)
+    chroma_collection.add(ids=[str(pid) for pid in product_ids], embeddings=embeddings)
     cur.close()
 
 
@@ -362,8 +362,8 @@ def scenario1_poly_store_qdrant(conn, products: List[dict], embed_client, qdrant
     product_ids = batch_insert_products(cur, products)
     documents = [build_embedding_context(p) for p in products]
     embeddings = embed_client.embed(documents)
-    points = [PointStruct(id=pid, vector=emb, payload={"text": doc})
-              for pid, emb, doc in zip(product_ids, embeddings, documents)]
+    points = [PointStruct(id=pid, vector=emb)
+              for pid, emb in zip(product_ids, embeddings)]
     qdrant_client.upsert(collection_name="product", points=points, wait=True)
     qdrant_client.update_collection("product", optimizer_config=models.OptimizersConfigDiff(indexing_threshold=20000))
     cur.close()
