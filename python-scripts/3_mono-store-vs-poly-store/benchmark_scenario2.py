@@ -25,6 +25,32 @@ from utils.benchmark_utils import (
 from utils.plot_utils import save_single_run_csv
 
 OUTPUT_DIR = Path(__file__).parent / "output"
+CHROMA_MAX_SIZE = 4096
+
+PRODUCT_TEXT_QUERY = """
+                     WITH review_texts AS (SELECT product_id,
+                                                  string_agg(review_text, ' | ' ORDER BY review_id) AS reviews_text
+                                           FROM (SELECT product_id,
+                                                        review_id,
+                                                        review_text,
+                                                        row_number() OVER (PARTITION BY product_id ORDER BY review_id) AS rn
+                                                 FROM review) r
+                                           WHERE rn <= 5
+                                           GROUP BY product_id),
+                          category_texts AS (SELECT product_id,
+                                                    string_agg(category_name, ', ' ORDER BY category_name) AS categories_text
+                                             FROM product_category
+                                             GROUP BY product_id)
+                     SELECT p.product_id,
+                            p.name || '. ' || p.description ||
+                            '. Price: $' || to_char(p.price, 'FM999999990.00') ||
+                            '. Reviews: ' || COALESCE(r.reviews_text, 'No reviews') ||
+                            '. Categories: ' || COALESCE(c.categories_text, 'Uncategorized') AS full_text
+                     FROM product p
+                              LEFT JOIN review_texts r ON r.product_id = p.product_id
+                              LEFT JOIN category_texts c ON c.product_id = p.product_id
+                     ORDER BY p.product_id
+                     """
 
 
 # =============================================================================
@@ -218,26 +244,16 @@ def cleanup_qdrant(client):
 def scenario2_mono_store(conn):
     """Generate embeddings for pre-existing data in PG."""
     cur = conn.cursor()
-    cur.execute("""
-                WITH product_data AS (SELECT p.product_id,
-                                             p.name || '. ' || p.description ||
-                                             '. Price: $' || p.price::text ||
-                                             '. Reviews: ' || COALESCE(
-                                                     (SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
-                                                      FROM (SELECT review_text, created_at
-                                                            FROM review
-                                                            WHERE product_id = p.product_id
-                                                            LIMIT 5) r), 'No reviews') ||
-                                             '. Categories: ' || COALESCE(
-                                                     (SELECT string_agg(category_name, ', ')
-                                                      FROM product_category
-                                                      WHERE product_id = p.product_id), 'Uncategorized') AS full_text
-                                      FROM product p),
+    cur.execute(f"""
+                WITH product_data AS ({PRODUCT_TEXT_QUERY}),
                      embeddings AS (SELECT id, embedding
-                                    FROM embed_texts_with_ids(
-                                            'embed_anything', %s,
-                                            (SELECT array_agg(product_id ORDER BY product_id) FROM product_data):: int [],
-                                            (SELECT array_agg(full_text ORDER BY product_id) FROM product_data)::text[]))
+                                    FROM unnest(
+                                            (SELECT array_agg(product_id ORDER BY product_id) FROM product_data)::int[],
+                                            embed_texts(
+                                                    'embed_anything', %s,
+                                                    (SELECT array_agg(full_text ORDER BY product_id) FROM product_data)::text[]
+                                            )
+                                         ) AS e(id, embedding))
                 UPDATE product p
                 SET embedding = e.embedding FROM embeddings e
                 WHERE p.product_id = e.id;
@@ -250,23 +266,7 @@ def scenario2_mono_store(conn):
 def scenario2_mono_direct(conn, embed_client):
     """Fetch text from PG, generate embeddings from app, store in PG."""
     cur = conn.cursor()
-    cur.execute("""
-                SELECT p.product_id,
-                       p.name || '. ' || p.description ||
-                       '. Price: $' || p.price::text ||
-                       '. Reviews: ' || COALESCE(
-                               (SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
-                                FROM (SELECT review_text, created_at
-                                      FROM review
-                                      WHERE product_id = p.product_id
-                                      LIMIT 5) r), 'No reviews') ||
-                       '. Categories: ' || COALESCE(
-                               (SELECT string_agg(category_name, ', ')
-                                FROM product_category
-                                WHERE product_id = p.product_id), 'Uncategorized') AS full_text
-                FROM product p
-                ORDER BY p.product_id
-                """)
+    cur.execute(PRODUCT_TEXT_QUERY)
     rows = cur.fetchall()
     product_ids, documents = [], []
     for row in rows:
@@ -292,27 +292,13 @@ def scenario2_mono_direct(conn, embed_client):
 def scenario2_poly_store_chroma(conn, embed_client, chroma_collection):
     """Fetch data from PG, embed, store in ChromaDB."""
     cur = conn.cursor()
-    cur.execute("""
-                SELECT p.product_id,
-                       p.name,
-                       p.description,
-                       p.price,
-                       COALESCE((SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
-                                 FROM (SELECT review_text, created_at
-                                       FROM review
-                                       WHERE product_id = p.product_id LIMIT 5) r), 'No reviews'),
-                       COALESCE((SELECT string_agg(category_name, ', ')
-                                 FROM product_category
-                                 WHERE product_id = p.product_id), 'Uncategorized')
-                FROM product p
-                ORDER BY p.product_id
-                """)
+    cur.execute(PRODUCT_TEXT_QUERY)
     rows = cur.fetchall()
     product_ids, documents = [], []
     for row in rows:
-        pid, name, desc, price, reviews, categories = row
+        pid, doc = row
         product_ids.append(pid)
-        documents.append(f"{name}. {desc}. Price: ${price}. Reviews: {reviews}. Categories: {categories}")
+        documents.append(doc)
     embeddings = embed_client.embed(documents)
     chroma_collection.add(ids=[str(pid) for pid in product_ids], embeddings=embeddings)
     cur.close()
@@ -321,27 +307,13 @@ def scenario2_poly_store_chroma(conn, embed_client, chroma_collection):
 def scenario2_poly_store_qdrant(conn, embed_client, qdrant_client):
     """Fetch data from PG, embed, store in Qdrant."""
     cur = conn.cursor()
-    cur.execute("""
-                SELECT p.product_id,
-                       p.name,
-                       p.description,
-                       p.price,
-                       COALESCE((SELECT string_agg(r.review_text, ' | ' ORDER BY r.created_at DESC)
-                                 FROM (SELECT review_text, created_at
-                                       FROM review
-                                       WHERE product_id = p.product_id LIMIT 5) r), 'No reviews'),
-                       COALESCE((SELECT string_agg(category_name, ', ')
-                                 FROM product_category
-                                 WHERE product_id = p.product_id), 'Uncategorized')
-                FROM product p
-                ORDER BY p.product_id
-                """)
+    cur.execute(PRODUCT_TEXT_QUERY)
     rows = cur.fetchall()
     product_ids, documents = [], []
     for row in rows:
-        pid, name, desc, price, reviews, categories = row
+        pid, doc = row
         product_ids.append(pid)
-        documents.append(f"{name}. {desc}. Price: ${price}. Reviews: {reviews}. Categories: {categories}")
+        documents.append(doc)
     embeddings = embed_client.embed(documents)
     points = [PointStruct(id=pid, vector=emb)
               for pid, emb in zip(product_ids, embeddings)]
@@ -434,26 +406,29 @@ def main():
             conn_direct.close()
 
         # Poly-Store Chroma
-        conn_chroma, pg_pid_chroma = connect_and_get_pid()
-        warmup_pg_connection(conn_chroma)
-        setup_pg_database(conn_chroma)
-        insert_product_data(conn_chroma, products)
-        conn_chroma.commit()
-        embed_client.embed(['warmup'])
-        try:
-            client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
+        if size <= CHROMA_MAX_SIZE:
+            conn_chroma, pg_pid_chroma = connect_and_get_pid()
+            warmup_pg_connection(conn_chroma)
+            setup_pg_database(conn_chroma)
+            insert_product_data(conn_chroma, products)
+            conn_chroma.commit()
+            embed_client.embed(['warmup'])
             try:
-                elapsed, _, stats = ResourceMonitor.measure(
-                    py_pid, pg_pid_chroma,
-                    lambda: scenario2_poly_store_chroma(conn_chroma, embed_client, col_c))
-                conn_chroma.commit()
-                results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
-                print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
-                clear_model_cache()
+                client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
+                try:
+                    elapsed, _, stats = ResourceMonitor.measure(
+                        py_pid, pg_pid_chroma,
+                        lambda: scenario2_poly_store_chroma(conn_chroma, embed_client, col_c))
+                    conn_chroma.commit()
+                    results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
+                    print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
+                    clear_model_cache()
+                finally:
+                    cleanup_chroma(client_c, path_c)
             finally:
-                cleanup_chroma(client_c, path_c)
-        finally:
-            conn_chroma.close()
+                conn_chroma.close()
+        else:
+            print(f"  poly_chroma: skipped (cap {CHROMA_MAX_SIZE})", flush=True)
 
         # Poly-Store Qdrant
         conn_qdrant, pg_pid_qdrant = connect_and_get_pid()
@@ -483,6 +458,8 @@ def main():
         entry = {'size': size}
         for method in methods:
             r = results_by_size[size][method]
+            if r is None:
+                continue
             entry[method] = {
                 'time_s': r.time_s,
                 'throughput': size / r.time_s if r.time_s > 0 else 0,

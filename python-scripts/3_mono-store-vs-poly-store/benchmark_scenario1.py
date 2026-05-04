@@ -25,6 +25,7 @@ from utils.benchmark_utils import (
 from utils.plot_utils import save_single_run_csv
 
 OUTPUT_DIR = Path(__file__).parent / "output"
+CHROMA_MAX_SIZE = 4096
 
 
 # =============================================================================
@@ -224,7 +225,6 @@ def scenario1_mono_store(conn, products: List[dict]):
     descriptions = [p['description'] for p in products]
     prices = [p['price'] for p in products]
     stocks = [p['stock'] for p in products]
-    full_texts = [build_embedding_context(p) for p in products]
     review_p_indices, review_ratings, review_texts = [], [], []
     for i, p in enumerate(products):
         for r in p['reviews']:
@@ -241,17 +241,45 @@ def scenario1_mono_store(conn, products: List[dict]):
                                                description,
                                                price,
                                                stock,
-                                               full_text,
                                                ord,
                                                nextval('product_product_id_seq') as new_id
-                                        FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[], %s::text[])
-                                                 WITH ORDINALITY AS i(name, description, price, stock, full_text, ord)),
-                     computed_embeddings AS (SELECT id as ord, embedding
-                                             FROM embed_texts_with_ids(
-                                                     'embed_anything', %s,
-                                                     (SELECT array_agg(ord ORDER BY ord) FROM input_products):: int [],
-                                                     (SELECT array_agg(full_text ORDER BY ord) FROM input_products)::text[]
-                                                  )),
+                                        FROM unnest(%s::text[], %s::text[], %s::numeric[], %s::int[])
+                                                 WITH ORDINALITY AS i(name, description, price, stock, ord)),
+                     input_reviews AS (SELECT p_idx, rating, text, review_ord
+                                       FROM unnest(%s::int[], %s::int[], %s::text[])
+                                                WITH ORDINALITY AS r(p_idx, rating, text, review_ord)),
+                     input_categories AS (SELECT p_idx, cat_name, category_ord
+                                          FROM unnest(%s::int[], %s::text[])
+                                                   WITH ORDINALITY AS c(p_idx, cat_name, category_ord)),
+                     review_texts AS (SELECT p_idx,
+                                             string_agg(text, ' | ' ORDER BY review_ord) AS reviews_text
+                                      FROM (SELECT p_idx,
+                                                   text,
+                                                   review_ord,
+                                                   row_number() OVER (PARTITION BY p_idx ORDER BY review_ord) AS rn
+                                            FROM input_reviews) r
+                                      WHERE rn <= 5
+                                      GROUP BY p_idx),
+                     category_texts AS (SELECT p_idx,
+                                               string_agg(cat_name, ', ' ORDER BY category_ord) AS categories_text
+                                        FROM input_categories
+                                        GROUP BY p_idx),
+                     product_texts AS (SELECT i.ord,
+                                              i.name || '. ' || i.description ||
+                                              '. Price: $' || to_char(i.price, 'FM999999990.00') ||
+                                              '. Reviews: ' || COALESCE(r.reviews_text, 'No reviews') ||
+                                              '. Categories: ' || COALESCE(c.categories_text, 'Uncategorized') AS full_text
+                                       FROM input_products i
+                                                LEFT JOIN review_texts r ON r.p_idx = i.ord
+                                                LEFT JOIN category_texts c ON c.p_idx = i.ord),
+                     computed_embeddings AS (SELECT ord, embedding
+                                             FROM unnest(
+                                                     (SELECT array_agg(ord ORDER BY ord) FROM product_texts)::int[],
+                                                     embed_texts(
+                                                             'embed_anything', %s,
+                                                             (SELECT array_agg(full_text ORDER BY ord) FROM product_texts)::text[]
+                                                     )
+                                                  ) AS e(ord, embedding)),
                      inserted_products AS (
                 INSERT
                 INTO product (product_id, name, description, price, stock_count, embedding)
@@ -262,26 +290,20 @@ def scenario1_mono_store(conn, products: List[dict]):
                      inserted_reviews AS (
                          INSERT INTO review (product_id, rating, review_text)
                              SELECT i.new_id, r.rating, r.text
-                             FROM unnest(%s:: int []
-                   , %s:: int []
-                   , %s::text[]) AS r(p_idx
-                   , rating
-                   , text)
-                    JOIN input_products i ON r.p_idx = i.ord)
+                             FROM input_reviews r
+                                      JOIN input_products i ON r.p_idx = i.ord)
                    , inserted_categories AS (
                     INSERT INTO product_category (product_id
                    , category_name)
                     SELECT i.new_id
                    , c.cat_name
-                    FROM unnest(%s:: int []
-                   , %s::text[]) AS c (p_idx
-                   , cat_name)
-                    JOIN input_products i ON c.p_idx = i.ord)
+                    FROM input_categories c
+                             JOIN input_products i ON c.p_idx = i.ord)
                 SELECT 1;
-                """, (names, descriptions, prices, stocks, full_texts,
-                      EMBED_ANYTHING_MODEL,
+                """, (names, descriptions, prices, stocks,
                       review_p_indices, review_ratings, review_texts,
-                      category_p_indices, category_names))
+                      category_p_indices, category_names,
+                      EMBED_ANYTHING_MODEL))
     cur.execute(
         "CREATE INDEX ON product USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
     cur.close()
@@ -474,26 +496,29 @@ def main():
             conn_direct.close()
 
         # Poly-Store Chroma
-        conn_chroma, pg_pid_chroma = connect_and_get_pid()
-        warmup_pg_connection(conn_chroma)
-        setup_pg_database(conn_chroma)
-        truncate_pg_tables(conn_chroma)
-        conn_chroma.commit()
-        embed_client.embed(['warmup'])
-        try:
-            client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
+        if size <= CHROMA_MAX_SIZE:
+            conn_chroma, pg_pid_chroma = connect_and_get_pid()
+            warmup_pg_connection(conn_chroma)
+            setup_pg_database(conn_chroma)
+            truncate_pg_tables(conn_chroma)
+            conn_chroma.commit()
+            embed_client.embed(['warmup'])
             try:
-                elapsed, _, stats = ResourceMonitor.measure(
-                    py_pid, pg_pid_chroma,
-                    lambda: scenario1_poly_store_chroma(conn_chroma, products, embed_client, col_c))
-                conn_chroma.commit()
-                results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
-                print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
-                clear_model_cache()
+                client_c, col_c, path_c = create_chroma_client(embed_fn=embed_client.embed)
+                try:
+                    elapsed, _, stats = ResourceMonitor.measure(
+                        py_pid, pg_pid_chroma,
+                        lambda: scenario1_poly_store_chroma(conn_chroma, products, embed_client, col_c))
+                    conn_chroma.commit()
+                    results_by_size[size]['poly_chroma'] = BenchmarkResult(elapsed, stats)
+                    print(f"  poly_chroma: {elapsed:.2f}s", flush=True)
+                    clear_model_cache()
+                finally:
+                    cleanup_chroma(client_c, path_c)
             finally:
-                cleanup_chroma(client_c, path_c)
-        finally:
-            conn_chroma.close()
+                conn_chroma.close()
+        else:
+            print(f"  poly_chroma: skipped (cap {CHROMA_MAX_SIZE})", flush=True)
 
         # Poly-Store Qdrant
         conn_qdrant, pg_pid_qdrant = connect_and_get_pid()
@@ -507,7 +532,8 @@ def main():
             try:
                 elapsed, _, stats = ResourceMonitor.measure(
                     py_pid, pg_pid_qdrant,
-                    lambda: scenario1_poly_store_qdrant(conn_qdrant, products, embed_client, qd))
+                    lambda: scenario1_poly_store_qdrant(conn_qdrant, products, embed_client, qd),
+                    container_name=QDRANT_CONTAINER_NAME)
                 conn_qdrant.commit()
                 results_by_size[size]['poly_qdrant_deferred'] = BenchmarkResult(elapsed, stats)
                 print(f"  poly_qdrant_deferred: {elapsed:.2f}s", flush=True)
@@ -523,6 +549,8 @@ def main():
         entry = {'size': size}
         for method in methods:
             r = results_by_size[size][method]
+            if r is None:
+                continue
             entry[method] = {
                 'time_s': r.time_s,
                 'throughput': size / r.time_s if r.time_s > 0 else 0,
