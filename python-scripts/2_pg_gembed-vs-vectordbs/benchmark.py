@@ -24,6 +24,7 @@ from utils.benchmark_utils import (
 from utils.plot_utils import save_single_run_csv
 
 OUTPUT_DIR = Path(__file__).parent / "output"
+CHROMA_MAX_SIZE = 4096
 
 
 # =============================================================================
@@ -361,17 +362,20 @@ def main():
             cleanup_qdrant(client)
 
         # Run Chroma
-        client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
-        embed_client.embed(['warmup'])
-        try:
-            elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
-                                                        lambda: benchmark_chroma(collection, texts,
-                                                                                 embed_client.embed))
-            results_by_size[size]['chroma'] = BenchmarkResult(time_s=elapsed, stats=stats)
-            print(f"  chroma: {elapsed:.2f}s", flush=True)
-            clear_model_cache()
-        finally:
-            cleanup_chroma(client, db_path)
+        if size <= CHROMA_MAX_SIZE:
+            client, collection, db_path = create_chroma_client(embed_fn=embed_client.embed)
+            embed_client.embed(['warmup'])
+            try:
+                elapsed, _, stats = ResourceMonitor.measure(py_pid, None,
+                                                            lambda: benchmark_chroma(collection, texts,
+                                                                                     embed_client.embed))
+                results_by_size[size]['chroma'] = BenchmarkResult(time_s=elapsed, stats=stats)
+                print(f"  chroma: {elapsed:.2f}s", flush=True)
+                clear_model_cache()
+            finally:
+                cleanup_chroma(client, db_path)
+        else:
+            print(f"  chroma: skipped (cap {CHROMA_MAX_SIZE})", flush=True)
 
         pass
 
@@ -385,6 +389,8 @@ def main():
 
         for method_name in methods:
             result = results[method_name]
+            if result is None:
+                continue
             # For single run, extract raw metrics
             stats_dict = {
                 'time_s': result.time_s,
