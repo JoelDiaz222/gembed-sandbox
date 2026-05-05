@@ -225,22 +225,31 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
                    throughput_unit: str = 'rows/s'):
     configure_latex_style()
     output_dir.mkdir(parents=True, exist_ok=True)
-    sizes = [r['size'] for r in all_results]
 
     # Data-driven component detection
     has_pg_data = any(m in r and r[m].get('pg_mem_peak', 0) > 0 for r in all_results for m in methods)
     has_qd_data = any(m in r and r[m].get('qd_mem_peak', 0) > 0 for r in all_results for m in methods)
+
+    def series_for(method, key):
+        points = [
+            (r['size'], r[method].get(key), r[method].get(f'{key}_std', 0))
+            for r in all_results
+            if method in r and key in r[method] and r[method].get(key) is not None
+        ]
+        x_vals = [p[0] for p in points]
+        y_vals = [p[1] for p in points]
+        std_vals = [p[2] or 0 for p in points]
+        return x_vals, y_vals, std_vals
 
     def plot_single(key, y_label, metric_type, filename_suffix):
         fig, ax = plt.subplots(figsize=(7, 5))
 
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get(key, 0) for r in all_results if method in r]
-            std_vals = [r[method].get(f'{key}_std', 0) for r in all_results if method in r]
+            x_vals, y_vals, std_vals = series_for(method, key)
             y_errs = std_vals
             if not any(y_vals): continue
-            ax.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
+            ax.errorbar(x_vals, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                         linewidth=2.0, capsize=3, markersize=6, alpha=0.9)
 
         ax.set_xlabel('Input Size (Log Scale)')
@@ -258,14 +267,11 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.figure(figsize=(7, 5))
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get('throughput', 0) for r in all_results if
-                      method in r]
-            std_vals = [r[method].get('throughput_std', 0) for r in all_results if
-                        method in r]
+            x_vals, y_vals, std_vals = series_for(method, 'throughput')
             # Symmetric error bars tracking std
             y_errs = std_vals
             if not any(y_vals): continue
-            plt.errorbar(sizes, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
+            plt.errorbar(x_vals, y_vals, yerr=y_errs, fmt=marker, linestyle=ls, color=color, label=label,
                          linewidth=1.5, capsize=3, markersize=5, alpha=0.9)
 
         plt.xlabel('Input Size (Log Scale)')
@@ -292,23 +298,24 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         plt.figure(figsize=(8, 6))
 
-        baseline_y_vals = [r[baseline_method].get('throughput', 0) for r in
-                           all_results if baseline_method in r]
-        if not any(baseline_y_vals):
+        baseline_by_size = {
+            r['size']: r[baseline_method].get('throughput')
+            for r in all_results
+            if baseline_method in r and 'throughput' in r[baseline_method]
+        }
+        if not any(v for v in baseline_by_size.values() if v is not None):
             plt.close()
             return
 
         for method in methods:
             color, ls, marker, label = get_style(method)
-            y_vals = [r[method].get('throughput', 0) for r in all_results if
-                      method in r]
-            std_vals = [r[method].get('throughput_std', 0) for r in all_results if
-                        method in r]
+            x_vals, y_vals, std_vals = series_for(method, 'throughput')
 
             if not any(y_vals): continue
 
             norm_y_vals, norm_std_vals, valid_sizes = [], [], []
-            for sz, y, std, b in zip(sizes, y_vals, std_vals, baseline_y_vals):
+            for sz, y, std in zip(x_vals, y_vals, std_vals):
+                b = baseline_by_size.get(sz)
                 if y and b and b > 0:
                     norm_y_vals.append(y / b)
                     norm_std_vals.append(std / b)
@@ -699,7 +706,8 @@ def generate_plots_from_csv(csv_file: str, output_dir: str, timestamp: str):
                         method_data[f'{metric_name}_q1'] = np.percentile(values, 25)
                         method_data[f'{metric_name}_q3'] = np.percentile(values, 75)
 
-            result_entry[method] = method_data
+            if method_data:
+                result_entry[method] = method_data
 
         all_results.append(result_entry)
 
