@@ -241,7 +241,7 @@ def cleanup_qdrant(client):
 # Scenario 2 Benchmark Functions
 # =============================================================================
 
-def scenario2_mono_store(conn):
+def scenario2_mono_store(conn, create_index: bool = True):
     """Generate embeddings for pre-existing data in PG."""
     cur = conn.cursor()
     cur.execute(f"""
@@ -258,8 +258,9 @@ def scenario2_mono_store(conn):
                 SET embedding = e.embedding FROM embeddings e
                 WHERE p.product_id = e.id;
                 """, (EMBED_ANYTHING_MODEL,))
-    cur.execute(
-        "CREATE INDEX ON product USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
+    if create_index:
+        cur.execute(
+            "CREATE INDEX ON product USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 100);")
     cur.close()
 
 
@@ -334,7 +335,8 @@ def main():
 
     test_sizes = args.sizes
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    methods = ['mono_pg_unified_deferred', 'mono_pg_direct_deferred', 'poly_chroma', 'poly_qdrant_deferred']
+    methods = ['mono_pg_unified_no_index', 'mono_pg_unified_deferred',
+               'mono_pg_direct_deferred', 'poly_chroma', 'poly_qdrant_deferred']
 
     print(f"\nStarting Benchmark 3 - Scenario 2: Pre-existing Data")
     print(f"Run ID: {run_id}")
@@ -368,6 +370,23 @@ def main():
     for size in test_sizes:
         print(f"\nSize: {size}", flush=True)
         products = test_products[size]
+
+        # Mono-Store No Index
+        conn_mono_no_index, pg_pid_mono_no_index = connect_and_get_pid()
+        warmup_pg_connection(conn_mono_no_index)
+        setup_pg_database(conn_mono_no_index)
+        insert_product_data(conn_mono_no_index, products)
+        conn_mono_no_index.commit()
+        try:
+            elapsed, _, stats = ResourceMonitor.measure(
+                py_pid, pg_pid_mono_no_index,
+                lambda: scenario2_mono_store(conn_mono_no_index, create_index=False))
+            conn_mono_no_index.commit()
+            results_by_size[size]['mono_pg_unified_no_index'] = BenchmarkResult(elapsed, stats)
+            print(f"  mono_pg_unified_no_index: {elapsed:.2f}s", flush=True)
+            clear_model_cache()
+        finally:
+            conn_mono_no_index.close()
 
         # Mono-Store
         conn_mono, pg_pid_mono = connect_and_get_pid()

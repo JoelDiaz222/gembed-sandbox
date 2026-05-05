@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 
 COLOR_PG_MAIN = '#003f5c'  # Navy Blue (Internal/Mono-Store)
 COLOR_PG_ALT = '#444e86'  # Slate (Indexed/Optimized)
+COLOR_PG_NO_INDEX = '#2f7ebc'  # Blue (No Index)
 COLOR_VECTOR_QD = '#ff1f5b'  # Crimson (Qdrant)
 COLOR_VECTOR_CH = '#ffa600'  # Amber (Chroma)
 COLOR_DIRECT = '#00af91'  # Teal (In-Process Local)
@@ -53,6 +54,7 @@ STYLE_MAP = {
     'ext_direct_deferred': (COLOR_DIRECT, '--', '*'),
     'mono_pg_direct_deferred': (COLOR_DIRECT, '--', 'o'),
     'mono_ext_direct_deferred': (COLOR_DIRECT, '--', '*'),
+    'mono_pg_unified_no_index': (COLOR_PG_NO_INDEX, '-', 'o'),
     'mono_pg_unified_deferred': (COLOR_PG_ALT, '--', 's'),
     'poly_qdrant_deferred': (COLOR_VECTOR_QD, ':', 'D'),
     'ext_grpc': (COLOR_REMOTE_GRPC, ':', 'P'),
@@ -92,6 +94,7 @@ LABEL_MAP = {
     'two_step_qdrant': 'Poly-Store (with Qdrant)',
     'qd_indexed': 'Qdrant Immediate',
     'qd_deferred': 'Qdrant Deferred',
+    'mono_pg_unified_no_index': 'Mono-Store (PG Local No Index)',
     'mono_pg_unified_deferred': 'Mono-Store (PG Local Deferred)',
     'mono_pg_direct_deferred': 'Mono-Store (App. Local Deferred)',
     'mono_ext_direct_deferred': 'Mono-Store (App. Local Deferred)',

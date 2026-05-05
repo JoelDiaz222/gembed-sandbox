@@ -30,6 +30,7 @@ LABEL_MAP = {
     'poly_chroma': 'Poly-Store (PG, ChromaDB)',
     'poly_qdrant': 'Dist. Qdrant',
     'poly_qdrant_deferred': 'Poly-Store (PG, QD Deferred)',
+    'mono_pg_unified_no_index': 'Mono-Store (PG Local No Index)',
     'mono_pg_unified_deferred': 'Mono-Store (PG Local)',
     'mono_pg_direct_deferred': 'Mono-Store (Direct)',
     'mono_ext_direct_deferred': 'Mono-Store (Ext Direct)',
@@ -342,4 +343,3 @@ def generate_tables_b8(df, output_path: Path, timestamp: str):
     tex_path = output_path / f'overhead_table_{timestamp}.tex'
     tex_path.write_text('\n'.join(lines) + '\n')
     print(f"LaTeX overhead table saved to {tex_path}")
-
