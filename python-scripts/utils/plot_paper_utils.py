@@ -229,6 +229,10 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
     configure_latex_style()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    is_b3 = any(m.startswith('mono_') or m.startswith('poly_') for m in methods)
+    leg_fs = 10 if is_b3 else 14
+    leg_ncol = 2 if is_b3 else 1
+
     # Data-driven component detection
     has_pg_data = any(m in r and r[m].get('pg_mem_peak', 0) > 0 for r in all_results for m in methods)
     has_qd_data = any(m in r and r[m].get('qd_mem_peak', 0) > 0 for r in all_results for m in methods)
@@ -260,7 +264,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         ax.grid(True, linestyle='--', alpha=0.3)
         ax.set_xscale('log', base=2)
 
-        ax.legend(loc='best', frameon=True, framealpha=0.9)
+        ax.legend(loc='best', frameon=True, framealpha=0.9, fontsize=leg_fs, ncol=leg_ncol)
         plt.tight_layout()
         plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.pdf", format='pdf', bbox_inches='tight')
         plt.savefig(output_dir / f"{filename_suffix}_{metric_type}_{timestamp}.png", dpi=300, bbox_inches='tight')
@@ -280,7 +284,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
         plt.xlabel('Input Size (Log Scale)')
         plt.ylabel(f'Throughput ({throughput_unit})')
 
-        plt.legend(loc='best', frameon=True, framealpha=0.9)
+        plt.legend(loc='best', frameon=True, framealpha=0.9, fontsize=leg_fs, ncol=leg_ncol)
         plt.grid(True, linestyle='--', alpha=0.3)
         plt.xscale('log', base=2)
         plt.savefig(output_dir / f"throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
@@ -343,7 +347,7 @@ def generate_plots(all_results: List[dict], output_dir: Path, timestamp: str, me
 
         plt.ylabel(f'Relative Throughput (vs {y_axis_baseline_name})')
 
-        plt.legend(loc='best', frameon=True, framealpha=0.9)
+        plt.legend(loc='best', frameon=True, framealpha=0.9, fontsize=leg_fs, ncol=leg_ncol)
         plt.grid(True, linestyle='--', alpha=0.3)
 
         plt.savefig(output_dir / f"normalized_throughput_{timestamp}.pdf", format='pdf', bbox_inches='tight')
